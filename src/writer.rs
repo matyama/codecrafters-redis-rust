@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::WriteHalf;
 
-use crate::{DataType, CRLF};
+use crate::{DataType, CRLF, NULL};
 
 pub struct DataWriter<'w> {
     writer: BufWriter<WriteHalf<'w>>,
@@ -29,6 +29,12 @@ impl<'w> DataWriter<'w> {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let write = async move {
             match resp {
+                // nulls: `_\r\n`
+                DataType::Null => {
+                    println!("writing null");
+                    self.writer.write_all(NULL).await?;
+                }
+
                 // booleans: `#<t|f>\r\n`
                 DataType::Boolean(boolean) => {
                     self.writer.write_u8(b'#').await?;

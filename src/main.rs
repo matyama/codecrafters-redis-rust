@@ -1,12 +1,14 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 
-use redis_starter_rust::{DataReader, DataWriter};
+use redis_starter_rust::{DataReader, DataWriter, Store};
 
 const PORT: u16 = 6379;
 
-async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, store: Arc<Store>) -> Result<()> {
     let (reader, writer) = stream.split();
 
     let mut reader = DataReader::new(reader);
@@ -19,7 +21,7 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
         };
 
         println!("executing {cmd:?}");
-        let resp = cmd.into();
+        let resp = cmd.exec(Arc::clone(&store)).await;
 
         // NOTE: for now we just ignore the payload and hard-code the response to PING
         writer.write(resp).await?;
@@ -33,6 +35,8 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind to port {PORT}"))?;
 
+    let store = Arc::new(Store::default());
+
     loop {
         tokio::select! {
             // signal handling would be here
@@ -41,8 +45,9 @@ async fn main() -> Result<()> {
                 match conn {
                     Ok((stream, addr)) => {
                         println!("accepted new connection at {addr}");
+                        let store = Arc::clone(&store);
                         task::spawn(async move {
-                            if let Err(e) = handle_connection(stream).await {
+                            if let Err(e) = handle_connection(stream, store).await {
                                 eprintln!("task handling connection failed with {e}");
                             }
                         });

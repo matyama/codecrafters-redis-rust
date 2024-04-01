@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
@@ -44,19 +44,36 @@ impl<'r> DataReader<'r> {
         };
 
         let cmd = match cmd.as_ref() {
-            b"ping" => match args.pop_front() {
+            b"PING" => match args.pop_front() {
                 None => Command::Ping(None),
-                Some(msg @ DataType::BulkString(_)) => Command::Ping(Some(msg)),
+                Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
                 Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
             },
 
-            b"echo" => match args.pop_front() {
-                Some(msg @ DataType::BulkString(_)) => Command::Echo(msg),
+            b"ECHO" => match args.pop_front() {
+                Some(DataType::BulkString(msg)) => Command::Echo(msg),
                 Some(arg) => bail!("ECHO only accepts bulk strings as argument, got {arg:?}"),
                 None => bail!("ECHO requires an argument, got none"),
             },
 
-            // TODO: implement other commands
+            b"GET" => match args.pop_front() {
+                // TODO: make sure this does not re-allocate
+                Some(DataType::BulkString(key)) => Command::Get(key.into()),
+                Some(arg) => bail!("GET only accepts bulk strings as argument, got {arg:?}"),
+                None => bail!("GET requires an argument, got none"),
+            },
+
+            b"SET" => match (args.pop_front(), args.pop_front()) {
+                (Some(DataType::BulkString(key)), Some(DataType::BulkString(val))) => {
+                    Command::Set(key.into(), val.into())
+                }
+
+                (Some(key), None) => bail!("SET {key:?} _ is missing a value argument"),
+                (None, Some(val)) => bail!("SET _ {val:?} is missing a key argument"),
+                (None, None) => bail!("SET requires two arguments, got none"),
+                args => bail!("protocol violation: SET with invalid argument types {args:?}"),
+            },
+
             cmd => bail!(
                 "protocol violation: unsupported command '{}'",
                 String::from_utf8_lossy(cmd)
@@ -68,6 +85,7 @@ impl<'r> DataReader<'r> {
 
     async fn read_data(&mut self) -> Result<Option<DataType>> {
         match self.reader.read_u8().await {
+            Ok(b'_') => self.read_null().await.map(Some),
             Ok(b'#') => self.read_bool().await.map(Some),
             Ok(b'$') => self.read_bulk_string().await.map(Some),
             Ok(b'*') => self.read_array().await.map(Some),
@@ -113,6 +131,19 @@ impl<'r> DataReader<'r> {
         slice
             .parse()
             .with_context(|| format!("expected number, got: {slice}"))
+    }
+
+    async fn read_null(&mut self) -> Result<DataType> {
+        self.buf.clear();
+
+        let n = self.read_segment().await?;
+
+        ensure!(
+            n == 0,
+            "protocol violation: expected no data for null, got {n} bytes"
+        );
+
+        Ok(DataType::Null)
     }
 
     /// Read a boolean of the form `#<t|f>\r\n`
@@ -161,7 +192,6 @@ impl<'r> DataReader<'r> {
 
             let mut items = VecDeque::with_capacity(len);
 
-            // XXX: probably should also validate that all items are of the same type
             for i in 0..len {
                 let item = self
                     .read_data()
