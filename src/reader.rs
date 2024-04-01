@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::pin::Pin;
 
 use anyhow::{bail, ensure, Context, Result};
+use bytes::BytesMut;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
@@ -43,7 +44,7 @@ impl<'r> DataReader<'r> {
             data => bail!("protocol violation: command must be an array or string, got {data:?}"),
         };
 
-        let cmd = match cmd.as_ref() {
+        let cmd = match cmd.as_slice() {
             b"PING" => match args.pop_front() {
                 None => Command::Ping(None),
                 Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
@@ -168,7 +169,9 @@ impl<'r> DataReader<'r> {
 
         let read_len = len + CRLF.len();
 
-        let mut buf = vec![0; read_len];
+        // XXX: split_off of self.buf
+        let mut buf = BytesMut::with_capacity(read_len);
+        buf.resize(read_len, 0);
 
         self.reader
             .read_exact(&mut buf)
@@ -176,8 +179,7 @@ impl<'r> DataReader<'r> {
             .with_context(|| format!("failed to read {read_len} bytes of a bulk string's data"))?;
 
         // strip trailing CRLF
-        buf.pop();
-        buf.pop();
+        buf.truncate(len);
 
         // TODO: ideally this could point to a pooled buffer and not allocate
         Ok(DataType::BulkString(buf.into()))

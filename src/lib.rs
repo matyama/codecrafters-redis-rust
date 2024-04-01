@@ -1,8 +1,7 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::ops::Deref;
 use std::sync::Arc;
 
+use bytes::Bytes;
 pub use reader::DataReader;
 use tokio::sync::RwLock;
 pub use writer::DataWriter;
@@ -13,78 +12,18 @@ pub(crate) mod writer;
 pub(crate) const LF: u8 = b'\n'; // 10
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
-pub(crate) const PONG: &[u8] = b"PONG";
-pub(crate) const OK: &[u8] = b"OK";
+pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
+pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
 
 pub trait DataExt {
-    fn cmd(self) -> Data;
+    // NOTE: this could probably benefit from small vec optimization
+    fn cmd(&self) -> Vec<u8>;
 }
 
-impl<'a> DataExt for Cow<'a, [u8]> {
-    fn cmd(self) -> Data {
-        match self {
-            Cow::Borrowed(data) => Data(Cow::Owned(data.to_ascii_uppercase())),
-            Cow::Owned(mut data) => {
-                data.make_ascii_uppercase();
-                Data(Cow::Owned(data))
-            }
-        }
-    }
-}
-
-// TODO: consolidate Vec vs Box<[u8]> vs Cow<'_, [u8]>
-// TODO: perhaps these could be Bytes (for cheap clone and write)
-#[derive(Clone, Debug)]
-#[repr(transparent)]
-pub struct Data(Cow<'static, [u8]>);
-
-impl DataExt for Data {
+impl DataExt for Bytes {
     #[inline]
-    fn cmd(self) -> Self {
-        self.0.cmd()
-    }
-}
-
-impl Deref for Data {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for Data {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl From<&'static [u8]> for Data {
-    fn from(data: &'static [u8]) -> Self {
-        Self(Cow::Borrowed(data))
-    }
-}
-
-impl From<Box<[u8]>> for Data {
-    #[inline]
-    fn from(data: Box<[u8]>) -> Self {
-        Self(Vec::from(data).into())
-    }
-}
-
-impl From<Vec<u8>> for Data {
-    #[inline]
-    fn from(data: Vec<u8>) -> Self {
-        Self(data.into())
-    }
-}
-
-impl From<String> for Data {
-    #[inline]
-    fn from(value: String) -> Self {
-        Self(Cow::Owned(format!("{value:?}").as_bytes().into()))
+    fn cmd(&self) -> Vec<u8> {
+        self.to_ascii_uppercase()
     }
 }
 
@@ -92,26 +31,26 @@ impl From<String> for Data {
 pub enum DataType {
     Null,
     Boolean(bool),
-    SimpleString(Data),
-    BulkString(Data),
+    SimpleString(Bytes),
+    BulkString(Bytes),
     Array(VecDeque<DataType>),
 }
 
 impl DataExt for DataType {
     #[inline]
-    fn cmd(self) -> Data {
+    fn cmd(&self) -> Vec<u8> {
         match self {
             Self::SimpleString(s) => s.cmd(),
             Self::BulkString(s) => s.cmd(),
-            other => Data::from(format!("{other:?}")),
+            other => format!("{other:?}").into(),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum Command {
-    Ping(Option<Data>),
-    Echo(Data),
+    Ping(Option<Bytes>),
+    Echo(Bytes),
     Get(Key),
     Set(Key, Value),
 }
@@ -119,18 +58,15 @@ pub enum Command {
 impl Command {
     pub async fn exec(self, store: Arc<Store>) -> DataType {
         match self {
-            Self::Ping(Some(msg)) => DataType::BulkString(msg),
-            Self::Ping(None) => DataType::SimpleString(PONG.into()),
+            Self::Ping(msg) => msg.map_or(DataType::SimpleString(PONG), DataType::BulkString),
             Self::Echo(msg) => DataType::BulkString(msg),
             Self::Get(key) => store
                 .get(&key)
                 .await
-                .map_or(DataType::Null, |Value(value)| {
-                    DataType::BulkString(value.into())
-                }),
+                .map_or(DataType::Null, |Value(value)| DataType::BulkString(value)),
             Self::Set(key, value) => {
                 let _value = store.set(key, value).await;
-                DataType::SimpleString(OK.into())
+                DataType::SimpleString(OK)
             }
         }
     }
@@ -138,24 +74,23 @@ impl Command {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Key(Box<[u8]>);
+pub struct Key(Bytes);
 
-impl From<Data> for Key {
+impl From<Bytes> for Key {
     #[inline]
-    fn from(Data(data): Data) -> Self {
-        Self(data.into())
+    fn from(key: Bytes) -> Self {
+        Self(key)
     }
 }
 
-// TODO: perhaps these could be Bytes (for cheap clone and write)
 #[derive(Clone, Debug)]
 #[repr(transparent)]
-pub struct Value(Box<[u8]>);
+pub struct Value(Bytes);
 
-impl From<Data> for Value {
+impl From<Bytes> for Value {
     #[inline]
-    fn from(Data(data): Data) -> Self {
-        Self(data.into())
+    fn from(value: Bytes) -> Self {
+        Self(value)
     }
 }
 
