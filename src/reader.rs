@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::num::ParseIntError;
 use std::pin::Pin;
 use std::str::FromStr;
 
@@ -193,7 +194,11 @@ impl<'r> DataReader<'r> {
 
     /// Read a bulk strings of the form `$<length>\r\n<data>\r\n`
     async fn read_bulk_string(&mut self) -> Result<DataType> {
-        let len = self.read_int().await?;
+        let Length::Some(len) = self.read_int().await? else {
+            println!("reading null bulk string");
+            return Ok(DataType::NullBulkString);
+        };
+
         println!("reading bulk string of length: {len}");
 
         let read_len = len + CRLF.len();
@@ -238,5 +243,22 @@ impl<'r> DataReader<'r> {
 
             Ok(DataType::Array(items))
         })
+    }
+}
+
+#[derive(Debug)]
+enum Length {
+    None,
+    Some(usize),
+}
+
+impl FromStr for Length {
+    type Err = ParseIntError;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse()
+            .map(Self::Some)
+            .or_else(|_| s.parse::<isize>().map(|_| Self::None))
     }
 }

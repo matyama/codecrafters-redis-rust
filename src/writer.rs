@@ -35,6 +35,15 @@ impl<'w> DataWriter<'w> {
                     self.writer.write_all(NULL).await?;
                 }
 
+                // null bulk string: `$-1\r\n`
+                DataType::NullBulkString => {
+                    println!("writing null bulk string");
+                    self.buf.clear();
+                    write!(self.buf, "$-1")?;
+                    self.writer.write_all(self.buf.as_bytes()).await?;
+                    self.writer.write_all(CRLF).await?;
+                }
+
                 // booleans: `#<t|f>\r\n`
                 DataType::Boolean(boolean) => {
                     self.writer.write_u8(b'#').await?;
