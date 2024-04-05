@@ -78,7 +78,7 @@ impl Store {
         key: Key,
         Value(data): Value,
         set::StoreOptions { exp, cond }: set::StoreOptions,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, ()> {
         use set::{Condition::*, Expiry::*};
 
         // XXX: not sure at what point Redis takes the timestamp to determine expiration
@@ -98,8 +98,8 @@ impl Store {
             Entry::Occupied(mut e) if e.expired_before(now) && matches!(cond, Some(NX) | None) => {
                 let expiry = expiration(&e);
                 match e.insert(StoredValue { data, expiry }) {
-                    value if value.expired_before(now) => None,
-                    StoredValue { data, .. } => Some(data),
+                    value if value.expired_before(now) => Ok(None),
+                    StoredValue { data, .. } => Ok(Some(data.into())),
                 }
             }
 
@@ -107,7 +107,7 @@ impl Store {
             Entry::Occupied(mut e) if matches!(cond, Some(XX) | None) => {
                 let expiry = expiration(&e);
                 let StoredValue { data, .. } = e.insert(StoredValue { data, expiry });
-                Some(data)
+                Ok(Some(data.into()))
             }
 
             // Insert new value (note: we know this is a new entry, so could not be an old one)
@@ -121,15 +121,15 @@ impl Store {
 
                 e.insert(StoredValue { data, expiry });
 
-                None
+                Ok(None)
             }
 
             // Other cases which don't meet given conditions (NX | XX)
-            _ => None,
+            _ => Err(()),
         };
 
         drop(store);
-        value.map(Value::from)
+        value
     }
 }
 

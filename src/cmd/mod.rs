@@ -35,9 +35,9 @@ impl Command {
             Self::Set(key, value, ops) => {
                 let (ops, get) = ops.into();
                 match store.set(key, value, ops).await {
-                    Some(Value(data)) if get => DataType::BulkString(data),
-                    Some(_) => DataType::SimpleString(OK),
-                    None => NULL,
+                    Ok(Some(Value(data))) if get => DataType::BulkString(data),
+                    Ok(_) => DataType::SimpleString(OK),
+                    Err(_) => NULL,
                 }
             }
         }
