@@ -1,28 +1,30 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::VecDeque;
 
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+
+pub use cmd::Command;
 pub use reader::DataReader;
-use tokio::sync::RwLock;
+pub use store::Store;
 pub use writer::DataWriter;
 
+pub(crate) mod cmd;
 pub(crate) mod reader;
+pub(crate) mod store;
 pub(crate) mod writer;
 
 pub(crate) const LF: u8 = b'\n'; // 10
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
-pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
-pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
 
 pub trait DataExt {
     // NOTE: this could probably benefit from small vec optimization
-    fn cmd(&self) -> Vec<u8>;
+    fn to_uppercase(&self) -> Vec<u8>;
 }
 
 impl DataExt for Bytes {
     #[inline]
-    fn cmd(&self) -> Vec<u8> {
+    fn to_uppercase(&self) -> Vec<u8> {
         self.to_ascii_uppercase()
     }
 }
@@ -31,84 +33,42 @@ impl DataExt for Bytes {
 pub enum DataType {
     Null,
     Boolean(bool),
+    Integer(i64),
     SimpleString(Bytes),
+    SimpleError(Bytes),
     BulkString(Bytes),
     Array(VecDeque<DataType>),
 }
 
-impl DataExt for DataType {
-    #[inline]
-    fn cmd(&self) -> Vec<u8> {
+impl DataType {
+    pub(crate) fn parse_int(self) -> Result<Self> {
         match self {
-            Self::SimpleString(s) => s.cmd(),
-            Self::BulkString(s) => s.cmd(),
-            other => format!("{other:?}").into(),
+            Self::Null => bail!("null cannot be converted to an integer"),
+            Self::Boolean(b) => Ok(Self::Integer(b.into())),
+            i @ Self::Integer(_) => Ok(i),
+            Self::SimpleString(s) | Self::BulkString(s) => {
+                let s = std::str::from_utf8(&s)
+                    .with_context(|| format!("{s:?} is not a UTF-8 string"))?;
+                s.parse()
+                    .map(Self::Integer)
+                    .with_context(|| format!("'{s}' does not represent an integer"))
+            }
+            Self::SimpleError(_) => bail!("simple error cannot be converted to an integer"),
+            Self::Array(_) => bail!("array cannot be converted to an integer"),
         }
     }
 }
 
-#[derive(Debug)]
-pub enum Command {
-    Ping(Option<Bytes>),
-    Echo(Bytes),
-    Get(Key),
-    Set(Key, Value),
-}
-
-impl Command {
-    pub async fn exec(self, store: Arc<Store>) -> DataType {
+impl DataExt for DataType {
+    fn to_uppercase(&self) -> Vec<u8> {
         match self {
-            Self::Ping(msg) => msg.map_or(DataType::SimpleString(PONG), DataType::BulkString),
-            Self::Echo(msg) => DataType::BulkString(msg),
-            Self::Get(key) => store
-                .get(&key)
-                .await
-                .map_or(DataType::Null, |Value(value)| DataType::BulkString(value)),
-            Self::Set(key, value) => {
-                let _value = store.set(key, value).await;
-                DataType::SimpleString(OK)
+            Self::SimpleString(s) => s.to_uppercase(),
+            Self::BulkString(s) => s.to_uppercase(),
+            other => {
+                let mut other = format!("{other:?}");
+                other.make_ascii_uppercase();
+                other.into()
             }
         }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Key(Bytes);
-
-impl From<Bytes> for Key {
-    #[inline]
-    fn from(key: Bytes) -> Self {
-        Self(key)
-    }
-}
-
-#[derive(Clone, Debug)]
-#[repr(transparent)]
-pub struct Value(Bytes);
-
-impl From<Bytes> for Value {
-    #[inline]
-    fn from(value: Bytes) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct Store(RwLock<HashMap<Key, Value>>);
-
-impl Store {
-    pub async fn get(self: Arc<Self>, key: &Key) -> Option<Value> {
-        let store = self.0.read().await;
-        let value = store.get(key).cloned();
-        drop(store);
-        value
-    }
-
-    pub async fn set(self: Arc<Self>, key: Key, value: Value) -> Option<Value> {
-        let mut store = self.0.write().await;
-        let value = store.insert(key, value);
-        drop(store);
-        value
     }
 }

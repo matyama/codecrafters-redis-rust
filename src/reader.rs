@@ -1,14 +1,16 @@
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
+use std::str::FromStr;
 
-use anyhow::{bail, ensure, Context, Result};
-use bytes::BytesMut;
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
-use crate::{Command, DataExt, DataType, CRLF, LF};
+use crate::{cmd, Command, DataExt, DataType, CRLF, LF};
 
 pub struct DataReader<'r> {
     reader: BufReader<ReadHalf<'r>>,
@@ -31,15 +33,17 @@ impl<'r> DataReader<'r> {
             return Ok(None);
         };
 
+        println!(">>> {data:?}");
+
         let (cmd, mut args) = match data {
             s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => {
-                (s.cmd(), VecDeque::new())
+                (s.to_uppercase(), VecDeque::new())
             }
             DataType::Array(mut args) => {
                 let Some(arg) = args.pop_front() else {
                     bail!("protocol violation: no command found");
                 };
-                (arg.cmd(), args)
+                (arg.to_uppercase(), args)
             }
             data => bail!("protocol violation: command must be an array or string, got {data:?}"),
         };
@@ -58,7 +62,6 @@ impl<'r> DataReader<'r> {
             },
 
             b"GET" => match args.pop_front() {
-                // TODO: make sure this does not re-allocate
                 Some(DataType::BulkString(key)) => Command::Get(key.into()),
                 Some(arg) => bail!("GET only accepts bulk strings as argument, got {arg:?}"),
                 None => bail!("GET requires an argument, got none"),
@@ -66,9 +69,10 @@ impl<'r> DataReader<'r> {
 
             b"SET" => match (args.pop_front(), args.pop_front()) {
                 (Some(DataType::BulkString(key)), Some(DataType::BulkString(val))) => {
-                    Command::Set(key.into(), val.into())
+                    let ops = cmd::set::Options::try_from(args)
+                        .with_context(|| format!("SET {key:?} {val:?} [options]"))?;
+                    Command::Set(key.into(), val.into(), ops)
                 }
-
                 (Some(key), None) => bail!("SET {key:?} _ is missing a value argument"),
                 (None, Some(val)) => bail!("SET _ {val:?} is missing a key argument"),
                 (None, None) => bail!("SET requires two arguments, got none"),
@@ -88,6 +92,17 @@ impl<'r> DataReader<'r> {
         match self.reader.read_u8().await {
             Ok(b'_') => self.read_null().await.map(Some),
             Ok(b'#') => self.read_bool().await.map(Some),
+            Ok(b':') => self.read_int().await.map(DataType::Integer).map(Some),
+            Ok(b'+') => self
+                .read_simple()
+                .await
+                .map(DataType::SimpleString)
+                .map(Some),
+            Ok(b'-') => self
+                .read_simple()
+                .await
+                .map(DataType::SimpleError)
+                .map(Some),
             Ok(b'$') => self.read_bulk_string().await.map(Some),
             Ok(b'*') => self.read_array().await.map(Some),
             Ok(b) => bail!("protocol violation: unsupported control byte '{b}'"),
@@ -118,22 +133,6 @@ impl<'r> DataReader<'r> {
         Ok(n - 2)
     }
 
-    async fn read_len(&mut self) -> Result<usize> {
-        self.buf.clear();
-
-        let n = self.read_segment().await?;
-
-        let bytes = &self.buf[..n];
-
-        let Ok(slice) = std::str::from_utf8(bytes) else {
-            bail!("expected UTF-8 digit sequence, got: {bytes:?}");
-        };
-
-        slice
-            .parse()
-            .with_context(|| format!("expected number, got: {slice}"))
-    }
-
     async fn read_null(&mut self) -> Result<DataType> {
         self.buf.clear();
 
@@ -162,14 +161,43 @@ impl<'r> DataReader<'r> {
         }
     }
 
+    /// Read an integer of the form `[:][<+|->]<value>\r\n`
+    async fn read_int<T>(&mut self) -> Result<T>
+    where
+        T: FromStr,
+        <T as FromStr>::Err: Debug,
+    {
+        self.buf.clear();
+
+        let n = self.read_segment().await?;
+
+        let bytes = &self.buf[..n];
+
+        let Ok(slice) = std::str::from_utf8(bytes) else {
+            bail!("expected UTF-8 digit sequence, got: {bytes:?}");
+        };
+
+        match slice.parse() {
+            Ok(int) => Ok(int),
+            Err(e) => Err(anyhow!("{e:?}: expected number, got: {slice}")),
+        }
+    }
+
+    /// Read a simple strings or errors of the form `[<+|->]<data>\r\n`
+    async fn read_simple(&mut self) -> Result<Bytes> {
+        println!("reading simple data");
+        self.buf.clear();
+        let n = self.read_segment().await?;
+        Ok(Bytes::copy_from_slice(&self.buf[..n]))
+    }
+
     /// Read a bulk strings of the form `$<length>\r\n<data>\r\n`
     async fn read_bulk_string(&mut self) -> Result<DataType> {
-        let len = self.read_len().await?;
+        let len = self.read_int().await?;
         println!("reading bulk string of length: {len}");
 
         let read_len = len + CRLF.len();
 
-        // XXX: split_off of self.buf
         let mut buf = BytesMut::with_capacity(read_len);
         buf.resize(read_len, 0);
 
@@ -180,16 +208,17 @@ impl<'r> DataReader<'r> {
 
         // strip trailing CRLF
         buf.truncate(len);
+        // TODO: do `let data = self.buf.split_to(len).freeze();` instead
 
         // TODO: ideally this could point to a pooled buffer and not allocate
         Ok(DataType::BulkString(buf.into()))
     }
 
     /// Read an array of the form: `*<number-of-elements>\r\n<element-1>...<element-n>`
-    #[must_use]
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn read_array(&mut self) -> Pin<Box<dyn Future<Output = Result<DataType>> + Send + '_>> {
-        let read = async move {
-            let len = self.read_len().await?;
+        Box::pin(async move {
+            let len = self.read_int().await?;
             println!("reading array of length: {len}");
 
             let mut items = VecDeque::with_capacity(len);
@@ -208,9 +237,6 @@ impl<'r> DataReader<'r> {
             }
 
             Ok(DataType::Array(items))
-        };
-
-        // TODO: try local pinning
-        Box::pin(read)
+        })
     }
 }

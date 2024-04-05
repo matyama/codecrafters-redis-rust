@@ -22,12 +22,12 @@ impl<'w> DataWriter<'w> {
         }
     }
 
-    #[must_use]
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub fn write(
         &mut self,
         resp: DataType,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        let write = async move {
+        Box::pin(async move {
             match resp {
                 // nulls: `_\r\n`
                 DataType::Null => {
@@ -44,10 +44,28 @@ impl<'w> DataWriter<'w> {
                     self.writer.write_all(CRLF).await?;
                 }
 
+                // integer: `:[<+|->]<value>\r\n`
+                DataType::Integer(int) => {
+                    self.writer.write_u8(b':').await?;
+                    let sign = if int.is_positive() { '+' } else { '-' };
+                    self.buf.clear();
+                    write!(self.buf, "{sign}{int}\r\n")?;
+                    println!("writing integer {int}: {:?}", self.buf.as_bytes());
+                    self.writer.write_all(self.buf.as_bytes()).await?;
+                }
+
                 // simple strings: `+<data>\r\n`
                 DataType::SimpleString(data) => {
                     self.writer.write_u8(b'+').await?;
-                    println!("writing {data:?}");
+                    println!("writing string {data:?}");
+                    self.writer.write_all(&data).await?;
+                    self.writer.write_all(CRLF).await?;
+                }
+
+                // simple errors: `-<data>\r\n`
+                DataType::SimpleError(data) => {
+                    self.writer.write_u8(b'-').await?;
+                    println!("writing error {data:?}");
                     self.writer.write_all(&data).await?;
                     self.writer.write_all(CRLF).await?;
                 }
@@ -96,10 +114,7 @@ impl<'w> DataWriter<'w> {
             }
 
             self.flush().await
-        };
-
-        // TODO: try local pinning
-        Box::pin(write)
+        })
     }
 
     pub async fn flush(&mut self) -> Result<()> {

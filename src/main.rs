@@ -30,7 +30,7 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<Store>) -> Result<(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("Binding TCP listener to port {PORT}");
+    println!("binding TCP listener to port {PORT}");
     let listener = TcpListener::bind(format!("127.0.0.1:{PORT}"))
         .await
         .with_context(|| format!("failed to bind to port {PORT}"))?;
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
                         let store = Arc::clone(&store);
                         task::spawn(async move {
                             if let Err(e) = handle_connection(stream, store).await {
-                                eprintln!("task handling connection failed with {e}");
+                                eprintln!("task handling connection failed with {e:?}");
                             }
                         });
                     },
