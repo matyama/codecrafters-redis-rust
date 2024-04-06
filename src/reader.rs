@@ -62,6 +62,18 @@ impl<'r> DataReader<'r> {
                 None => bail!("ECHO requires an argument, got none"),
             },
 
+            b"INFO" => {
+                let sections = args
+                    .into_iter()
+                    .filter_map(|arg| match arg {
+                        DataType::BulkString(s) | DataType::SimpleString(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+
+                Command::Info(sections)
+            }
+
             b"GET" => match args.pop_front() {
                 Some(DataType::BulkString(key)) => Command::Get(key.into()),
                 Some(arg) => bail!("GET only accepts bulk strings as argument, got {arg:?}"),
