@@ -4,11 +4,13 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 
 pub use cmd::Command;
+pub use config::Config;
 pub use reader::DataReader;
 pub use store::Store;
 pub use writer::DataWriter;
 
 pub(crate) mod cmd;
+pub(crate) mod config;
 pub(crate) mod reader;
 pub(crate) mod store;
 pub(crate) mod writer;

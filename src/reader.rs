@@ -34,8 +34,6 @@ impl<'r> DataReader<'r> {
             return Ok(None);
         };
 
-        println!(">>> {data:?}");
-
         let (cmd, mut args) = match data {
             s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => {
                 (s.to_uppercase(), VecDeque::new())

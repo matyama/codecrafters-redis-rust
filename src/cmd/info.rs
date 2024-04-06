@@ -1,11 +1,22 @@
 use std::borrow::Cow;
 
-#[derive(Debug, Default)]
+use crate::Config;
+
+#[derive(Debug)]
 pub enum Role {
-    #[default]
     Master,
-    #[allow(dead_code)]
     Slave,
+}
+
+impl From<&Config> for Role {
+    #[inline]
+    fn from(cfg: &Config) -> Self {
+        if cfg.replica_of.is_some() {
+            Self::Slave
+        } else {
+            Self::Master
+        }
+    }
 }
 
 impl std::fmt::Display for Role {
@@ -95,11 +106,11 @@ impl std::fmt::Display for Replication {
     }
 }
 
-impl Default for Replication {
+impl From<&Config> for Replication {
     #[inline]
-    fn default() -> Self {
+    fn from(cfg: &Config) -> Self {
         Self {
-            role: Role::default(),
+            role: Role::from(cfg),
             connected_slaves: 0,
             master_failover_state: FailoverState::default(),
             master_replid: Cow::from(""),
@@ -119,11 +130,11 @@ pub struct Info {
     replication: Option<Replication>,
 }
 
-impl From<Vec<bytes::Bytes>> for Info {
-    fn from(sections: Vec<bytes::Bytes>) -> Self {
+impl Info {
+    pub(crate) fn new(sections: Vec<bytes::Bytes>, cfg: &Config) -> Self {
         if sections.is_empty() {
             return Self {
-                replication: Some(Replication::default()),
+                replication: Some(Replication::from(cfg)),
             };
         }
 
@@ -131,7 +142,7 @@ impl From<Vec<bytes::Bytes>> for Info {
 
         for section in sections {
             match section.to_ascii_lowercase().as_slice() {
-                b"replication" => info.replication = Some(Replication::default()),
+                b"replication" => info.replication = Some(Replication::from(cfg)),
                 _ => continue,
             }
         }

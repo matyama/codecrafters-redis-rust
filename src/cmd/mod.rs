@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 
 use crate::store::{Key, Store, Value};
-use crate::{DataType, Protocol, PROTOCOL};
+use crate::{Config, DataType, Protocol, PROTOCOL};
 
 pub mod info;
 pub mod set;
@@ -27,7 +27,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub async fn exec(self, store: Arc<Store>) -> DataType {
+    pub async fn exec(self, store: Arc<Store>, cfg: Arc<Config>) -> DataType {
         match self {
             Self::Ping(msg) => msg.map_or(DataType::SimpleString(PONG), DataType::BulkString),
 
@@ -35,7 +35,7 @@ impl Command {
 
             Self::Info(sections) => {
                 let num_sections = sections.len();
-                let info = info::Info::from(sections);
+                let info = info::Info::new(sections, &cfg);
                 let mut data = BytesMut::with_capacity(1024 * num_sections);
                 match write!(data, "{}", info) {
                     Ok(_) => DataType::BulkString(data.freeze()),
