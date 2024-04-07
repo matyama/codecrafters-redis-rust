@@ -1,6 +1,5 @@
 use std::collections::hash_map::{Entry, OccupiedEntry, VacantEntry};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::Mutex;
@@ -54,7 +53,7 @@ struct StoredValue {
 pub struct Store(Mutex<HashMap<Key, StoredValue>>);
 
 impl Store {
-    pub async fn get(self: Arc<Self>, key: Key) -> Option<Value> {
+    pub async fn get(&self, key: Key) -> Option<Value> {
         let mut store = self.0.lock().await;
         let value = match store.entry(key) {
             Entry::Occupied(e) => match e.get() {
@@ -74,7 +73,7 @@ impl Store {
     }
 
     pub async fn set(
-        self: Arc<Self>,
+        &self,
         key: Key,
         Value(data): Value,
         set::StoreOptions { exp, cond }: set::StoreOptions,

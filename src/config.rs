@@ -1,19 +1,25 @@
-use std::net::SocketAddr;
-use std::{env::Args, net::ToSocketAddrs};
+use std::env::Args;
+use std::net::{SocketAddr, ToSocketAddrs as _};
 
 use anyhow::{bail, Context, Result};
 
+fn listen_socket_addr(port: &impl std::fmt::Display) -> Result<SocketAddr> {
+    format!("0.0.0.0:{port}")
+        .parse()
+        .with_context(|| format!("failed to parse listen socket address: '0.0.0.0:{port}'"))
+}
+
 #[derive(Debug)]
 pub struct Config {
-    pub port: u16,
-    pub replica_of: Option<SocketAddr>,
+    pub(crate) addr: SocketAddr,
+    pub(crate) replica_of: Option<SocketAddr>,
 }
 
 impl Default for Config {
     #[inline]
     fn default() -> Self {
         Self {
-            port: 6379,
+            addr: listen_socket_addr(&6379).expect("default listen address"),
             replica_of: None,
         }
     }
@@ -30,11 +36,15 @@ impl TryFrom<Args> for Config {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--port" | "-p" => {
-                    cfg.port = args
-                        .next()
-                        .context("missing argument value for --port")?
-                        .parse()
-                        .context("invalid argument value for --port")?;
+                    let Some(port) = args.next() else {
+                        bail!("missing argument value for --port");
+                    };
+
+                    let Ok(addr) = listen_socket_addr(&port) else {
+                        bail!("invalid argument value for --port: '{port}'");
+                    };
+
+                    cfg.addr = addr;
                 }
 
                 "--replicaof" => {

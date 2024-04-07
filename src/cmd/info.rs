@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::Config;
+use crate::Instance;
 
 #[derive(Debug)]
 pub enum Role {
@@ -8,13 +8,12 @@ pub enum Role {
     Slave,
 }
 
-impl From<&Config> for Role {
+impl From<&Instance> for Role {
     #[inline]
-    fn from(cfg: &Config) -> Self {
-        if cfg.replica_of.is_some() {
-            Self::Slave
-        } else {
-            Self::Master
+    fn from(instance: &Instance) -> Self {
+        match instance {
+            Instance::Leader { .. } => Self::Master,
+            Instance::Replica { .. } => Self::Slave,
         }
     }
 }
@@ -106,16 +105,17 @@ impl std::fmt::Display for Replication {
     }
 }
 
-impl From<&Config> for Replication {
+impl From<&Instance> for Replication {
     #[inline]
-    fn from(cfg: &Config) -> Self {
+    fn from(instance: &Instance) -> Self {
+        let (Instance::Leader { repl, .. } | Instance::Replica { repl, .. }) = instance;
         Self {
-            role: Role::from(cfg),
+            role: Role::from(instance),
             connected_slaves: 0,
             master_failover_state: FailoverState::default(),
-            master_replid: Cow::from(""),
-            master_replid2: Cow::from(""),
-            master_repl_offset: 0,
+            master_replid: repl.repl_id.clone(),
+            master_replid2: repl.repl_id.clone(),
+            master_repl_offset: repl.repl_offset,
             second_repl_offset: -1,
             repl_backlog_active: false,
             repl_backlog_size: 0,
@@ -131,10 +131,10 @@ pub struct Info {
 }
 
 impl Info {
-    pub(crate) fn new(sections: Vec<bytes::Bytes>, cfg: &Config) -> Self {
+    pub(crate) fn new(instance: &Instance, sections: Vec<bytes::Bytes>) -> Self {
         if sections.is_empty() {
             return Self {
-                replication: Some(Replication::from(cfg)),
+                replication: Some(Replication::from(instance)),
             };
         }
 
@@ -142,7 +142,7 @@ impl Info {
 
         for section in sections {
             match section.to_ascii_lowercase().as_slice() {
-                b"replication" => info.replication = Some(Replication::from(cfg)),
+                b"replication" => info.replication = Some(Replication::from(instance)),
                 _ => continue,
             }
         }

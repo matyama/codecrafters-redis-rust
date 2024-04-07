@@ -1,13 +1,17 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use tokio::net::TcpStream;
 
-pub use cmd::Command;
-pub use config::Config;
-pub use reader::DataReader;
-pub use store::Store;
-pub use writer::DataWriter;
+pub(crate) use cmd::Command;
+pub(crate) use config::Config;
+pub(crate) use reader::DataReader;
+pub(crate) use store::Store;
+pub(crate) use writer::DataWriter;
 
 pub(crate) mod cmd;
 pub(crate) mod config;
@@ -82,6 +86,91 @@ impl DataExt for DataType {
                 other.make_ascii_uppercase();
                 other.into()
             }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ReplState {
+    pub(crate) repl_id: Cow<'static, str>,
+    pub(crate) repl_offset: usize,
+}
+
+#[derive(Debug)]
+pub enum Instance {
+    Leader {
+        repl: ReplState,
+        store: Store,
+        cfg: Config,
+    },
+    Replica {
+        repl: ReplState,
+        store: Store,
+        cfg: Config,
+    },
+}
+
+impl Instance {
+    pub fn new(cfg: Config) -> Self {
+        // TODO: this is just an initial placeholder replication state
+        let repl = ReplState {
+            repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".into(),
+            repl_offset: 0,
+        };
+
+        let store = Store::default();
+
+        if cfg.replica_of.is_none() {
+            Self::Leader { repl, store, cfg }
+        } else {
+            Self::Replica { repl, store, cfg }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn cfg(&self) -> &Config {
+        match self {
+            Self::Leader {
+                repl: _,
+                store: _,
+                cfg,
+            } => cfg,
+            Self::Replica {
+                repl: _,
+                store: _,
+                cfg,
+            } => cfg,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn store(&self) -> &Store {
+        let (Self::Leader { repl: _, store, .. } | Self::Replica { repl: _, store, .. }) = self;
+        store
+    }
+
+    #[inline]
+    pub fn addr(&self) -> SocketAddr {
+        self.cfg().addr
+    }
+
+    pub async fn handle_connection(self: Arc<Self>, mut stream: TcpStream) -> Result<()> {
+        let (reader, writer) = stream.split();
+
+        let mut reader = DataReader::new(reader);
+        let mut writer = DataWriter::new(writer);
+
+        loop {
+            let Some(cmd) = reader.read_next().await? else {
+                println!("flushing and closing connection");
+                break writer.flush().await;
+            };
+
+            println!("executing {cmd:?}");
+            let resp = cmd.exec(Arc::clone(&self)).await;
+
+            // NOTE: for now we just ignore the payload and hard-code the response to PING
+            writer.write(resp).await?;
         }
     }
 }
