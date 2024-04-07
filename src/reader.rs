@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
-use crate::{cmd, Command, DataExt, DataType, CRLF, LF};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, LF, PONG};
 
 pub struct DataReader<'r> {
     reader: BufReader<ReadHalf<'r>>,
@@ -29,7 +29,7 @@ impl<'r> DataReader<'r> {
         }
     }
 
-    pub async fn read_next(&mut self) -> Result<Option<Command>> {
+    pub async fn read_next(&mut self) -> Result<Option<Resp>> {
         let Some(data) = self.read_data().await? else {
             return Ok(None);
         };
@@ -44,7 +44,7 @@ impl<'r> DataReader<'r> {
                 };
                 (arg.to_uppercase(), args)
             }
-            data => bail!("protocol violation: command must be an array or string, got {data:?}"),
+            data => return Ok(Some(data.into())),
         };
 
         let cmd = match cmd.as_slice() {
@@ -53,6 +53,8 @@ impl<'r> DataReader<'r> {
                 Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
                 Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
             },
+
+            b"PONG" => return Ok(Some(DataType::SimpleString(PONG).into())),
 
             b"ECHO" => match args.pop_front() {
                 Some(DataType::BulkString(msg)) => Command::Echo(msg),
@@ -96,7 +98,7 @@ impl<'r> DataReader<'r> {
             ),
         };
 
-        Ok(Some(cmd))
+        Ok(Some(cmd.into()))
     }
 
     async fn read_data(&mut self) -> Result<Option<DataType>> {

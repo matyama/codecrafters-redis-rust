@@ -4,13 +4,10 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 
 use crate::store::{Key, Value};
-use crate::{DataType, Instance, Protocol, PROTOCOL};
+use crate::{DataType, Instance, Protocol, OK, PONG, PROTOCOL};
 
 pub mod info;
 pub mod set;
-
-pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
-pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
 
 const NULL: DataType = match PROTOCOL {
     Protocol::RESP2 => DataType::NullBulkString,

@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
         .context("failed to parse program arguments")?;
 
     println!("using configuration to init new instance: {cfg:?}");
-    let instance = Arc::new(Instance::new(cfg));
+    let instance = Instance::new(cfg).await.map(Arc::new)?;
 
     println!("binding TCP listener to {}", instance.addr());
     let listener = TcpListener::bind(instance.addr())

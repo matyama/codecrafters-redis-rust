@@ -100,7 +100,7 @@ impl<'w> DataWriter<'w> {
                     self.writer.write_u8(b'*').await?;
 
                     self.buf.clear();
-                    write!(self.buf, "{}\r\n", items.len())?;
+                    write!(self.buf, "{}", items.len())?;
                     println!(
                         "writing array length of {}: {:?}",
                         items.len(),

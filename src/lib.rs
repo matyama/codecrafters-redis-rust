@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use repl::Handshake;
 use tokio::net::TcpStream;
 
 pub(crate) use cmd::Command;
@@ -16,6 +17,7 @@ pub(crate) use writer::DataWriter;
 pub(crate) mod cmd;
 pub(crate) mod config;
 pub(crate) mod reader;
+pub(crate) mod repl;
 pub(crate) mod store;
 pub(crate) mod writer;
 
@@ -23,12 +25,36 @@ pub(crate) const LF: u8 = b'\n'; // 10
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
 
+pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
+pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
+pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
+
 // NOTE: this is based on the codecrafters examples
 pub const PROTOCOL: Protocol = Protocol::RESP2;
 
 pub enum Protocol {
     RESP2,
     RESP3,
+}
+
+#[derive(Debug)]
+pub enum Resp {
+    Cmd(Command),
+    Data(DataType),
+}
+
+impl From<Command> for Resp {
+    #[inline]
+    fn from(cmd: Command) -> Self {
+        Self::Cmd(cmd)
+    }
+}
+
+impl From<DataType> for Resp {
+    #[inline]
+    fn from(resp: DataType) -> Self {
+        Self::Data(resp)
+    }
 }
 
 pub trait DataExt {
@@ -56,6 +82,11 @@ pub enum DataType {
 }
 
 impl DataType {
+    #[inline]
+    pub(crate) fn array(items: impl Into<VecDeque<Self>>) -> Self {
+        Self::Array(items.into())
+    }
+
     pub(crate) fn parse_int(self) -> Result<Self> {
         match self {
             Self::Null => bail!("null cannot be converted to an integer"),
@@ -111,7 +142,7 @@ pub enum Instance {
 }
 
 impl Instance {
-    pub fn new(cfg: Config) -> Self {
+    pub async fn new(cfg: Config) -> Result<Self> {
         // TODO: this is just an initial placeholder replication state
         let repl = ReplState {
             repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".into(),
@@ -120,11 +151,12 @@ impl Instance {
 
         let store = Store::default();
 
-        if cfg.replica_of.is_none() {
-            Self::Leader { repl, store, cfg }
-        } else {
-            Self::Replica { repl, store, cfg }
-        }
+        let Some(leader) = cfg.replica_of else {
+            return Ok(Self::Leader { repl, store, cfg });
+        };
+
+        let _handshake = Handshake::ping(leader).await?;
+        Ok(Self::Replica { repl, store, cfg })
     }
 
     #[inline]
@@ -160,17 +192,22 @@ impl Instance {
         let mut reader = DataReader::new(reader);
         let mut writer = DataWriter::new(writer);
 
-        loop {
-            let Some(cmd) = reader.read_next().await? else {
-                println!("flushing and closing connection");
-                break writer.flush().await;
+        while let Some(resp) = reader.read_next().await? {
+            let resp = match resp {
+                Resp::Cmd(cmd) => {
+                    println!("executing {cmd:?}");
+                    cmd.exec(Arc::clone(&self)).await
+                }
+                Resp::Data(resp) => {
+                    bail!("protocol violation: expected a command, got {resp:?} instead")
+                }
             };
-
-            println!("executing {cmd:?}");
-            let resp = cmd.exec(Arc::clone(&self)).await;
 
             // NOTE: for now we just ignore the payload and hard-code the response to PING
             writer.write(resp).await?;
         }
+
+        println!("flushing and closing connection");
+        writer.flush().await
     }
 }
