@@ -1,85 +1,63 @@
 use std::fmt::Write;
-use std::{marker::PhantomData, net::SocketAddr};
+use std::net::SocketAddr;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
-use crate::{Config, DataExt as _, DataReader, DataType, DataWriter, Resp, PING};
+use crate::{
+    Command, Config, DataExt as _, DataReader, DataType, DataWriter, ReplState, Resp, PING, PSYNC,
+    REPLCONF,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
-
-pub struct Connected;
-pub struct Configured;
-// pub struct Synced;
-
-pub trait HandshakeState {}
-
-impl HandshakeState for () {}
-impl HandshakeState for Connected {}
-impl HandshakeState for Configured {}
-
-pub struct Handshake<S: HandshakeState = ()> {
-    leader: SocketAddr,
+pub struct Replication {
     conn: TcpStream,
     cfg: Config,
-    state: PhantomData<S>,
 }
 
-impl Handshake<()> {
-    pub async fn ping(leader: SocketAddr, cfg: Config) -> Result<Handshake<Connected>> {
+impl Replication {
+    async fn new(leader: SocketAddr, cfg: Config) -> Result<Self> {
         // NOTE: this could use some form of connection pooling
-        let mut conn = TcpStream::connect(leader)
+        let conn = TcpStream::connect(leader)
             .await
-            .with_context(|| format!("handshake({leader}): failed to establish connection"))?;
+            .context("failed to establish connection")?;
 
-        let (reader, writer) = conn.split();
-        let mut reader = DataReader::new(reader);
-        let mut writer = DataWriter::new(writer);
+        Ok(Self { conn, cfg })
+    }
 
-        let ping = DataType::BulkString(PING);
-
-        writer
-            .write(DataType::array([ping]))
+    pub async fn handshake(leader: SocketAddr, cfg: Config) -> Result<Self> {
+        Self::new(leader, cfg)
+            .await?
+            .ping()
             .await
-            .with_context(|| format!("handshake({leader}): init replication"))?;
-
-        writer
-            .flush()
+            .context("handshake init stage (PING)")?
+            .conf()
             .await
-            .with_context(|| format!("handshake({leader}): failed to flush PING"))?;
-
-        let resp = timeout(TIMEOUT, reader.read_next())
+            .context("handshake config stage (REPLCONF)")?
+            .sync()
             .await
-            .with_context(|| format!("handshake({leader}): PING timed out"))?
-            .with_context(|| format!("handshake({leader}): no response to PING"))?;
+            .context("handshake sync stage (PSYNC)")
+    }
 
+    async fn ping(mut self) -> Result<Self> {
         let pong = |s| String::from_utf8_lossy(s).to_uppercase() == "PONG";
-
-        match resp {
-            Some(Resp::Data(DataType::SimpleString(s))) if pong(&s) => Ok(Handshake {
-                leader,
-                conn,
-                cfg,
-                state: PhantomData,
-            }),
-            other => bail!("handshake({leader}): unexpected response to PING {other:?}"),
+        let args = [DataType::BulkString(PING)];
+        match self.request(args).await.context("init replication")? {
+            Resp::Data(DataType::SimpleString(s)) if pong(&s) => Ok(self),
+            other => bail!("unexpected response {other:?}"),
         }
     }
-}
 
-impl Handshake<Connected> {
-    pub async fn conf(mut self) -> Result<Handshake<Configured>> {
-        let (reader, writer) = self.conn.split();
-        let mut reader = DataReader::new(reader);
-        let mut writer = DataWriter::new(writer);
-
+    async fn conf(mut self) -> Result<Self> {
         let mut port = BytesMut::with_capacity(4);
         write!(port, "{}", self.cfg.addr.port())?;
         let port = port.freeze();
+
+        // TODO: replace with an optimized Matcher<'_> that uses Cow internally and is_lowercase
+        let ok = |s: &Bytes| s.to_uppercase() == b"OK";
 
         let replconf = [
             DataType::BulkString(REPLCONF),
@@ -87,35 +65,14 @@ impl Handshake<Connected> {
             DataType::BulkString(port),
         ];
 
-        writer
-            .write(DataType::array(replconf))
+        let resp = self
+            .request(replconf)
             .await
-            .with_context(|| {
-                format!(
-                    "handshake({}): REPLCONF listening-port {}",
-                    self.leader,
-                    self.cfg.addr.port()
-                )
-            })?;
-
-        writer
-            .flush()
-            .await
-            .with_context(|| format!("handshake({}): failed to flush REPLCONF", self.leader))?;
-
-        let ok = |s: &Bytes| s.to_uppercase() == b"OK";
-
-        let resp = timeout(TIMEOUT, reader.read_next())
-            .await
-            .with_context(|| format!("handshake({}): REPLCONF timed out", self.leader))?
-            .with_context(|| format!("handshake({}): no response to REPLCONF", self.leader))?;
+            .with_context(|| format!("REPLCONF listening-port {}", self.cfg.addr.port()))?;
 
         match resp {
-            Some(Resp::Data(DataType::SimpleString(s))) if ok(&s) => {}
-            other => bail!(
-                "handshake({}): unexpected response to REPLCONF {other:?}",
-                self.leader
-            ),
+            Resp::Data(DataType::SimpleString(s)) if ok(&s) => {}
+            other => bail!("unexpected response {other:?}"),
         }
 
         let replconf = [
@@ -124,32 +81,60 @@ impl Handshake<Connected> {
             DataType::string(b"psync2"),
         ];
 
-        writer
-            .write(DataType::array(replconf))
+        let resp = self
+            .request(replconf)
             .await
-            .with_context(|| format!("handshake({}): REPLCONF capa psync2", self.leader,))?;
+            .context("REPLCONF capa psync2")?;
+
+        match resp {
+            Resp::Data(DataType::SimpleString(s)) if ok(&s) => Ok(self),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    async fn sync(mut self) -> Result<Self> {
+        let ReplState {
+            repl_id,
+            repl_offset,
+        } = ReplState::default();
+
+        let psync = [
+            DataType::BulkString(PSYNC),
+            DataType::BulkString(repl_id.clone().into()),
+            DataType::BulkString(repl_offset.to_string().into()),
+        ];
+
+        let resp = self
+            .request(psync)
+            .await
+            .with_context(|| format!("PSYNC {repl_id} {repl_offset}"))?;
+
+        match resp {
+            Resp::Cmd(Command::FullResync(_state)) => Ok(self),
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+
+    async fn request<const N: usize>(&mut self, args: [DataType; N]) -> Result<Resp> {
+        let (reader, writer) = self.conn.split();
+        let mut reader = DataReader::new(reader);
+        let mut writer = DataWriter::new(writer);
 
         writer
-            .flush()
+            .write(DataType::array(args))
             .await
-            .with_context(|| format!("handshake({}): failed to flush REPLCONF", self.leader))?;
+            .context("failed to write request")?;
+
+        writer.flush().await.context("failed to flush request")?;
 
         let resp = timeout(TIMEOUT, reader.read_next())
             .await
-            .with_context(|| format!("handshake({}): REPLCONF timed out", self.leader))?
-            .with_context(|| format!("handshake({}): no response to REPLCONF", self.leader))?;
+            .context("request timed out")?
+            .context("no response")?;
 
         match resp {
-            Some(Resp::Data(DataType::SimpleString(s))) if ok(&s) => Ok(Handshake {
-                leader: self.leader,
-                conn: self.conn,
-                cfg: self.cfg,
-                state: PhantomData,
-            }),
-            other => bail!(
-                "handshake({}): unexpected response to REPLCONF {other:?}",
-                self.leader
-            ),
+            Some(resp) => Ok(resp),
+            other => bail!("unexpected response {other:?}"),
         }
     }
 }

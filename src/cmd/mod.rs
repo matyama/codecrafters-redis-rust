@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 
 use crate::store::{Key, Value};
-use crate::{DataType, Instance, Protocol, OK, PONG, PROTOCOL};
+use crate::{DataType, Instance, Protocol, ReplState, OK, PONG, PROTOCOL};
 
 pub mod info;
 pub mod replconf;
@@ -23,6 +23,8 @@ pub enum Command {
     Get(Key),
     Set(Key, Value, set::Options),
     Replconf(replconf::Conf),
+    PSync(ReplState),
+    FullResync(ReplState),
 }
 
 impl Command {
@@ -62,6 +64,23 @@ impl Command {
 
             // TODO: handle ListeningPort | Capabilities
             Self::Replconf(_) => DataType::SimpleString(OK),
+
+            Self::PSync(ReplState {
+                repl_id,
+                repl_offset,
+            }) if repl_id == "?" && repl_offset == -1 => {
+                let mut resp = BytesMut::with_capacity(64);
+                match write!(resp, "FULLRESYNC {repl_id} {repl_offset}") {
+                    Ok(_) => DataType::SimpleString(resp.freeze()),
+                    Err(e) => {
+                        let error = format!("failed to write response to PSYNC ? -1: {e:?}");
+                        DataType::SimpleError(error.into())
+                    }
+                }
+            }
+
+            Self::PSync(state) => unimplemented!("handle PSYNC {state:?}"),
+            Self::FullResync(state) => unimplemented!("handle FULLRESYNC {state:?}"),
         }
     }
 }

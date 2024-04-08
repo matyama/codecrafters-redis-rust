@@ -1,11 +1,10 @@
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use repl::Handshake;
+use repl::Replication;
 use tokio::net::TcpStream;
 
 pub(crate) use cmd::Command;
@@ -28,6 +27,9 @@ pub(crate) const NULL: &[u8] = b"_\r\n";
 pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
 pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
 pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
+pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
+pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
+pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
 
 // NOTE: this is based on the codecrafters examples
 pub const PROTOCOL: Protocol = Protocol::RESP2;
@@ -147,8 +149,19 @@ impl DataExt for DataType {
 
 #[derive(Debug)]
 pub struct ReplState {
-    pub(crate) repl_id: Cow<'static, str>,
-    pub(crate) repl_offset: usize,
+    /// Pseudo random alphanumeric string of 40 characters
+    pub(crate) repl_id: String,
+    pub(crate) repl_offset: isize,
+}
+
+impl Default for ReplState {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            repl_id: String::from("?"),
+            repl_offset: -1,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -179,7 +192,10 @@ impl Instance {
             return Ok(Self::Leader { repl, store, cfg });
         };
 
-        let _handshake = Handshake::ping(leader, cfg.clone()).await?.conf().await?;
+        let _ = Replication::handshake(leader, cfg.clone())
+            .await
+            .with_context(|| format!("handshake with leader at {leader}"))?;
+
         Ok(Self::Replica { repl, store, cfg })
     }
 
@@ -227,7 +243,6 @@ impl Instance {
                 }
             };
 
-            // NOTE: for now we just ignore the payload and hard-code the response to PING
             writer.write(resp).await?;
         }
 

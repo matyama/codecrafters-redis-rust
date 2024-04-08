@@ -65,7 +65,7 @@ pub struct Replication {
     master_replid2: Cow<'static, str>,
 
     /// The server's current replication offset
-    master_repl_offset: usize,
+    master_repl_offset: isize,
 
     /// The offset up to which replication IDs are accepted
     second_repl_offset: isize,
@@ -113,8 +113,8 @@ impl From<&Instance> for Replication {
             role: Role::from(instance),
             connected_slaves: 0,
             master_failover_state: FailoverState::default(),
-            master_replid: repl.repl_id.clone(),
-            master_replid2: repl.repl_id.clone(),
+            master_replid: repl.repl_id.clone().into(),
+            master_replid2: repl.repl_id.clone().into(),
             master_repl_offset: repl.repl_offset,
             second_repl_offset: -1,
             repl_backlog_active: false,
