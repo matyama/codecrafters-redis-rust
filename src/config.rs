@@ -9,7 +9,7 @@ fn listen_socket_addr(port: &impl std::fmt::Display) -> Result<SocketAddr> {
         .with_context(|| format!("failed to parse listen socket address: '0.0.0.0:{port}'"))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub(crate) addr: SocketAddr,
     pub(crate) replica_of: Option<SocketAddr>,

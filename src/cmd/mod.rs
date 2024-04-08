@@ -7,6 +7,7 @@ use crate::store::{Key, Value};
 use crate::{DataType, Instance, Protocol, OK, PONG, PROTOCOL};
 
 pub mod info;
+pub mod replconf;
 pub mod set;
 
 const NULL: DataType = match PROTOCOL {
@@ -21,6 +22,7 @@ pub enum Command {
     Info(Vec<Bytes>),
     Get(Key),
     Set(Key, Value, set::Options),
+    Replconf(replconf::Conf),
 }
 
 impl Command {
@@ -57,6 +59,9 @@ impl Command {
                     Err(_) => NULL,
                 }
             }
+
+            // TODO: handle ListeningPort | Capabilities
+            Self::Replconf(_) => DataType::SimpleString(OK),
         }
     }
 }

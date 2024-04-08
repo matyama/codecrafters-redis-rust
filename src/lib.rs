@@ -60,12 +60,18 @@ impl From<DataType> for Resp {
 pub trait DataExt {
     // NOTE: this could probably benefit from small vec optimization
     fn to_uppercase(&self) -> Vec<u8>;
+    fn to_lowercase(&self) -> Vec<u8>;
 }
 
 impl DataExt for Bytes {
     #[inline]
     fn to_uppercase(&self) -> Vec<u8> {
         self.to_ascii_uppercase()
+    }
+
+    #[inline]
+    fn to_lowercase(&self) -> Vec<u8> {
+        self.to_ascii_lowercase()
     }
 }
 
@@ -82,6 +88,11 @@ pub enum DataType {
 }
 
 impl DataType {
+    #[inline]
+    pub(crate) fn string(bytes: &'static [u8]) -> Self {
+        Self::BulkString(Bytes::from_static(bytes))
+    }
+
     #[inline]
     pub(crate) fn array(items: impl Into<VecDeque<Self>>) -> Self {
         Self::Array(items.into())
@@ -115,6 +126,19 @@ impl DataExt for DataType {
             other => {
                 let mut other = format!("{other:?}");
                 other.make_ascii_uppercase();
+                other.into()
+            }
+        }
+    }
+
+    fn to_lowercase(&self) -> Vec<u8> {
+        match self {
+            Self::NullBulkString => vec![],
+            Self::SimpleString(s) => s.to_lowercase(),
+            Self::BulkString(s) => s.to_lowercase(),
+            other => {
+                let mut other = format!("{other:?}");
+                other.make_ascii_lowercase();
                 other.into()
             }
         }
@@ -155,7 +179,7 @@ impl Instance {
             return Ok(Self::Leader { repl, store, cfg });
         };
 
-        let _handshake = Handshake::ping(leader).await?;
+        let _handshake = Handshake::ping(leader, cfg.clone()).await?.conf().await?;
         Ok(Self::Replica { repl, store, cfg })
     }
 

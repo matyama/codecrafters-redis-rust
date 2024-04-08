@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
-use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, LF, PONG};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, LF, OK, PONG};
 
 pub struct DataReader<'r> {
     reader: BufReader<ReadHalf<'r>>,
@@ -48,6 +48,8 @@ impl<'r> DataReader<'r> {
         };
 
         let cmd = match cmd.as_slice() {
+            b"OK" => return Ok(Some(DataType::SimpleString(OK).into())),
+
             b"PING" => match args.pop_front() {
                 None => Command::Ping(None),
                 Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
@@ -91,6 +93,8 @@ impl<'r> DataReader<'r> {
                 (None, None) => bail!("SET requires two arguments, got none"),
                 args => bail!("protocol violation: SET with invalid argument types {args:?}"),
             },
+
+            b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
 
             cmd => bail!(
                 "protocol violation: unsupported command '{}'",
