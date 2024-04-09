@@ -334,8 +334,10 @@ impl Instance {
                     println!("executing {cmd:?}");
                     let resp = cmd.exec(Arc::clone(&self)).await;
                     writer.write(resp).await?;
+
                     let rdbfile = RDBFile::empty();
                     writer.write_rdb(rdbfile).await?;
+                    writer.flush().await?;
                 }
                 Resp::Cmd(cmd @ Command::PSync(_)) => {
                     bail!("protocol violation: {cmd:?} is only supported by a leader");

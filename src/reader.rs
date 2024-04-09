@@ -31,6 +31,7 @@ impl<'r> DataReader<'r> {
 
     // TODO: reading a RDB file is not yet implemented
     pub async fn read_rdb(&mut self) -> Result<RDBFile> {
+        println!("reading RDB file");
         Ok(RDBFile::empty())
     }
 
