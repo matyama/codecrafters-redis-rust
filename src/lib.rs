@@ -33,6 +33,9 @@ pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
 
 pub(crate) const DEFAULT_REPL_ID: Bytes = Bytes::from_static(b"?");
 
+// TODO: generalize to non-unix systems via cfg target_os
+const EMPTY_RDB: Bytes = Bytes::from_static(include_bytes!("../data/empty_rdb.dat"));
+
 // NOTE: this is based on the codecrafters examples
 pub const PROTOCOL: Protocol = Protocol::RESP2;
 
@@ -149,6 +152,17 @@ impl DataExt for DataType {
     }
 }
 
+#[derive(Debug, Clone)]
+#[repr(transparent)]
+pub struct RDBFile(pub(crate) Bytes);
+
+impl RDBFile {
+    #[inline]
+    pub fn empty() -> Self {
+        Self(EMPTY_RDB)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[repr(transparent)]
 pub struct ReplId(Bytes);
@@ -240,6 +254,7 @@ impl std::fmt::Display for ReplState {
     }
 }
 
+// XXX: might need to store the both the state and store under a common mutex
 #[derive(Debug)]
 pub enum Instance {
     Leader {
@@ -312,17 +327,28 @@ impl Instance {
         let mut writer = DataWriter::new(writer);
 
         while let Some(resp) = reader.read_next().await? {
-            let resp = match resp {
+            match resp {
+                Resp::Cmd(cmd @ Command::PSync(_))
+                    if matches!(self.as_ref(), Instance::Leader { .. }) =>
+                {
+                    println!("executing {cmd:?}");
+                    let resp = cmd.exec(Arc::clone(&self)).await;
+                    writer.write(resp).await?;
+                    let rdbfile = RDBFile::empty();
+                    writer.write_rdb(rdbfile).await?;
+                }
+                Resp::Cmd(cmd @ Command::PSync(_)) => {
+                    bail!("protocol violation: {cmd:?} is only supported by a leader");
+                }
                 Resp::Cmd(cmd) => {
                     println!("executing {cmd:?}");
-                    cmd.exec(Arc::clone(&self)).await
+                    let resp = cmd.exec(Arc::clone(&self)).await;
+                    writer.write(resp).await?;
                 }
                 Resp::Data(resp) => {
                     bail!("protocol violation: expected a command, got {resp:?} instead")
                 }
             };
-
-            writer.write(resp).await?;
         }
 
         println!("flushing and closing connection");

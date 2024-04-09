@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
-use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
+use crate::{cmd, Command, DataExt, DataType, RDBFile, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
 
 pub struct DataReader<'r> {
     reader: BufReader<ReadHalf<'r>>,
@@ -27,6 +27,11 @@ impl<'r> DataReader<'r> {
             // here we'd ideally use some sort of buffer pooling
             buf: Vec::with_capacity(1024),
         }
+    }
+
+    // TODO: reading a RDB file is not yet implemented
+    pub async fn read_rdb(&mut self) -> Result<RDBFile> {
+        Ok(RDBFile::empty())
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Resp>> {

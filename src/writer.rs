@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::WriteHalf;
 
-use crate::{DataType, CRLF, NULL};
+use crate::{DataType, RDBFile, CRLF, NULL};
 
 pub struct DataWriter<'w> {
     writer: BufWriter<WriteHalf<'w>>,
@@ -124,6 +124,36 @@ impl<'w> DataWriter<'w> {
 
             self.flush().await
         })
+    }
+
+    /// Write a RDB file
+    ///
+    /// # Format
+    /// `$<length_of_file>\r\n<contents_of_file>`
+    ///
+    /// Note that the format similar to how [Bulk String](DataType::BulkString)s are encoded, but
+    /// without the trailing [CLRF].
+    pub async fn write_rdb(&mut self, RDBFile(data): RDBFile) -> Result<()> {
+        self.writer.write_u8(b'$').await?;
+
+        self.buf.clear();
+        write!(self.buf, "{}", data.len())?;
+        println!(
+            "writing RDB file length of {}: {:?}",
+            data.len(),
+            self.buf.as_bytes()
+        );
+        self.writer.write_all(self.buf.as_bytes()).await?;
+        self.writer.write_all(CRLF).await?;
+
+        if data.is_empty() {
+            return self.flush().await;
+        }
+
+        self.writer
+            .write_all(&data)
+            .await
+            .context("RDB file contents")
     }
 
     pub async fn flush(&mut self) -> Result<()> {

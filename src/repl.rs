@@ -7,8 +7,8 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
 use crate::{
-    Command, Config, DataExt as _, DataReader, DataType, DataWriter, ReplState, Resp, PING, PSYNC,
-    REPLCONF,
+    Command, Config, DataExt as _, DataReader, DataType, DataWriter, RDBFile, ReplState, Resp,
+    PING, PSYNC, REPLCONF,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,7 +28,7 @@ impl Replication {
         Ok(Self { conn, cfg })
     }
 
-    pub async fn handshake(leader: SocketAddr, cfg: Config) -> Result<Self> {
+    pub async fn handshake(leader: SocketAddr, cfg: Config) -> Result<RDBFile> {
         Self::new(leader, cfg)
             .await?
             .ping()
@@ -94,7 +94,7 @@ impl Replication {
         }
     }
 
-    async fn sync(mut self) -> Result<Self> {
+    async fn sync(mut self) -> Result<RDBFile> {
         let state = ReplState::default();
 
         let psync = [
@@ -109,7 +109,14 @@ impl Replication {
             .with_context(|| format!("PSYNC {state}"))?;
 
         match resp {
-            Resp::Cmd(Command::FullResync(_state)) => Ok(self),
+            // TODO: don't forget about the state
+            Resp::Cmd(Command::FullResync(_state)) => {
+                let (reader, _) = self.conn.split();
+                DataReader::new(reader)
+                    .read_rdb()
+                    .await
+                    .with_context(|| format!("reading RDB file after PSYNC {state}"))
+            }
             other => bail!("unexpected response {other:?}"),
         }
     }
