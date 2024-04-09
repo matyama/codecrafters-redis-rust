@@ -31,6 +31,8 @@ pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
 pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
 pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
 
+pub(crate) const DEFAULT_REPL_ID: Bytes = Bytes::from_static(b"?");
+
 // NOTE: this is based on the codecrafters examples
 pub const PROTOCOL: Protocol = Protocol::RESP2;
 
@@ -147,27 +149,59 @@ impl DataExt for DataType {
     }
 }
 
-#[derive(Debug)]
-pub struct ReplState {
-    // TODO: consider making `repl_id: Option<[_; 40]>`
-    /// Pseudo random alphanumeric string of 40 characters
-    pub(crate) repl_id: String,
-    pub(crate) repl_offset: isize,
+#[derive(Debug, Clone, PartialEq)]
+#[repr(transparent)]
+pub struct ReplId(Bytes);
+
+impl ReplId {
+    #[inline]
+    pub fn new(repl_id: Bytes) -> Result<Option<ReplId>> {
+        match repl_id.as_ref() {
+            b"?" => Ok(None),
+            id if id.is_ascii() && id.len() == 40 => Ok(Some(Self(repl_id))),
+            id => bail!("invalid REPL_ID: {id:?}"),
+        }
+    }
 }
 
-impl<B> TryFrom<(B, B)> for ReplState
+impl From<ReplId> for Bytes {
+    #[inline]
+    fn from(ReplId(id): ReplId) -> Self {
+        id
+    }
+}
+
+impl Default for ReplId {
+    #[inline]
+    fn default() -> Self {
+        Self(DEFAULT_REPL_ID)
+    }
+}
+
+impl std::fmt::Display for ReplId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Ok(repl_id) = std::str::from_utf8(&self.0) else {
+            unreachable!("REPL_ID is valid UTF-8 by construction");
+        };
+        f.write_str(repl_id)
+    }
+}
+
+#[derive(Debug)]
+pub struct ReplState {
+    /// Pseudo random alphanumeric string of 40 characters
+    repl_id: Option<ReplId>,
+    repl_offset: isize,
+}
+
+impl<B> TryFrom<(Bytes, B)> for ReplState
 where
     B: std::ops::Deref<Target = [u8]> + Debug,
 {
     type Error = anyhow::Error;
 
-    fn try_from((repl_id, repl_offset): (B, B)) -> Result<Self> {
-        let repl_id = match std::str::from_utf8(&repl_id) {
-            Ok(id) if id.is_ascii() && id.len() == 40 => id.to_owned(),
-            Ok(id) if id == "?" => id.to_owned(),
-            Ok(id) => bail!("invalid REPL_ID: '{id}'"),
-            Err(e) => bail!("non-UTF-8 REPL_ID: {e:?}"),
-        };
+    fn try_from((repl_id, repl_offset): (Bytes, B)) -> Result<Self> {
+        let repl_id = ReplId::new(repl_id)?;
 
         let Ok(repl_offset) = std::str::from_utf8(&repl_offset) else {
             bail!("non-UTF-8 REPL_OFFSET: {repl_offset:?}");
@@ -188,15 +222,21 @@ impl Default for ReplState {
     #[inline]
     fn default() -> Self {
         Self {
-            repl_id: String::from("?"),
+            repl_id: None,
             repl_offset: -1,
         }
     }
 }
 
 impl std::fmt::Display for ReplState {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.repl_id, self.repl_offset)
+        write!(
+            f,
+            "{} {}",
+            self.repl_id.clone().unwrap_or_default(),
+            self.repl_offset
+        )
     }
 }
 
@@ -218,7 +258,10 @@ impl Instance {
     pub async fn new(cfg: Config) -> Result<Self> {
         // TODO: this is just an initial placeholder replication state
         let repl = ReplState {
-            repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".into(),
+            repl_id: ReplId::new(Bytes::from_static(
+                b"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+            ))
+            .expect("valid REPL_ID"),
             repl_offset: 0,
         };
 

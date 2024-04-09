@@ -125,6 +125,8 @@ impl<'r> DataReader<'r> {
                     );
                 };
 
+                let repl_id = BytesMut::from(repl_id).freeze();
+
                 let state = (repl_id, repl_offset)
                     .try_into()
                     .with_context(|| format!("{}", String::from_utf8_lossy(cmd)))?;

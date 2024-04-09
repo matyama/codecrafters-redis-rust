@@ -1,6 +1,4 @@
-use std::borrow::Cow;
-
-use crate::Instance;
+use crate::{Instance, ReplId};
 
 #[derive(Debug)]
 pub enum Role {
@@ -59,10 +57,10 @@ pub struct Replication {
     master_failover_state: FailoverState,
 
     /// The replication ID of the Redis server
-    master_replid: Cow<'static, str>,
+    master_replid: ReplId,
 
     /// The secondary replication ID, used for PSYNC after a failover
-    master_replid2: Cow<'static, str>,
+    master_replid2: ReplId,
 
     /// The server's current replication offset
     master_repl_offset: isize,
@@ -113,8 +111,8 @@ impl From<&Instance> for Replication {
             role: Role::from(instance),
             connected_slaves: 0,
             master_failover_state: FailoverState::default(),
-            master_replid: repl.repl_id.clone().into(),
-            master_replid2: repl.repl_id.clone().into(),
+            master_replid: repl.repl_id.clone().unwrap_or_default(),
+            master_replid2: repl.repl_id.clone().unwrap_or_default(),
             master_repl_offset: repl.repl_offset,
             second_repl_offset: -1,
             repl_backlog_active: false,

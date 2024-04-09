@@ -93,21 +93,18 @@ impl Replication {
     }
 
     async fn sync(mut self) -> Result<Self> {
-        let ReplState {
-            repl_id,
-            repl_offset,
-        } = ReplState::default();
+        let state = ReplState::default();
 
         let psync = [
             DataType::BulkString(PSYNC),
-            DataType::BulkString(repl_id.clone().into()),
-            DataType::BulkString(repl_offset.to_string().into()),
+            DataType::BulkString(state.repl_id.clone().unwrap_or_default().into()),
+            DataType::BulkString(state.repl_offset.to_string().into()),
         ];
 
         let resp = self
             .request(psync)
             .await
-            .with_context(|| format!("PSYNC {repl_id} {repl_offset}"))?;
+            .with_context(|| format!("PSYNC {state}"))?;
 
         match resp {
             Resp::Cmd(Command::FullResync(_state)) => Ok(self),
