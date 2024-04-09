@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, u16};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 
 use crate::{DataExt as _, DataType};
@@ -8,13 +8,15 @@ use crate::{DataExt as _, DataType};
 #[derive(Debug)]
 pub enum Conf {
     ListeningPort(u16),
-    Capabilities(Bytes),
+    Capabilities(VecDeque<Bytes>),
 }
 
 impl TryFrom<VecDeque<DataType>> for Conf {
     type Error = anyhow::Error;
 
     fn try_from(mut args: VecDeque<DataType>) -> Result<Self> {
+        let mut capabilities = VecDeque::with_capacity(2);
+
         while let Some(key) = args.pop_front() {
             let key @ (DataType::BulkString(_) | DataType::SimpleString(_)) = key else {
                 continue;
@@ -36,7 +38,7 @@ impl TryFrom<VecDeque<DataType>> for Conf {
 
                 b"capa" | b"capabilities" => match args.pop_front() {
                     Some(DataType::BulkString(capa) | DataType::SimpleString(capa)) => {
-                        return Ok(Self::Capabilities(capa));
+                        capabilities.push_back(capa);
                     }
                     other => bail!("protocol violation: REPLCONF {key:?} {other:?}"),
                 },
@@ -45,6 +47,12 @@ impl TryFrom<VecDeque<DataType>> for Conf {
             }
         }
 
-        bail!("protocol violation: REPLCONF with unknown/unsupported arguments");
+        // NOTE: in case of listening-port we return immediately
+        ensure!(
+            !capabilities.is_empty(),
+            "protocol violation: REPLCONF with unknown/unsupported arguments"
+        );
+
+        Ok(Self::Capabilities(capabilities))
     }
 }

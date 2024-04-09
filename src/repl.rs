@@ -78,13 +78,15 @@ impl Replication {
         let replconf = [
             DataType::BulkString(REPLCONF),
             DataType::string(b"capa"),
+            DataType::string(b"eof"),
+            DataType::string(b"capa"),
             DataType::string(b"psync2"),
         ];
 
         let resp = self
             .request(replconf)
             .await
-            .context("REPLCONF capa psync2")?;
+            .context("REPLCONF capa eof capa psync2")?;
 
         match resp {
             Resp::Data(DataType::SimpleString(s)) if ok(&s) => Ok(self),
