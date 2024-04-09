@@ -65,13 +65,10 @@ impl Command {
             // TODO: handle ListeningPort | Capabilities
             Self::Replconf(_) => DataType::SimpleString(OK),
 
-            Self::PSync(ReplState {
-                repl_id,
-                repl_offset,
-            }) if repl_id == "?" && repl_offset == -1 => {
-                let mut resp = BytesMut::with_capacity(64);
-                match write!(resp, "FULLRESYNC {repl_id} {repl_offset}") {
-                    Ok(_) => DataType::SimpleString(resp.freeze()),
+            Self::PSync(state) if state.repl_id == "?" && state.repl_offset == -1 => {
+                let mut data = BytesMut::with_capacity(64);
+                match write!(data, "FULLRESYNC {state}") {
+                    Ok(_) => DataType::SimpleString(data.freeze()),
                     Err(e) => {
                         let error = format!("failed to write response to PSYNC ? -1: {e:?}");
                         DataType::SimpleError(error.into())

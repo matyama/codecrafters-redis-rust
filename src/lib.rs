@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{collections::VecDeque, fmt::Debug};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -149,9 +149,39 @@ impl DataExt for DataType {
 
 #[derive(Debug)]
 pub struct ReplState {
+    // TODO: consider making `repl_id: Option<[_; 40]>`
     /// Pseudo random alphanumeric string of 40 characters
     pub(crate) repl_id: String,
     pub(crate) repl_offset: isize,
+}
+
+impl<B> TryFrom<(B, B)> for ReplState
+where
+    B: std::ops::Deref<Target = [u8]> + Debug,
+{
+    type Error = anyhow::Error;
+
+    fn try_from((repl_id, repl_offset): (B, B)) -> Result<Self> {
+        let repl_id = match std::str::from_utf8(&repl_id) {
+            Ok(id) if id.is_ascii() && id.len() == 40 => id.to_owned(),
+            Ok(id) if id == "?" => id.to_owned(),
+            Ok(id) => bail!("invalid REPL_ID: '{id}'"),
+            Err(e) => bail!("non-UTF-8 REPL_ID: {e:?}"),
+        };
+
+        let Ok(repl_offset) = std::str::from_utf8(&repl_offset) else {
+            bail!("non-UTF-8 REPL_OFFSET: {repl_offset:?}");
+        };
+
+        let Ok(repl_offset) = repl_offset.parse() else {
+            bail!("non-int REPL_OFFSET: {repl_offset}");
+        };
+
+        Ok(ReplState {
+            repl_id,
+            repl_offset,
+        })
+    }
 }
 
 impl Default for ReplState {
@@ -161,6 +191,12 @@ impl Default for ReplState {
             repl_id: String::from("?"),
             repl_offset: -1,
         }
+    }
+}
+
+impl std::fmt::Display for ReplState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.repl_id, self.repl_offset)
     }
 }
 

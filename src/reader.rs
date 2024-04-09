@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::tcp::ReadHalf;
 
-use crate::{cmd, Command, DataExt, DataType, ReplState, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
 
 pub struct DataReader<'r> {
     reader: BufReader<ReadHalf<'r>>,
@@ -98,26 +98,10 @@ impl<'r> DataReader<'r> {
 
             b"PSYNC" => match (args.pop_front(), args.pop_front()) {
                 (Some(DataType::BulkString(repl_id)), Some(DataType::BulkString(repl_offset))) => {
-                    // TODO: dedup with FULLRESYNC
-                    let repl_id = match std::str::from_utf8(&repl_id) {
-                        // TODO: consider making `repl_id: Option<[_; 40]>`
-                        Ok(id) if id.is_ascii() && (id.len() == 40 || id == "?") => id.to_owned(),
-                        Ok(id) => bail!("PSYNC with invalid ID: '{id}'"),
-                        Err(e) => bail!("PSYNC with non-UTF-8 ID: {e:?}"),
-                    };
-
-                    let Ok(repl_offset) = std::str::from_utf8(&repl_offset) else {
-                        bail!("PSYNC with non-UTF-8 offset: {repl_offset:?}");
-                    };
-
-                    let Ok(repl_offset) = repl_offset.parse() else {
-                        bail!("PSYNC with non-int offset: {repl_offset}");
-                    };
-
-                    Command::PSync(ReplState {
-                        repl_id,
-                        repl_offset,
-                    })
+                    let state = (repl_id.clone(), repl_offset.clone())
+                        .try_into()
+                        .with_context(|| format!("PSYNC {repl_id:?} {repl_offset:?}"))?;
+                    Command::PSync(state)
                 }
                 (Some(id), None) => bail!("PSYNC {id:?} _ is missing offset"),
                 (None, Some(offset)) => bail!("PSYNC _ {offset:?} is missing ID"),
@@ -141,28 +125,11 @@ impl<'r> DataReader<'r> {
                     );
                 };
 
-                let repl_id = match std::str::from_utf8(repl_id) {
-                    Ok(id) if id.is_ascii() && id.len() == 40 => id.to_owned(),
-                    Ok(id) if id == "?" => id.to_owned(),
-                    Ok(id) => bail!("FULLRESYNC with invalid ID: '{id}'"),
-                    Err(e) => bail!("FULLRESYNC with non-UTF-8 ID: {e:?}"),
-                };
+                let state = (repl_id, repl_offset)
+                    .try_into()
+                    .with_context(|| format!("{}", String::from_utf8_lossy(cmd)))?;
 
-                let Ok(repl_offset) = std::str::from_utf8(repl_offset) else {
-                    bail!(
-                        "FULLRESYNC with non-UTF-8 offset: {}",
-                        String::from_utf8_lossy(repl_offset)
-                    );
-                };
-
-                let Ok(repl_offset) = repl_offset.parse() else {
-                    bail!("FULLRESYNC with non-int offset: {repl_offset}");
-                };
-
-                Command::FullResync(ReplState {
-                    repl_id,
-                    repl_offset,
-                })
+                Command::FullResync(state)
             }
 
             cmd => bail!(
