@@ -71,8 +71,13 @@ impl Command {
                     repl_offset: -1,
                 },
             ) => {
+                let Instance::Leader { repl, .. } = instance.as_ref() else {
+                    let error = format!("unsupported command in a replica: PSYNC {state} ");
+                    return DataType::SimpleError(error.into());
+                };
+
                 let mut data = BytesMut::with_capacity(64);
-                match write!(data, "FULLRESYNC {state}") {
+                match write!(data, "FULLRESYNC {repl}") {
                     Ok(_) => DataType::SimpleString(data.freeze()),
                     Err(e) => {
                         let error = format!("failed to write response to PSYNC ? -1: {e:?}");
