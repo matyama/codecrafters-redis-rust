@@ -25,6 +25,7 @@ pub(crate) mod repl;
 pub(crate) mod store;
 pub(crate) mod writer;
 
+pub(crate) const EOF: u8 = 255; // 0xFF (e.g., RDB EOF op code)
 pub(crate) const LF: u8 = b'\n'; // 10
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
@@ -167,9 +168,9 @@ impl DataExt for DataType {
 
 #[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct RDBFile(pub(crate) Bytes);
+pub struct RDB(pub(crate) Bytes);
 
-impl RDBFile {
+impl RDB {
     #[inline]
     pub fn empty() -> Self {
         Self(EMPTY_RDB)
@@ -446,8 +447,8 @@ impl Instance {
                     let resp = cmd.exec(Arc::clone(&self)).await;
                     writer.write(&resp).await?;
 
-                    let rdbfile = RDBFile::empty();
-                    writer.write_rdb(rdbfile).await?;
+                    let rdb = RDB::empty();
+                    writer.write_rdb(rdb).await?;
                     writer.flush().await?;
 
                     return replicas.register(conn).await;

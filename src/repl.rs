@@ -9,7 +9,7 @@ use tokio::net::{tcp::OwnedReadHalf, TcpStream};
 use tokio::time::timeout;
 
 use crate::{
-    Command, DataExt as _, DataReader, DataType, DataWriter, RDBFile, ReplState, Resp, PING, PSYNC,
+    Command, DataExt as _, DataReader, DataType, DataWriter, ReplState, Resp, PING, PSYNC, RDB,
     REPLCONF, TIMEOUT,
 };
 
@@ -77,7 +77,7 @@ impl Replication {
     pub async fn handshake(
         leader: SocketAddr,
         replica: SocketAddr,
-    ) -> Result<(RDBFile, ReplSubscriber)> {
+    ) -> Result<(RDB, ReplSubscriber)> {
         let (Replication { conn, .. }, rdb) = Self::new(leader, replica)
             .await?
             .ping()
@@ -148,7 +148,7 @@ impl Replication {
         }
     }
 
-    async fn sync(mut self) -> Result<(Self, RDBFile)> {
+    async fn sync(mut self) -> Result<(Self, RDB)> {
         let state = ReplState::default();
 
         let psync = [

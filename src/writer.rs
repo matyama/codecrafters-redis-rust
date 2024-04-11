@@ -5,7 +5,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::{DataType, RDBFile, CRLF, NULL};
+use crate::{DataType, CRLF, EOF, NULL, RDB};
 
 pub struct DataWriter<W> {
     writer: BufWriter<W>,
@@ -136,7 +136,7 @@ where
     ///
     /// Note that the format similar to how [Bulk String](DataType::BulkString)s are encoded, but
     /// without the trailing [CLRF].
-    pub async fn write_rdb(&mut self, RDBFile(data): RDBFile) -> Result<()> {
+    pub async fn write_rdb(&mut self, RDB(data): RDB) -> Result<()> {
         self.writer.write_u8(b'$').await?;
 
         self.buf.clear();
@@ -156,7 +156,10 @@ where
         self.writer
             .write_all(&data)
             .await
-            .context("RDB file contents")
+            .context("RDB file contents")?;
+
+        // TODO: this impl assumes capa EOF
+        self.writer.write_u8(EOF).await.context("RDB EOF")
     }
 
     pub async fn flush(&mut self) -> Result<()> {

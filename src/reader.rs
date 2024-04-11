@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::{cmd, Command, DataExt, DataType, RDBFile, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, EOF, FULLRESYNC, LF, OK, PONG, RDB};
 
 pub struct DataReader<R> {
     reader: BufReader<R>,
@@ -32,20 +32,19 @@ where
         }
     }
 
-    // TODO: reading a RDB file is not yet implemented
-    pub async fn read_rdb(&mut self) -> Result<RDBFile> {
+    pub async fn read_rdb(&mut self) -> Result<RDB> {
         println!("reading RDB file");
-        let rdb = RDBFile::empty();
 
-        let mut buf = BytesMut::with_capacity(rdb.len());
-        buf.resize(rdb.len(), 0);
+        self.buf.clear();
 
-        self.reader
-            .read_exact(&mut buf)
+        // TODO: this impl assumes capa EOF
+        let n = self
+            .reader
+            .read_until(EOF, &mut self.buf)
             .await
             .context("failed to read RDB file")?;
 
-        Ok(RDBFile(buf.freeze()))
+        Ok(RDB(Bytes::copy_from_slice(&self.buf[..n])))
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Resp>> {
