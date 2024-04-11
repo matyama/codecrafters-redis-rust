@@ -9,18 +9,21 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::net::tcp::ReadHalf;
 
 use crate::{cmd, Command, DataExt, DataType, RDBFile, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
 
-pub struct DataReader<'r> {
-    reader: BufReader<ReadHalf<'r>>,
+pub struct DataReader<R> {
+    reader: BufReader<R>,
     buf: Vec<u8>,
 }
 
-impl<'r> DataReader<'r> {
+impl<R> DataReader<R>
+where
+    R: AsyncReadExt + Send + Unpin,
+{
+    // TODO: it's unfortunate that ad-hoc uses of this always allocate `buf`, make it reusable
     #[inline]
-    pub fn new(reader: ReadHalf<'r>) -> Self {
+    pub fn new(reader: R) -> Self {
         Self {
             reader: BufReader::new(reader),
             // TODO: customize capacity
@@ -32,7 +35,17 @@ impl<'r> DataReader<'r> {
     // TODO: reading a RDB file is not yet implemented
     pub async fn read_rdb(&mut self) -> Result<RDBFile> {
         println!("reading RDB file");
-        Ok(RDBFile::empty())
+        let rdb = RDBFile::empty();
+
+        let mut buf = BytesMut::with_capacity(rdb.len());
+        buf.resize(rdb.len(), 0);
+
+        self.reader
+            .read_exact(&mut buf)
+            .await
+            .context("failed to read RDB file")?;
+
+        Ok(RDBFile(buf.freeze()))
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Resp>> {

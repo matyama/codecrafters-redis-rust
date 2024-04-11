@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 use crate::{DataExt as _, DataType};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Conf {
     ListeningPort(u16),
     Capabilities(VecDeque<Bytes>),

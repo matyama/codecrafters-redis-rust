@@ -6,12 +6,12 @@ pub enum Role {
     Slave,
 }
 
-impl From<&Instance> for Role {
+impl From<&crate::Role> for Role {
     #[inline]
-    fn from(instance: &Instance) -> Self {
-        match instance {
-            Instance::Leader { .. } => Self::Master,
-            Instance::Replica { .. } => Self::Slave,
+    fn from(role: &crate::Role) -> Self {
+        match role {
+            crate::Role::Leader(_) => Self::Master,
+            crate::Role::Replica(_) => Self::Slave,
         }
     }
 }
@@ -103,17 +103,16 @@ impl std::fmt::Display for Replication {
     }
 }
 
-impl From<&Instance> for Replication {
+impl Replication {
     #[inline]
-    fn from(instance: &Instance) -> Self {
-        let (Instance::Leader { repl, .. } | Instance::Replica { repl, .. }) = instance;
+    pub(crate) fn new(instance: &Instance) -> Self {
         Self {
-            role: Role::from(instance),
+            role: Role::from(&instance.role),
             connected_slaves: 0,
             master_failover_state: FailoverState::default(),
-            master_replid: repl.repl_id.clone().unwrap_or_default(),
-            master_replid2: repl.repl_id.clone().unwrap_or_default(),
-            master_repl_offset: repl.repl_offset,
+            master_replid: instance.state.repl_id.clone().unwrap_or_default(),
+            master_replid2: instance.state.repl_id.clone().unwrap_or_default(),
+            master_repl_offset: instance.state.repl_offset,
             second_repl_offset: -1,
             repl_backlog_active: false,
             repl_backlog_size: 0,
@@ -132,7 +131,7 @@ impl Info {
     pub(crate) fn new(instance: &Instance, sections: Vec<bytes::Bytes>) -> Self {
         if sections.is_empty() {
             return Self {
-                replication: Some(Replication::from(instance)),
+                replication: Some(Replication::new(instance)),
             };
         }
 
@@ -140,7 +139,7 @@ impl Info {
 
         for section in sections {
             match section.to_ascii_lowercase().as_slice() {
-                b"replication" => info.replication = Some(Replication::from(instance)),
+                b"replication" => info.replication = Some(Replication::new(instance)),
                 _ => continue,
             }
         }

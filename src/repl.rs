@@ -1,35 +1,84 @@
 use std::fmt::Write;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::net::{tcp::OwnedReadHalf, TcpStream};
+use tokio::time::timeout;
 
 use crate::{
-    Command, Config, DataExt as _, DataReader, DataType, DataWriter, RDBFile, ReplState, Resp,
-    PING, PSYNC, REPLCONF,
+    Command, DataExt as _, DataReader, DataType, DataWriter, RDBFile, ReplState, Resp, PING, PSYNC,
+    REPLCONF, TIMEOUT,
 };
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+#[derive(Default)]
+pub enum ReplSubscriber {
+    #[default]
+    Noop,
+    RecvWrite(DataReader<OwnedReadHalf>),
+}
+
+impl ReplSubscriber {
+    pub fn recv_write(
+        mut self,
+    ) -> Pin<Box<impl Future<Output = Result<(Self, Command), (Self, anyhow::Error)>> + 'static>>
+    {
+        Box::pin(async {
+            let Self::RecvWrite(ref mut reader) = self else {
+                return Err((
+                    self,
+                    anyhow!("trying to receive write commands on a noop subscriber"),
+                ));
+            };
+            loop {
+                match reader.read_next().await {
+                    Ok(Some(Resp::Cmd(cmd))) if cmd.is_write() => break Ok((self, cmd)),
+                    Ok(Some(resp)) => {
+                        break Err((self, anyhow!("subscribed to write commands, got: {resp:?}")))
+                    }
+                    Ok(None) => tokio::task::yield_now().await,
+                    Err(e) => break Err((self, e)),
+                }
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for ReplSubscriber {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Noop => write!(f, "ReplSubscriber::Noop"),
+            Self::RecvWrite(_) => write!(f, "ReplSubscriber::RecvWrite"),
+        }
+    }
+}
 
 pub struct Replication {
     conn: TcpStream,
-    cfg: Config,
+    repl: SocketAddr,
 }
 
 impl Replication {
-    async fn new(leader: SocketAddr, cfg: Config) -> Result<Self> {
+    async fn new(leader: SocketAddr, replica: SocketAddr) -> Result<Self> {
         // NOTE: this could use some form of connection pooling
         let conn = TcpStream::connect(leader)
             .await
             .context("failed to establish connection")?;
 
-        Ok(Self { conn, cfg })
+        Ok(Self {
+            conn,
+            repl: replica,
+        })
     }
 
-    pub async fn handshake(leader: SocketAddr, cfg: Config) -> Result<RDBFile> {
-        Self::new(leader, cfg)
+    pub async fn handshake(
+        leader: SocketAddr,
+        replica: SocketAddr,
+    ) -> Result<(RDBFile, ReplSubscriber)> {
+        let (Replication { conn, .. }, rdb) = Self::new(leader, replica)
             .await?
             .ping()
             .await
@@ -39,7 +88,12 @@ impl Replication {
             .context("handshake config stage (REPLCONF)")?
             .sync()
             .await
-            .context("handshake sync stage (PSYNC)")
+            .context("handshake sync stage (PSYNC)")?;
+
+        let (reader, _) = conn.into_split();
+        let subscriber = ReplSubscriber::RecvWrite(DataReader::new(reader));
+
+        Ok((rdb, subscriber))
     }
 
     async fn ping(mut self) -> Result<Self> {
@@ -53,7 +107,7 @@ impl Replication {
 
     async fn conf(mut self) -> Result<Self> {
         let mut port = BytesMut::with_capacity(4);
-        write!(port, "{}", self.cfg.addr.port())?;
+        write!(port, "{}", self.repl.port())?;
         let port = port.freeze();
 
         // TODO: replace with an optimized Matcher<'_> that uses Cow internally and is_lowercase
@@ -68,7 +122,7 @@ impl Replication {
         let resp = self
             .request(replconf)
             .await
-            .with_context(|| format!("REPLCONF listening-port {}", self.cfg.addr.port()))?;
+            .with_context(|| format!("REPLCONF listening-port {}", self.repl.port()))?;
 
         match resp {
             Resp::Data(DataType::SimpleString(s)) if ok(&s) => {}
@@ -94,7 +148,7 @@ impl Replication {
         }
     }
 
-    async fn sync(mut self) -> Result<RDBFile> {
+    async fn sync(mut self) -> Result<(Self, RDBFile)> {
         let state = ReplState::default();
 
         let psync = [
@@ -112,10 +166,11 @@ impl Replication {
             // TODO: don't forget about the state
             Resp::Cmd(Command::FullResync(_state)) => {
                 let (reader, _) = self.conn.split();
-                DataReader::new(reader)
+                let rdb = DataReader::new(reader)
                     .read_rdb()
                     .await
-                    .with_context(|| format!("reading RDB file after PSYNC {state}"))
+                    .with_context(|| format!("reading RDB file after PSYNC {state}"))?;
+                Ok((self, rdb))
             }
             other => bail!("unexpected response {other:?}"),
         }
@@ -127,7 +182,7 @@ impl Replication {
         let mut writer = DataWriter::new(writer);
 
         writer
-            .write(DataType::array(args))
+            .write(&DataType::array(args))
             .await
             .context("failed to write request")?;
 

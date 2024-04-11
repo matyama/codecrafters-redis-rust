@@ -1,16 +1,26 @@
 use std::collections::VecDeque;
 
 use anyhow::{bail, ensure, Result};
+use bytes::Bytes;
 use tokio::time::Duration;
 
-use crate::{DataExt as _, DataType};
+use crate::{DataExt as _, DataType, EMPTY, GET};
+
+const EX: Bytes = Bytes::from_static(b"EX");
+const PX: Bytes = Bytes::from_static(b"PX");
+const EXAT: Bytes = Bytes::from_static(b"EXAT");
+const PXAT: Bytes = Bytes::from_static(b"PXAT");
+const KEEPTTL: Bytes = Bytes::from_static(b"KEEPTTL");
+
+const NX: Bytes = Bytes::from_static(b"NX");
+const XX: Bytes = Bytes::from_static(b"XX");
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Expiry {
-    /// Set the specified expire time
+    /// Set the specified expire time, in seconds
     EX(Duration),
-    /// Set the specified expire time
+    /// Set the specified expire time, in milliseconds
     PX(Duration),
     /// Set the specified Unix time at which the key will expire, in seconds
     #[allow(dead_code)]
@@ -22,7 +32,20 @@ pub enum Expiry {
     KeepTTL,
 }
 
-#[derive(Debug)]
+impl From<Expiry> for [Bytes; 2] {
+    #[inline]
+    fn from(expiry: Expiry) -> Self {
+        match expiry {
+            Expiry::EX(ex) => [EX, ex.as_secs().to_string().into()],
+            Expiry::PX(px) => [PX, px.as_millis().to_string().into()],
+            Expiry::EXAT(exat) => [EXAT, exat.to_string().into()],
+            Expiry::PXAT(pxat) => [PXAT, pxat.to_string().into()],
+            Expiry::KeepTTL => [KEEPTTL, EMPTY],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum Condition {
     /// Only set the key if it does not already exist
     NX,
@@ -30,7 +53,17 @@ pub enum Condition {
     XX,
 }
 
-#[derive(Debug, Default)]
+impl From<Condition> for Bytes {
+    #[inline]
+    fn from(cond: Condition) -> Self {
+        match cond {
+            Condition::NX => NX,
+            Condition::XX => XX,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     pub(crate) exp: Option<Expiry>,
     pub(crate) cond: Option<Condition>,
@@ -121,6 +154,36 @@ impl TryFrom<VecDeque<DataType>> for Options {
         }
 
         Ok(ops)
+    }
+}
+
+impl From<Options> for VecDeque<DataType> {
+    fn from(Options { exp, cond, get }: Options) -> Self {
+        // NOTE: capacity = SET <key> <value> EX <ex> <cond> GET?
+        let mut ops = VecDeque::with_capacity(8);
+
+        match exp {
+            Some(exp @ Expiry::KeepTTL) => {
+                let [keep_ttl, _] = exp.into();
+                ops.push_back(DataType::BulkString(keep_ttl));
+            }
+            Some(exp) => {
+                for op in Into::<[Bytes; 2]>::into(exp) {
+                    ops.push_back(DataType::BulkString(op));
+                }
+            }
+            None => {}
+        }
+
+        if let Some(cond) = cond {
+            ops.push_back(DataType::BulkString(cond.into()));
+        }
+
+        if get {
+            ops.push_back(DataType::BulkString(GET));
+        }
+
+        ops
     }
 }
 

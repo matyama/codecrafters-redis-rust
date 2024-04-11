@@ -1,11 +1,16 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::VecDeque, fmt::Debug};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use repl::Replication;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task;
+
+use repl::{ReplSubscriber, Replication};
 
 pub(crate) use cmd::Command;
 pub(crate) use config::Config;
@@ -24,9 +29,15 @@ pub(crate) const LF: u8 = b'\n'; // 10
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
 
+pub(crate) const EMPTY: Bytes = Bytes::from_static(b"");
+
 pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
 pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
+pub(crate) const ECHO: Bytes = Bytes::from_static(b"ECHO");
+pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
+pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
 pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
+pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
 pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
 pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
 pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
@@ -35,6 +46,8 @@ pub(crate) const DEFAULT_REPL_ID: Bytes = Bytes::from_static(b"?");
 
 // TODO: generalize to non-unix systems via cfg target_os
 const EMPTY_RDB: Bytes = Bytes::from_static(include_bytes!("../data/empty_rdb.dat"));
+
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 
 // NOTE: this is based on the codecrafters examples
 pub const PROTOCOL: Protocol = Protocol::RESP2;
@@ -161,9 +174,15 @@ impl RDBFile {
     pub fn empty() -> Self {
         Self(EMPTY_RDB)
     }
+
+    #[allow(clippy::len_without_is_empty)]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(transparent)]
 pub struct ReplId(Bytes);
 
@@ -201,7 +220,7 @@ impl std::fmt::Display for ReplId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReplState {
     /// Pseudo random alphanumeric string of 40 characters
     repl_id: Option<ReplId>,
@@ -254,25 +273,116 @@ impl std::fmt::Display for ReplState {
     }
 }
 
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Leader(SocketAddr);
+
+#[derive(Debug)]
+pub struct Replica {
+    addr: SocketAddr,
+    conn: TcpStream,
+}
+
+impl Replica {
+    pub(crate) async fn forward(&mut self, cmd: &DataType) -> Result<()> {
+        let (_, writer) = self.conn.split();
+        let mut writer = DataWriter::new(writer);
+
+        writer
+            .write(cmd)
+            .await
+            .with_context(|| format!("failed to forward a write command to {}", self.addr))?;
+
+        writer
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush replication to {}", self.addr))?;
+
+        // NOTE: here we implement an async replication, so no sync waiting for a response
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct ReplicaSet(RwLock<HashMap<SocketAddr, Arc<Mutex<Replica>>>>);
+
+impl ReplicaSet {
+    pub(crate) async fn register(&self, conn: TcpStream) -> Result<()> {
+        let Ok(addr) = conn.peer_addr() else {
+            bail!("cannot obtain replica address");
+        };
+        println!("registering new replica at {addr}");
+        let mut replicas = self.0.write().await;
+        let replica = Arc::new(Mutex::new(Replica { addr, conn }));
+        replicas.insert(addr, replica);
+        Ok(())
+    }
+
+    pub(crate) async fn forward(&self, cmd: Command) {
+        if !cmd.is_write() {
+            println!("WARN: only write commands can be forwarded to replicas, skipping {cmd:?}");
+            return;
+        };
+
+        let cmd: Arc<DataType> = Arc::new(cmd.into());
+
+        let replicas = self.0.read().await;
+
+        println!(
+            "forwarding {cmd:?} to current replica set {:?}",
+            replicas.keys()
+        );
+
+        // NOTE: spawn should be fine (i.e., without ordering issues), since there's a replica lock
+        for (&addr, replica) in replicas.iter() {
+            let cmd = Arc::clone(&cmd);
+            let replica = Arc::clone(replica);
+            tokio::spawn(async move {
+                let mut replica = replica.lock().await;
+                let result = replica.forward(&cmd).await;
+                drop(replica);
+
+                // NOTE: when async replication fails, it's the failed replicas' job to re-sync
+                match result.with_context(|| format!("replicating to {addr}")) {
+                    Ok(_) => println!("update sent to replica {addr}"),
+                    Err(e) => eprintln!("write command replication failed with {e:?}"),
+                }
+            });
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Role {
+    Leader(ReplicaSet),
+    Replica(Leader),
+}
+
+impl std::fmt::Display for Role {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Leader(_) => write!(f, "leader"),
+            Self::Replica(Leader(addr)) => write!(f, "replica of {addr}"),
+        }
+    }
+}
+
 // XXX: might need to store the both the state and store under a common mutex
 #[derive(Debug)]
-pub enum Instance {
-    Leader {
-        repl: ReplState,
-        store: Store,
-        cfg: Config,
-    },
-    Replica {
-        repl: ReplState,
-        store: Store,
-        cfg: Config,
-    },
+pub struct Instance {
+    addr: SocketAddr,
+    role: Role,
+    state: ReplState,
+    store: Store,
 }
 
 impl Instance {
-    pub async fn new(cfg: Config) -> Result<Self> {
+    pub async fn new(cfg: Config) -> Result<(Self, ReplSubscriber)> {
         // TODO: this is just an initial placeholder replication state
-        let repl = ReplState {
+        let state = ReplState {
             repl_id: ReplId::new(Bytes::from_static(
                 b"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
             ))
@@ -283,69 +393,87 @@ impl Instance {
         let store = Store::default();
 
         let Some(leader) = cfg.replica_of else {
-            return Ok(Self::Leader { repl, store, cfg });
+            let instance = Self {
+                addr: cfg.addr,
+                role: Role::Leader(ReplicaSet::default()),
+                state,
+                store,
+            };
+            return Ok((instance, ReplSubscriber::default()));
         };
 
-        let _ = Replication::handshake(leader, cfg.clone())
+        // TODO: apply initial RDB
+        let (_rdb, subscriber) = Replication::handshake(leader, cfg.addr)
             .await
             .with_context(|| format!("handshake with leader at {leader}"))?;
 
-        Ok(Self::Replica { repl, store, cfg })
+        let instance = Self {
+            addr: cfg.addr,
+            role: Role::Replica(Leader(leader)),
+            state,
+            store,
+        };
+
+        Ok((instance, subscriber))
     }
 
     #[inline]
-    pub(crate) fn cfg(&self) -> &Config {
-        match self {
-            Self::Leader {
-                repl: _,
-                store: _,
-                cfg,
-            } => cfg,
-            Self::Replica {
-                repl: _,
-                store: _,
-                cfg,
-            } => cfg,
-        }
+    pub fn is_replica(&self) -> bool {
+        matches!(self.role, Role::Replica(_))
     }
 
-    #[inline]
-    pub(crate) fn store(&self) -> &Store {
-        let (Self::Leader { repl: _, store, .. } | Self::Replica { repl: _, store, .. }) = self;
-        store
+    pub async fn listen(&self) -> Result<TcpListener> {
+        println!("{self}: binding TCP listener");
+        TcpListener::bind(self.addr)
+            .await
+            .with_context(|| format!("{self}: failed to bind a TCP listener"))
     }
 
-    #[inline]
-    pub fn addr(&self) -> SocketAddr {
-        self.cfg().addr
-    }
-
-    pub async fn handle_connection(self: Arc<Self>, mut stream: TcpStream) -> Result<()> {
-        let (reader, writer) = stream.split();
+    pub async fn handle_connection(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
+        let (reader, writer) = conn.split();
 
         let mut reader = DataReader::new(reader);
         let mut writer = DataWriter::new(writer);
 
         while let Some(resp) = reader.read_next().await? {
             match resp {
-                Resp::Cmd(cmd @ Command::PSync(_))
-                    if matches!(self.as_ref(), Instance::Leader { .. }) =>
-                {
+                Resp::Cmd(cmd @ Command::PSync(_)) => {
+                    let Role::Leader(replicas) = &self.role else {
+                        bail!("protocol violation: {cmd:?} is only supported by a leader");
+                    };
+
                     println!("executing {cmd:?}");
                     let resp = cmd.exec(Arc::clone(&self)).await;
-                    writer.write(resp).await?;
+                    writer.write(&resp).await?;
 
                     let rdbfile = RDBFile::empty();
                     writer.write_rdb(rdbfile).await?;
                     writer.flush().await?;
+
+                    return replicas.register(conn).await;
                 }
-                Resp::Cmd(cmd @ Command::PSync(_)) => {
-                    bail!("protocol violation: {cmd:?} is only supported by a leader");
+                Resp::Cmd(cmd) if cmd.is_write() => {
+                    // TODO: skip this clone (should be cheap tho) on replicas
+                    let repl_cmd = cmd.clone();
+
+                    println!("executing write command {cmd:?}");
+                    let resp = cmd.exec(Arc::clone(&self)).await;
+                    writer.write(&resp).await?;
+
+                    println!("flushing and closing connection");
+                    writer.flush().await?;
+
+                    if let Role::Leader(replicas) = &self.role {
+                        replicas.forward(repl_cmd).await;
+                    }
                 }
                 Resp::Cmd(cmd) => {
-                    println!("executing {cmd:?}");
+                    println!("executing non-write command {cmd:?}");
                     let resp = cmd.exec(Arc::clone(&self)).await;
-                    writer.write(resp).await?;
+                    writer.write(&resp).await?;
+
+                    println!("flushing and closing connection");
+                    writer.flush().await?;
                 }
                 Resp::Data(resp) => {
                     bail!("protocol violation: expected a command, got {resp:?} instead")
@@ -353,7 +481,45 @@ impl Instance {
             };
         }
 
-        println!("flushing and closing connection");
-        writer.flush().await
+        Ok(())
+    }
+
+    pub async fn spawn_replicator(self: Arc<Self>) -> WriteHandle {
+        match self.role {
+            Role::Leader(_) => {
+                let (dummy, _) = mpsc::channel::<Command>(1);
+                WriteHandle(dummy)
+            }
+            Role::Replica(_) => {
+                // NOTE: buffer up some writes and unblock new read connections
+                let (tx, mut rx) = mpsc::channel::<Command>(64);
+                let instance = Arc::clone(&self);
+                task::spawn(async move {
+                    while let Some(cmd) = rx.recv().await {
+                        println!("executing write command {cmd:?}");
+                        let resp = cmd.exec(Arc::clone(&instance)).await;
+                        println!("write command replicated: {resp:?}");
+                    }
+                });
+                WriteHandle(tx)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} @ {} ({})", self.role, self.addr, self.state)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[repr(transparent)]
+pub struct WriteHandle(mpsc::Sender<Command>);
+
+impl WriteHandle {
+    #[inline]
+    pub async fn send(&self, cmd: Command) -> Result<()> {
+        self.0.send(cmd).await.context("replicator disconnected")
     }
 }

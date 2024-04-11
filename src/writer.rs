@@ -4,18 +4,21 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::net::tcp::WriteHalf;
 
 use crate::{DataType, RDBFile, CRLF, NULL};
 
-pub struct DataWriter<'w> {
-    writer: BufWriter<WriteHalf<'w>>,
+pub struct DataWriter<W> {
+    writer: BufWriter<W>,
     buf: String,
 }
 
-impl<'w> DataWriter<'w> {
+impl<W> DataWriter<W>
+where
+    W: AsyncWriteExt + Send + Unpin,
+{
+    // TODO: it's unfortunate that ad-hoc uses of this always allocate `buf`, make it reusable
     #[inline]
-    pub fn new(writer: WriteHalf<'w>) -> Self {
+    pub fn new(writer: W) -> Self {
         Self {
             writer: BufWriter::new(writer),
             buf: String::with_capacity(16),
@@ -23,9 +26,9 @@ impl<'w> DataWriter<'w> {
     }
 
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub fn write(
-        &mut self,
-        resp: DataType,
+    pub fn write<'a>(
+        &'a mut self,
+        resp: &'a DataType,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             match resp {
@@ -47,7 +50,7 @@ impl<'w> DataWriter<'w> {
                 // booleans: `#<t|f>\r\n`
                 DataType::Boolean(boolean) => {
                     self.writer.write_u8(b'#').await?;
-                    let boolean = if boolean { b't' } else { b'f' };
+                    let boolean = if *boolean { b't' } else { b'f' };
                     println!("writing boolean {boolean:?}");
                     self.writer.write_u8(boolean).await?;
                     self.writer.write_all(CRLF).await?;
@@ -67,7 +70,7 @@ impl<'w> DataWriter<'w> {
                 DataType::SimpleString(data) => {
                     self.writer.write_u8(b'+').await?;
                     println!("writing string {data:?}");
-                    self.writer.write_all(&data).await?;
+                    self.writer.write_all(data).await?;
                     self.writer.write_all(CRLF).await?;
                 }
 
@@ -75,7 +78,7 @@ impl<'w> DataWriter<'w> {
                 DataType::SimpleError(data) => {
                     self.writer.write_u8(b'-').await?;
                     println!("writing error {data:?}");
-                    self.writer.write_all(&data).await?;
+                    self.writer.write_all(data).await?;
                     self.writer.write_all(CRLF).await?;
                 }
 
@@ -91,7 +94,7 @@ impl<'w> DataWriter<'w> {
                     );
                     self.writer.write_all(self.buf.as_bytes()).await?;
                     println!("writing {data:?}");
-                    self.writer.write_all(&data).await?;
+                    self.writer.write_all(data).await?;
                     self.writer.write_all(CRLF).await?;
                 }
 
@@ -113,7 +116,7 @@ impl<'w> DataWriter<'w> {
                         return Ok(());
                     }
 
-                    for (i, item) in items.into_iter().enumerate() {
+                    for (i, item) in items.iter().enumerate() {
                         print!("array[{i}]: ");
                         self.write(item)
                             .await
