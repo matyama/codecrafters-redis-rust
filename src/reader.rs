@@ -37,12 +37,21 @@ where
 
         self.buf.clear();
 
-        // TODO: this impl assumes capa EOF
         let n = self
             .reader
             .read_until(EOF, &mut self.buf)
             .await
-            .context("failed to read RDB file")?;
+            .context("failed to read RDB file contents")?;
+
+        // read 8-byte checksum
+        let mut checksum = Vec::with_capacity(8);
+
+        self.reader
+            .read_exact(&mut checksum)
+            .await
+            .context("failed to read RFB file checksum")?;
+
+        // TODO: handle checksum
 
         Ok(RDB(Bytes::copy_from_slice(&self.buf[..n])))
     }

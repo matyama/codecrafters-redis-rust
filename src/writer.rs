@@ -158,7 +158,6 @@ where
             .await
             .context("RDB file contents")?;
 
-        // TODO: this impl assumes capa EOF
         self.writer.write_u8(EOF).await.context("RDB EOF")
     }
 
