@@ -5,7 +5,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::{DataType, CRLF, EOF, NULL, RDB};
+use crate::{DataType, CRLF, NULL, RDB};
 
 pub struct DataWriter<W> {
     writer: BufWriter<W>,
@@ -156,9 +156,7 @@ where
         self.writer
             .write_all(&data)
             .await
-            .context("RDB file contents")?;
-
-        self.writer.write_u8(EOF).await.context("RDB EOF")
+            .context("RDB file contents")
     }
 
     pub async fn flush(&mut self) -> Result<()> {
