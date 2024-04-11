@@ -48,7 +48,7 @@ pub(crate) const DEFAULT_REPL_ID: Bytes = Bytes::from_static(b"?");
 // TODO: generalize to non-unix systems via cfg target_os
 const EMPTY_RDB: Bytes = Bytes::from_static(include_bytes!("../data/empty_rdb.dat"));
 
-pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 
 // NOTE: this is based on the codecrafters examples
 pub const PROTOCOL: Protocol = Protocol::RESP2;

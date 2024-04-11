@@ -166,10 +166,11 @@ impl Replication {
             // TODO: don't forget about the state
             Resp::Cmd(Command::FullResync(_state)) => {
                 let (reader, _) = self.conn.split();
-                let rdb = DataReader::new(reader)
-                    .read_rdb()
+                let mut reader = DataReader::new(reader);
+                let rdb = timeout(TIMEOUT, reader.read_rdb())
                     .await
-                    .with_context(|| format!("reading RDB file after PSYNC {state}"))?;
+                    .with_context(|| format!("reading RDB file after PSYNC {state}"))?
+                    .with_context(|| format!("reading RDB file after PSYNC {state} timed out"))?;
                 Ok((self, rdb))
             }
             other => bail!("unexpected response {other:?}"),
