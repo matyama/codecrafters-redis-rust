@@ -169,8 +169,8 @@ impl Replication {
                 let mut reader = DataReader::new(reader);
                 let rdb = timeout(TIMEOUT, reader.read_rdb())
                     .await
-                    .with_context(|| format!("reading RDB file after PSYNC {state}"))?
-                    .with_context(|| format!("reading RDB file after PSYNC {state} timed out"))?;
+                    .with_context(|| format!("reading RDB file after PSYNC {state} timed out"))?
+                    .with_context(|| format!("reading RDB file after PSYNC {state}"))?;
                 Ok((self, rdb))
             }
             other => bail!("unexpected response {other:?}"),
