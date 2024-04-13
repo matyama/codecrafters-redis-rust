@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, EOF, FULLRESYNC, LF, OK, PONG, RDB};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, FULLRESYNC, LF, OK, PONG, RDB};
 
 pub struct DataReader<R> {
     reader: BufReader<R>,
@@ -33,27 +33,38 @@ where
     }
 
     pub async fn read_rdb(&mut self) -> Result<RDB> {
-        println!("reading RDB file");
-
-        self.buf.clear();
-
-        let n = self
+        let type_ = self
             .reader
-            .read_until(EOF, &mut self.buf)
+            .read_u8()
             .await
-            .context("failed to read RDB file contents")?;
+            .context("read initial byte of a RDB file")?;
 
-        // read 8-byte checksum
-        let mut checksum = Vec::with_capacity(8);
+        ensure!(
+            type_ == b'$',
+            "RDB file must start with a b'$' byte, got '{type_}'"
+        );
+
+        println!("reading RDB file length");
+
+        let Length::Some(len) = self.read_int().await.context("RDB file length")? else {
+            bail!("cannot read RDB file without content");
+        };
+
+        println!("reading RDB file content ({len}B)");
+
+        let mut buf = BytesMut::with_capacity(len);
+        buf.resize(len, 0);
 
         self.reader
-            .read_exact(&mut checksum)
+            .read_exact(&mut self.buf)
             .await
-            .context("failed to read RFB file checksum")?;
+            .context("read RDB file contents")?;
 
-        // TODO: handle checksum
+        // 8-byte checksum
+        let checksum = &buf[len.saturating_sub(8)..];
+        println!("read RDB file with checksum {checksum:?}");
 
-        Ok(RDB(Bytes::copy_from_slice(&self.buf[..n])))
+        Ok(RDB(buf.freeze()))
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Resp>> {
