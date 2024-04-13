@@ -5,7 +5,8 @@ use std::pin::Pin;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use tokio::net::{tcp::OwnedReadHalf, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::{
@@ -13,11 +14,19 @@ use crate::{
     REPLCONF, TIMEOUT,
 };
 
+// NOTE: it's actually necessary not to shutdown the write part to keep the connection alive
+// TODO: support reconnect
+pub struct Connection {
+    reader: DataReader<OwnedReadHalf>,
+    #[allow(dead_code)]
+    writer: DataWriter<OwnedWriteHalf>,
+}
+
 #[derive(Default)]
 pub enum ReplSubscriber {
     #[default]
     Noop,
-    RecvWrite(DataReader<OwnedReadHalf>),
+    RecvWrite(Connection),
 }
 
 impl ReplSubscriber {
@@ -26,14 +35,14 @@ impl ReplSubscriber {
     ) -> Pin<Box<impl Future<Output = Result<(Self, Command), (Self, anyhow::Error)>> + 'static>>
     {
         Box::pin(async {
-            let Self::RecvWrite(ref mut reader) = self else {
+            let Self::RecvWrite(ref mut conn) = self else {
                 return Err((
                     self,
                     anyhow!("trying to receive write commands on a noop subscriber"),
                 ));
             };
             loop {
-                match reader.read_next().await {
+                match conn.reader.read_next().await {
                     Ok(Some(Resp::Cmd(cmd))) if cmd.is_write() => break Ok((self, cmd)),
                     Ok(Some(resp)) => {
                         break Err((self, anyhow!("subscribed to write commands, got: {resp:?}")))
@@ -90,8 +99,12 @@ impl Replication {
             .await
             .context("handshake sync stage (PSYNC)")?;
 
-        let (reader, _) = conn.into_split();
-        let subscriber = ReplSubscriber::RecvWrite(DataReader::new(reader));
+        let (reader, writer) = conn.into_split();
+
+        let subscriber = ReplSubscriber::RecvWrite(Connection {
+            reader: DataReader::new(reader),
+            writer: DataWriter::new(writer),
+        });
 
         Ok((rdb, subscriber))
     }
@@ -131,8 +144,8 @@ impl Replication {
 
         let replconf = [
             DataType::BulkString(REPLCONF),
-            DataType::string(b"capa"),
-            DataType::string(b"eof"),
+            // DataType::string(b"capa"),
+            // DataType::string(b"eof"),
             DataType::string(b"capa"),
             DataType::string(b"psync2"),
         ];
@@ -140,7 +153,7 @@ impl Replication {
         let resp = self
             .request(replconf)
             .await
-            .context("REPLCONF capa eof capa psync2")?;
+            .context("REPLCONF capa psync2")?;
 
         match resp {
             Resp::Data(DataType::SimpleString(s)) if ok(&s) => Ok(self),
@@ -161,6 +174,8 @@ impl Replication {
             .request(psync)
             .await
             .with_context(|| format!("PSYNC {state}"))?;
+
+        println!("response to PSYNC {state}: {resp:?}");
 
         match resp {
             // TODO: don't forget about the state
