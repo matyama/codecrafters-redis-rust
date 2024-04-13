@@ -33,16 +33,17 @@ where
     }
 
     pub async fn read_rdb(&mut self) -> Result<RDB> {
-        let type_ = self
-            .reader
-            .read_u8()
-            .await
-            .context("read initial byte of a RDB file")?;
-
-        ensure!(
-            type_ == b'$',
-            "RDB file must start with a b'$' byte, got '{type_}'"
-        );
+        // NOTE: wait till leader starts sending the file after FULLRESYNC
+        loop {
+            match self.reader.read_u8().await {
+                Ok(b'$') => break,
+                Ok(b) => bail!("RDB file should start with b'$', got {b}"),
+                Err(e) if matches!(e.kind(), ErrorKind::UnexpectedEof) => {
+                    tokio::task::yield_now().await
+                }
+                Err(e) => bail!("failed to read initial byte of a RDB file: {e:?}"),
+            }
+        }
 
         println!("reading RDB file length");
 
