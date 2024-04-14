@@ -38,11 +38,15 @@ where
 
         self.buf.clear();
 
-        let n = self
-            .reader
-            .read_until(EOF, &mut self.buf)
-            .await
-            .context("read RDB file contents")?;
+        let mut n = 0;
+
+        while !self.buf[..n].ends_with(&[EOF]) {
+            n += self
+                .reader
+                .read_until(EOF, &mut self.buf)
+                .await
+                .context("read RDB file contents")?;
+        }
 
         println!("read {n}B of RDB file length and contents");
 
