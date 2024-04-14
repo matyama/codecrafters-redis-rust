@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::num::ParseIntError;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::{collections::VecDeque, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -148,6 +148,33 @@ where
                 (None, Some(offset)) => bail!("PSYNC _ {offset:?} is missing ID"),
                 (None, None) => bail!("PSYNC requires two arguments, got none"),
                 args => bail!("protocol violation: PSYNC with invalid argument types {args:?}"),
+            },
+
+            b"WAIT" => match (args.pop_front(), args.pop_front()) {
+                (Some(num_replicas), Some(timeout)) => {
+                    let Ok(DataType::Integer(num_replicas)) = num_replicas.parse_int() else {
+                        bail!("protocol violation: WAIT with invalid numreplicas type");
+                    };
+
+                    ensure!(num_replicas >= 0, "WAIT: numreplicas must be non-negative");
+
+                    let Ok(DataType::Integer(timeout)) = timeout.parse_int() else {
+                        bail!("protocol violation: WAIT with invalid timeout type");
+                    };
+
+                    ensure!(num_replicas >= 0, "WAIT: timeout must be non-negative");
+
+                    let timeout = if timeout > 0 {
+                        Some(Duration::from_millis(timeout as u64))
+                    } else {
+                        None
+                    };
+
+                    Command::Wait(num_replicas as usize, timeout)
+                }
+                (Some(num_replicas), None) => bail!("WAIT {num_replicas:?} _ is missing timeout"),
+                (None, Some(timeout)) => bail!("WAIT _ {timeout:?} is missing numreplicas"),
+                (None, None) => bail!("PSYNC requires two arguments, got none"),
             },
 
             // FULLRESYNC <REPL_ID> <REPL_OFFSET>

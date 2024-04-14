@@ -58,10 +58,8 @@ where
 
                 // integer: `:[<+|->]<value>\r\n`
                 DataType::Integer(int) => {
-                    self.writer.write_u8(b':').await?;
-                    let sign = if int.is_positive() { '+' } else { '-' };
                     self.buf.clear();
-                    write!(self.buf, "{sign}{int}\r\n")?;
+                    write!(self.buf, ":{int}\r\n")?;
                     println!("writing integer {int}: {:?}", self.buf.as_bytes());
                     self.writer.write_all(self.buf.as_bytes()).await?;
                 }

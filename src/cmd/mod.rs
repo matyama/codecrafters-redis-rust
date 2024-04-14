@@ -1,14 +1,17 @@
 use std::collections::VecDeque;
 use std::fmt::Write;
+use std::future::ready;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use tokio::time::sleep;
 
 use crate::store::{Key, Value};
 use crate::{
     DataType, Instance, Protocol, ReplState, Role, ACK, ECHO, GET, INFO, OK, PING, PONG, PROTOCOL,
-    PSYNC, REPLCONF, SET,
+    PSYNC, REPLCONF, SET, WAIT,
 };
 
 pub mod info;
@@ -30,6 +33,7 @@ pub enum Command {
     Replconf(replconf::Conf),
     PSync(ReplState),
     FullResync(ReplState),
+    Wait(usize, Option<Duration>),
 }
 
 impl Command {
@@ -100,6 +104,17 @@ impl Command {
 
             Self::PSync(state) => unimplemented!("handle PSYNC {state:?}"),
             Self::FullResync(state) => unimplemented!("handle FULLRESYNC {state:?}"),
+
+            // TODO: implement actual WAIT
+            Self::Wait(num_replicas, Some(timeout)) => {
+                let num_acks = tokio::select! {
+                    _ = sleep(timeout) => num_replicas,
+                    num_acks = ready(num_replicas) => num_acks,
+                };
+                DataType::Integer(num_acks as i64)
+            }
+
+            Self::Wait(_, None) => unimplemented!("WAIT forever is not supported yet"),
         }
     }
 
@@ -122,21 +137,26 @@ impl From<Command> for DataType {
     fn from(cmd: Command) -> Self {
         let items = match cmd {
             Command::Ping(None) => VecDeque::from([DataType::BulkString(PING)]),
+
             Command::Ping(Some(msg)) => {
                 VecDeque::from([DataType::BulkString(PING), DataType::BulkString(msg)])
             }
+
             Command::Echo(msg) => {
                 VecDeque::from([DataType::BulkString(ECHO), DataType::BulkString(msg)])
             }
+
             Command::Info(sections) => {
                 let mut items = VecDeque::with_capacity(1 + sections.len());
                 items.push_back(DataType::BulkString(INFO));
                 items.extend(sections.into_iter().map(DataType::BulkString));
                 items
             }
+
             Command::Get(Key(key)) => {
                 VecDeque::from([DataType::BulkString(GET), DataType::BulkString(key)])
             }
+
             Command::Set(Key(key), Value(value), ops) => {
                 // TODO(optimization): cmd writer with single BytesMut alloc and Bytes splits
                 let mut items: VecDeque<DataType> = ops.into();
@@ -145,6 +165,7 @@ impl From<Command> for DataType {
                 items.push_front(DataType::BulkString(SET));
                 items
             }
+
             Command::Replconf(replconf::Conf::ListeningPort(port)) => {
                 let port = port.to_string().into();
                 VecDeque::from([
@@ -159,10 +180,12 @@ impl From<Command> for DataType {
                 DataType::string(b"getack"),
                 DataType::BulkString(dummy),
             ]),
+
             Command::Replconf(replconf::Conf::Capabilities(mut capabilities)) => {
                 capabilities.push_front(REPLCONF);
                 capabilities.into_iter().map(DataType::BulkString).collect()
             }
+
             Command::PSync(ReplState {
                 repl_id,
                 repl_offset,
@@ -175,10 +198,20 @@ impl From<Command> for DataType {
                     DataType::BulkString(repl_offset),
                 ])
             }
+
             Command::FullResync(state) => {
                 let mut data = BytesMut::with_capacity(64);
                 write!(data, "FULLRESYNC {state}").expect("failed to serialize FULLRESYNC");
                 return DataType::SimpleString(data.freeze());
+            }
+
+            Command::Wait(num_replicas, timeout) => {
+                let timeout = timeout.unwrap_or_default().as_millis();
+                VecDeque::from([
+                    DataType::BulkString(WAIT),
+                    DataType::BulkString(num_replicas.to_string().into()),
+                    DataType::BulkString(timeout.to_string().into()),
+                ])
             }
         };
 

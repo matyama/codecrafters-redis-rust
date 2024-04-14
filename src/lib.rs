@@ -42,6 +42,7 @@ pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
 pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
 pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
 pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
+pub(crate) const WAIT: Bytes = Bytes::from_static(b"WAIT");
 
 pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
 pub(crate) const ACK: Bytes = Bytes::from_static(b"ACK");
