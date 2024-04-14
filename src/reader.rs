@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, FULLRESYNC, LF, OK, PONG, RDB};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, EOF, FULLRESYNC, LF, OK, PONG, RDB};
 
 pub struct DataReader<R> {
     reader: BufReader<R>,
@@ -32,40 +32,63 @@ where
         }
     }
 
+    // TODO: this is terribly inefficient - improve (read length first & pre-allocate buffer)
     pub async fn read_rdb(&mut self) -> Result<RDB> {
-        // NOTE: wait till leader starts sending the file after FULLRESYNC
-        loop {
-            match self.reader.read_u8().await {
-                Ok(b'$') => break,
-                Ok(b) => bail!("RDB file should start with b'$', got {b}"),
-                Err(e) if matches!(e.kind(), ErrorKind::UnexpectedEof) => {
-                    tokio::task::yield_now().await
-                }
-                Err(e) => bail!("failed to read initial byte of a RDB file: {e:?}"),
-            }
-        }
+        println!("reading RDB file");
 
-        println!("reading RDB file length");
+        self.buf.clear();
 
-        let Length::Some(len) = self.read_int().await.context("RDB file length")? else {
-            bail!("cannot read RDB file without content");
-        };
-
-        println!("reading RDB file content ({len}B)");
-
-        let mut buf = BytesMut::with_capacity(len);
-        buf.resize(len, 0);
-
-        self.reader
-            .read_exact(&mut self.buf)
+        let n = self
+            .reader
+            .read_until(EOF, &mut self.buf)
             .await
             .context("read RDB file contents")?;
 
-        // 8-byte checksum
-        let checksum = &buf[len.saturating_sub(8)..];
-        println!("read RDB file with checksum {checksum:?}");
+        println!("read {n}B of RDB file length and contents");
 
-        Ok(RDB(buf.freeze()))
+        // 8-byte checksum
+        let mut checksum = vec![0; 8];
+
+        self.reader
+            .read_exact(&mut checksum)
+            .await
+            .context("read RDB checksum")?;
+
+        // TODO: validate
+        println!("read RDB file with checksum hex: {checksum:x?}");
+
+        self.buf.extend(checksum);
+
+        ensure!(
+            self.buf[0] == b'$',
+            "RDB file should start with b'$', got {}",
+            self.buf[0]
+        );
+
+        let data: Vec<_> = self.buf.splitn(2, |&b| b == LF).collect();
+        let [len, rdb] = data[..] else {
+            bail!("cannot separate length from RDB contents: {:?}", self.buf);
+        };
+
+        let len = &len[1..(len.len() - 1)];
+
+        let Ok(len) = std::str::from_utf8(len) else {
+            bail!("RDB length {len:?} is not a valid UTF-8 string");
+        };
+
+        let Ok(len) = len.parse::<usize>() else {
+            bail!("{len:?} is not a valid integer");
+        };
+
+        ensure!(
+            rdb.len() == len,
+            "RDB length mismatch: expected {len}B, got {}B",
+            rdb.len()
+        );
+
+        println!("RDB file hex: {rdb:x?}");
+
+        Ok(RDB(Bytes::copy_from_slice(rdb)))
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Resp>> {
