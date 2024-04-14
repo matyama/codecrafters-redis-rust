@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::store::{Key, Value};
 use crate::{
-    DataType, Instance, Protocol, ReplState, Role, ECHO, GET, INFO, OK, PING, PONG, PROTOCOL,
+    DataType, Instance, Protocol, ReplState, Role, ACK, ECHO, GET, INFO, OK, PING, PONG, PROTOCOL,
     PSYNC, REPLCONF, SET,
 };
 
@@ -66,6 +66,16 @@ impl Command {
                 }
             }
 
+            Self::Replconf(replconf::Conf::GetAck(_)) => {
+                // TODO: offset tracking
+                let offset = 0;
+                DataType::array([
+                    DataType::BulkString(REPLCONF),
+                    DataType::BulkString(ACK),
+                    DataType::BulkString(offset.to_string().into()),
+                ])
+            }
+
             // TODO: handle ListeningPort | Capabilities
             Self::Replconf(_) => DataType::SimpleString(OK),
 
@@ -95,8 +105,16 @@ impl Command {
 
     /// Returns `true` iff this command represents a _write_ operation that's subject to
     /// replication.
+    #[inline]
     pub(crate) fn is_write(&self) -> bool {
         matches!(self, Self::Set(..))
+    }
+
+    /// Returns `true` iff this command represents a replicated operation that should be
+    /// acknowledged (i.e., responded to).
+    #[inline]
+    pub(crate) fn is_ack(&self) -> bool {
+        matches!(self, Self::Replconf(replconf::Conf::GetAck(_)))
     }
 }
 
@@ -135,6 +153,12 @@ impl From<Command> for DataType {
                     DataType::BulkString(port),
                 ])
             }
+
+            Command::Replconf(replconf::Conf::GetAck(dummy)) => VecDeque::from([
+                DataType::BulkString(REPLCONF),
+                DataType::string(b"getack"),
+                DataType::BulkString(dummy),
+            ]),
             Command::Replconf(replconf::Conf::Capabilities(mut capabilities)) => {
                 capabilities.push_front(REPLCONF);
                 capabilities.into_iter().map(DataType::BulkString).collect()

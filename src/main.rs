@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let instance = Arc::new(instance);
 
     println!("subscribing to replication via {replication}");
-    let mut recv_write = replication.recv_write();
+    let mut repl_recv = replication.recv();
 
     let listener = instance.listen().await?;
     let replicator = instance.clone().spawn_replicator().await;
@@ -24,15 +24,18 @@ async fn main() -> Result<()> {
         tokio::select! {
             // signal handling would be here
 
-            result = &mut recv_write, if instance.is_replica() => match result {
-                Ok((repl, cmd)) => {
-                    println!("received write command {cmd:?}");
-                    replicator.send(cmd).await?;
-                    recv_write = repl.recv_write();
+            result = &mut repl_recv, if instance.is_replica() => match result {
+                Ok((mut repl, cmd)) => {
+                    println!("received command {cmd:?}");
+                    if let Some(data) = replicator.exec(cmd).await? {
+                        println!("replication response: {data:?}");
+                        repl.resp(data).await?;
+                    }
+                    repl_recv = repl.recv();
                 },
                 Err((repl, err)) => {
                     eprintln!("received unexpected replication message: {err:?}");
-                    recv_write = repl.recv_write();
+                    repl_recv = repl.recv();
                 },
             },
 

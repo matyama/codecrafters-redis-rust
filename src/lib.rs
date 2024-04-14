@@ -7,10 +7,10 @@ use std::{collections::VecDeque, fmt::Debug};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task;
 
-use repl::{ReplSubscriber, Replication};
+use repl::{ReplConnection, Replication};
 
 pub(crate) use cmd::Command;
 pub(crate) use config::Config;
@@ -37,11 +37,13 @@ pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
 pub(crate) const ECHO: Bytes = Bytes::from_static(b"ECHO");
 pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
 pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
-pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
 pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
 pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
 pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
 pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
+
+pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
+pub(crate) const ACK: Bytes = Bytes::from_static(b"ACK");
 
 pub(crate) const DEFAULT_REPL_ID: Bytes = Bytes::from_static(b"?");
 
@@ -381,7 +383,7 @@ pub struct Instance {
 }
 
 impl Instance {
-    pub async fn new(cfg: Config) -> Result<(Self, ReplSubscriber)> {
+    pub async fn new(cfg: Config) -> Result<(Self, ReplConnection)> {
         // TODO: this is just an initial placeholder replication state
         let state = ReplState {
             repl_id: ReplId::new(Bytes::from_static(
@@ -400,7 +402,7 @@ impl Instance {
                 state,
                 store,
             };
-            return Ok((instance, ReplSubscriber::default()));
+            return Ok((instance, ReplConnection::default()));
         };
 
         // TODO: apply initial RDB
@@ -485,24 +487,35 @@ impl Instance {
         Ok(())
     }
 
-    pub async fn spawn_replicator(self: Arc<Self>) -> WriteHandle {
+    pub async fn spawn_replicator(self: Arc<Self>) -> ReplHandle {
         match self.role {
             Role::Leader(_) => {
-                let (dummy, _) = mpsc::channel::<Command>(1);
-                WriteHandle(dummy)
+                let (dummy, _) = mpsc::channel::<ReplCommand>(1);
+                ReplHandle(dummy)
             }
+
             Role::Replica(_) => {
                 // NOTE: buffer up some writes and unblock new read connections
-                let (tx, mut rx) = mpsc::channel::<Command>(64);
+                let (tx, mut rx) = mpsc::channel::<ReplCommand>(64);
                 let instance = Arc::clone(&self);
+
                 task::spawn(async move {
-                    while let Some(cmd) = rx.recv().await {
-                        println!("executing write command {cmd:?}");
+                    while let Some(ReplCommand { cmd, ack }) = rx.recv().await {
+                        println!("replication: executing command {cmd:?}");
+
                         let resp = cmd.exec(Arc::clone(&instance)).await;
-                        println!("write command replicated: {resp:?}");
+                        println!("command replicated: {resp:?}");
+
+                        if let Some(ack) = ack {
+                            println!("replying with replication response: {resp:?}");
+                            if let Err(e) = ack.send(resp) {
+                                eprintln!("replication: response dropped due to {e:?}");
+                            }
+                        }
                     }
                 });
-                WriteHandle(tx)
+
+                ReplHandle(tx)
             }
         }
     }
@@ -514,13 +527,33 @@ impl std::fmt::Display for Instance {
     }
 }
 
+#[derive(Debug)]
+struct ReplCommand {
+    cmd: Command,
+    ack: Option<oneshot::Sender<DataType>>,
+}
+
 #[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct WriteHandle(mpsc::Sender<Command>);
+pub struct ReplHandle(mpsc::Sender<ReplCommand>);
 
-impl WriteHandle {
-    #[inline]
-    pub async fn send(&self, cmd: Command) -> Result<()> {
-        self.0.send(cmd).await.context("replicator disconnected")
+impl ReplHandle {
+    pub async fn exec(&self, cmd: Command) -> Result<Option<DataType>> {
+        if !cmd.is_ack() {
+            let cmd = ReplCommand { cmd, ack: None };
+            self.0.send(cmd).await.context("replicator disconnected")?;
+            return Ok(None);
+        }
+
+        let (ack, result) = oneshot::channel();
+
+        let cmd = ReplCommand {
+            cmd,
+            ack: Some(ack),
+        };
+
+        self.0.send(cmd).await.context("replicator disconnected")?;
+
+        result.await.context("replicator disconnected").map(Some)
     }
 }

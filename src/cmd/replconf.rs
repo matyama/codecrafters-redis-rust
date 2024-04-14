@@ -9,6 +9,7 @@ use crate::{DataExt as _, DataType};
 pub enum Conf {
     ListeningPort(u16),
     Capabilities(VecDeque<Bytes>),
+    GetAck(Bytes),
 }
 
 impl TryFrom<VecDeque<DataType>> for Conf {
@@ -35,6 +36,15 @@ impl TryFrom<VecDeque<DataType>> for Conf {
                         other => bail!("protocol violation: REPLCONF {key:?} {other:?}"),
                     }
                 }
+
+                b"getack" => match args.pop_front() {
+                    Some(DataType::BulkString(dummy) | DataType::SimpleString(dummy)) => {
+                        return Ok(Self::GetAck(dummy));
+                    }
+                    other => {
+                        bail!("protocol violation: REPLCONF GETACK {other:?}");
+                    }
+                },
 
                 b"capa" | b"capabilities" => match args.pop_front() {
                     Some(DataType::BulkString(capa) | DataType::SimpleString(capa)) => {

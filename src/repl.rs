@@ -22,29 +22,29 @@ pub struct Connection {
 }
 
 #[derive(Default)]
-pub enum ReplSubscriber {
+pub enum ReplConnection {
     #[default]
     Noop,
-    RecvWrite(Connection),
+    Recv(Connection),
 }
 
-impl ReplSubscriber {
-    pub fn recv_write(
+impl ReplConnection {
+    pub fn recv(
         mut self,
     ) -> Pin<Box<impl Future<Output = Result<(Self, Command), (Self, anyhow::Error)>> + 'static>>
     {
         Box::pin(async {
-            let Self::RecvWrite(ref mut conn) = self else {
+            let Self::Recv(ref mut conn) = self else {
                 return Err((
                     self,
-                    anyhow!("trying to receive write commands on a noop subscriber"),
+                    anyhow!("trying to receive replication commands on a noop connection"),
                 ));
             };
             loop {
                 match conn.reader.read_next().await {
-                    Ok(Some(Resp::Cmd(cmd))) if cmd.is_write() => break Ok((self, cmd)),
+                    Ok(Some(Resp::Cmd(cmd))) => break Ok((self, cmd)),
                     Ok(Some(resp)) => {
-                        break Err((self, anyhow!("subscribed to write commands, got: {resp:?}")))
+                        break Err((self, anyhow!("subscribed to commands, got: {resp:?}")))
                     }
                     Ok(None) => tokio::task::yield_now().await,
                     Err(e) => break Err((self, e)),
@@ -52,14 +52,22 @@ impl ReplSubscriber {
             }
         })
     }
+
+    pub async fn resp(&mut self, data: DataType) -> Result<()> {
+        let Self::Recv(Connection { writer, .. }) = self else {
+            bail!("trying to respond with {data:?} on a noop connection");
+        };
+        writer.write(&data).await?;
+        writer.flush().await
+    }
 }
 
-impl std::fmt::Display for ReplSubscriber {
+impl std::fmt::Display for ReplConnection {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Noop => write!(f, "ReplSubscriber::Noop"),
-            Self::RecvWrite(_) => write!(f, "ReplSubscriber::RecvWrite"),
+            Self::Recv(_) => write!(f, "ReplSubscriber::RecvWrite"),
         }
     }
 }
@@ -91,7 +99,7 @@ impl Replication {
     pub async fn handshake(
         leader: SocketAddr,
         replica: SocketAddr,
-    ) -> Result<(RDB, ReplSubscriber)> {
+    ) -> Result<(RDB, ReplConnection)> {
         let (Replication { conn, .. }, rdb) = Self::new(leader, replica)
             .await?
             .ping()
@@ -104,7 +112,7 @@ impl Replication {
             .await
             .context("handshake sync stage (PSYNC)")?;
 
-        let subscriber = ReplSubscriber::RecvWrite(conn);
+        let subscriber = ReplConnection::Recv(conn);
 
         Ok((rdb, subscriber))
     }
