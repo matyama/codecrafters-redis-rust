@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::ready;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tokio::task;
+use tokio::task::{self, JoinSet};
 
 use repl::{ReplConnection, Replication};
 
@@ -391,10 +392,52 @@ impl ReplicaSet {
             });
         }
     }
+
+    pub(crate) async fn wait(&self, num_replicas: usize, timeout: Duration) -> Result<usize> {
+        let mut tasks = JoinSet::new();
+
+        let replicas = self.0.read().await;
+
+        println!(
+            "waiting for {num_replicas} (or {timeout:?}) from current replica set {:?}",
+            replicas.keys()
+        );
+
+        for (&_addr, replica) in replicas.iter() {
+            let replica = Arc::clone(replica);
+            tasks.spawn(async move {
+                let replica = replica.lock().await;
+                let ack = ready(1).await;
+                drop(replica);
+                Ok(ack)
+            });
+        }
+
+        let num_acks = AtomicUsize::new(0);
+
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+
+        loop {
+            tokio::select! {
+                () = &mut sleep, if timeout > Duration::ZERO => break,
+                ack = tasks.join_next() => match ack {
+                    Some(Ok(Ok(ack))) => {
+                        let _ = num_acks.fetch_add(ack, Ordering::Release);
+                    }
+                    Some(Ok(Err(e)) | Err(e)) => eprintln!("replica failed to ack during wait: {e:?}"),
+                    None => break,
+                },
+                else => tokio::task::yield_now().await,
+            }
+        }
+
+        Ok(num_acks.load(Ordering::Acquire))
+    }
 }
 
 #[derive(Debug)]
-enum Role {
+pub(crate) enum Role {
     Leader(ReplicaSet),
     Replica(Leader),
 }
@@ -462,6 +505,11 @@ impl Instance {
     #[inline]
     pub fn is_replica(&self) -> bool {
         matches!(self.role, Role::Replica(_))
+    }
+
+    #[inline]
+    pub(crate) fn role(&self) -> &Role {
+        &self.role
     }
 
     /// Returns previous [`Offset`]

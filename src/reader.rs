@@ -162,15 +162,9 @@ where
                         bail!("protocol violation: WAIT with invalid timeout type");
                     };
 
-                    ensure!(num_replicas >= 0, "WAIT: timeout must be non-negative");
+                    ensure!(timeout >= 0, "WAIT: timeout must be non-negative");
 
-                    let timeout = if timeout > 0 {
-                        Some(Duration::from_millis(timeout as u64))
-                    } else {
-                        None
-                    };
-
-                    Command::Wait(num_replicas as usize, timeout)
+                    Command::Wait(num_replicas as usize, Duration::from_millis(timeout as u64))
                 }
                 (Some(num_replicas), None) => bail!("WAIT {num_replicas:?} _ is missing timeout"),
                 (None, Some(timeout)) => bail!("WAIT _ {timeout:?} is missing numreplicas"),

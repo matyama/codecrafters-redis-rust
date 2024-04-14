@@ -1,12 +1,11 @@
 use std::collections::VecDeque;
 use std::fmt::Write;
-use std::future::ready;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use bytes::{Bytes, BytesMut};
-use tokio::time::sleep;
 
 use crate::store::{Key, Value};
 use crate::{
@@ -33,7 +32,7 @@ pub enum Command {
     Replconf(replconf::Conf),
     PSync(ReplState),
     FullResync(ReplState),
-    Wait(usize, Option<Duration>),
+    Wait(usize, Duration),
 }
 
 impl Command {
@@ -105,16 +104,26 @@ impl Command {
             Self::PSync(state) => unimplemented!("handle PSYNC {state:?}"),
             Self::FullResync(state) => unimplemented!("handle FULLRESYNC {state:?}"),
 
-            // TODO: implement actual WAIT
-            Self::Wait(num_replicas, Some(timeout)) => {
-                let num_acks = tokio::select! {
-                    _ = sleep(timeout) => num_replicas,
-                    num_acks = ready(num_replicas) => num_acks,
+            Self::Wait(num_replicas, timeout) => {
+                let Role::Leader(replicas) = instance.role() else {
+                    return DataType::SimpleError(Bytes::from_static(
+                        b"protocol violation: WAIT is only supported by a leader",
+                    ));
                 };
-                DataType::Integer(num_acks as i64)
-            }
 
-            Self::Wait(_, None) => unimplemented!("WAIT forever is not supported yet"),
+                let num_acks = replicas
+                    .wait(num_replicas, timeout)
+                    .await
+                    .with_context(|| format!("WAIT {num_replicas} {timeout:?}"));
+
+                match num_acks {
+                    Ok(n) => DataType::Integer(n as i64),
+                    Err(e) => {
+                        let error = format!("WAIT {num_replicas} {timeout:?} failed with {e:?}");
+                        DataType::SimpleError(error.into())
+                    }
+                }
+            }
         }
     }
 
@@ -205,14 +214,11 @@ impl From<Command> for DataType {
                 return DataType::SimpleString(data.freeze());
             }
 
-            Command::Wait(num_replicas, timeout) => {
-                let timeout = timeout.unwrap_or_default().as_millis();
-                VecDeque::from([
-                    DataType::BulkString(WAIT),
-                    DataType::BulkString(num_replicas.to_string().into()),
-                    DataType::BulkString(timeout.to_string().into()),
-                ])
-            }
+            Command::Wait(num_replicas, timeout) => VecDeque::from([
+                DataType::BulkString(WAIT),
+                DataType::BulkString(num_replicas.to_string().into()),
+                DataType::BulkString(timeout.as_millis().to_string().into()),
+            ]),
         };
 
         DataType::Array(items)
