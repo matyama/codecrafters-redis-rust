@@ -25,12 +25,14 @@ async fn main() -> Result<()> {
             // signal handling would be here
 
             result = &mut repl_recv, if instance.is_replica() => match result {
-                Ok((mut repl, cmd)) => {
+                Ok((mut repl, cmd, offset)) => {
                     println!("received command {cmd:?}");
                     if let Some(data) = replicator.exec(cmd).await? {
                         println!("replication response: {data:?}");
                         repl.resp(data).await?;
                     }
+                    let old_offset = instance.shift_offset(offset);
+                    println!("replica offset: {old_offset:?} -> {:?}", old_offset + offset);
                     repl_recv = repl.recv();
                 },
                 Err((repl, err)) => {

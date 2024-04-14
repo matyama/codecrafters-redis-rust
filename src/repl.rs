@@ -10,8 +10,8 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::{
-    Command, DataExt as _, DataReader, DataType, DataWriter, ReplState, Resp, PING, PSYNC, RDB,
-    REPLCONF, TIMEOUT,
+    Command, DataExt as _, DataReader, DataType, DataWriter, Offset, ReplState, Resp, PING, PSYNC,
+    RDB, REPLCONF, TIMEOUT,
 };
 
 // NOTE: it's actually necessary not to shutdown the write part to keep the connection alive
@@ -21,6 +21,8 @@ pub struct Connection {
     writer: DataWriter<OwnedWriteHalf>,
 }
 
+pub type RecvResult<T> = Result<(T, Command, Offset), (T, anyhow::Error)>;
+
 #[derive(Default)]
 pub enum ReplConnection {
     #[default]
@@ -29,10 +31,7 @@ pub enum ReplConnection {
 }
 
 impl ReplConnection {
-    pub fn recv(
-        mut self,
-    ) -> Pin<Box<impl Future<Output = Result<(Self, Command), (Self, anyhow::Error)>> + 'static>>
-    {
+    pub fn recv(mut self) -> Pin<Box<impl Future<Output = RecvResult<Self>> + 'static>> {
         Box::pin(async {
             let Self::Recv(ref mut conn) = self else {
                 return Err((
@@ -42,8 +41,8 @@ impl ReplConnection {
             };
             loop {
                 match conn.reader.read_next().await {
-                    Ok(Some(Resp::Cmd(cmd))) => break Ok((self, cmd)),
-                    Ok(Some(resp)) => {
+                    Ok(Some((Resp::Cmd(cmd), offset))) => break Ok((self, cmd, offset)),
+                    Ok(Some((resp, _))) => {
                         break Err((self, anyhow!("subscribed to commands, got: {resp:?}")))
                     }
                     Ok(None) => tokio::task::yield_now().await,
@@ -214,7 +213,7 @@ impl Replication {
             .context("no response")?;
 
         match resp {
-            Some(resp) => Ok(resp),
+            Some((resp, _)) => Ok(resp),
             other => bail!("unexpected response {other:?}"),
         }
     }

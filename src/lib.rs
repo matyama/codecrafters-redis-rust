@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::VecDeque, fmt::Debug};
@@ -182,6 +183,40 @@ impl RDB {
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(transparent)]
+pub struct Offset(usize);
+
+impl From<usize> for Offset {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Offset> for usize {
+    #[inline]
+    fn from(Offset(value): Offset) -> Self {
+        value
+    }
+}
+
+impl<T: Into<Self>> std::ops::Add<T> for Offset {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: T) -> Self::Output {
+        Self(self.0 + rhs.into().0)
+    }
+}
+
+impl<T: Into<Self>> std::ops::AddAssign<T> for Offset {
+    #[inline]
+    fn add_assign(&mut self, rhs: T) {
+        self.0 += rhs.into().0;
     }
 }
 
@@ -380,6 +415,7 @@ pub struct Instance {
     role: Role,
     state: ReplState,
     store: Store,
+    offset: AtomicUsize,
 }
 
 impl Instance {
@@ -401,6 +437,7 @@ impl Instance {
                 role: Role::Leader(ReplicaSet::default()),
                 state,
                 store,
+                offset: AtomicUsize::new(0),
             };
             return Ok((instance, ReplConnection::default()));
         };
@@ -415,6 +452,7 @@ impl Instance {
             role: Role::Replica(Leader(leader)),
             state,
             store,
+            offset: AtomicUsize::new(0),
         };
 
         Ok((instance, subscriber))
@@ -423,6 +461,21 @@ impl Instance {
     #[inline]
     pub fn is_replica(&self) -> bool {
         matches!(self.role, Role::Replica(_))
+    }
+
+    /// Returns previous [`Offset`]
+    pub fn shift_offset(&self, Offset(offset): Offset) -> Offset {
+        let mut old = self.offset.load(Ordering::Relaxed);
+        loop {
+            let new = old + offset;
+            match self
+                .offset
+                .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(old) => break old.into(),
+                Err(new_old) => old = new_old,
+            }
+        }
     }
 
     pub async fn listen(&self) -> Result<TcpListener> {
@@ -438,7 +491,7 @@ impl Instance {
         let mut reader = DataReader::new(reader);
         let mut writer = DataWriter::new(writer);
 
-        while let Some(resp) = reader.read_next().await? {
+        while let Some((resp, _offset)) = reader.read_next().await? {
             match resp {
                 Resp::Cmd(cmd @ Command::PSync(_)) => {
                     let Role::Leader(replicas) = &self.role else {

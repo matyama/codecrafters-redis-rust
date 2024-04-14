@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt::Write;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -67,8 +68,7 @@ impl Command {
             }
 
             Self::Replconf(replconf::Conf::GetAck(_)) => {
-                // TODO: offset tracking
-                let offset = 0;
+                let offset = instance.offset.load(Ordering::Acquire);
                 DataType::array([
                     DataType::BulkString(REPLCONF),
                     DataType::BulkString(ACK),

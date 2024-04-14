@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, FULLRESYNC, LF, OK, PONG, RDB};
+use crate::{cmd, Command, DataExt, DataType, Offset, Resp, CRLF, FULLRESYNC, LF, OK, PONG, RDB};
 
 pub struct DataReader<R> {
     reader: BufReader<R>,
@@ -47,7 +47,7 @@ where
 
         println!("reading RDB file length");
 
-        let Length::Some(len) = self.read_int().await.context("RDB file length")? else {
+        let (Length::Some(len), _) = self.read_int().await.context("RDB file length")? else {
             bail!("cannot read RDB file without content");
         };
 
@@ -70,8 +70,8 @@ where
         Ok(RDB(buf.freeze()))
     }
 
-    pub async fn read_next(&mut self) -> Result<Option<Resp>> {
-        let Some(data) = self.read_data().await? else {
+    pub async fn read_next(&mut self) -> Result<Option<(Resp, Offset)>> {
+        let Some((data, offset)) = self.read_data().await? else {
             return Ok(None);
         };
 
@@ -85,11 +85,11 @@ where
                 };
                 (arg.to_uppercase(), args)
             }
-            data => return Ok(Some(data.into())),
+            data => return Ok(Some((data.into(), offset))),
         };
 
         let cmd = match cmd.as_slice() {
-            b"OK" => return Ok(Some(DataType::SimpleString(OK).into())),
+            b"OK" => return Ok(Some((DataType::SimpleString(OK).into(), offset))),
 
             b"PING" => match args.pop_front() {
                 None => Command::Ping(None),
@@ -97,7 +97,7 @@ where
                 Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
             },
 
-            b"PONG" => return Ok(Some(DataType::SimpleString(PONG).into())),
+            b"PONG" => return Ok(Some((DataType::SimpleString(PONG).into(), offset))),
 
             b"ECHO" => match args.pop_front() {
                 Some(DataType::BulkString(msg)) => Command::Echo(msg),
@@ -181,26 +181,34 @@ where
             ),
         };
 
-        Ok(Some(cmd.into()))
+        Ok(Some((cmd.into(), offset)))
     }
 
-    async fn read_data(&mut self) -> Result<Option<DataType>> {
+    async fn read_data(&mut self) -> Result<Option<(DataType, Offset)>> {
         match self.reader.read_u8().await {
-            Ok(b'_') => self.read_null().await.map(Some),
-            Ok(b'#') => self.read_bool().await.map(Some),
-            Ok(b':') => self.read_int().await.map(DataType::Integer).map(Some),
+            Ok(b'_') => self.read_null().await.map(|(x, n)| (x, n + 1)).map(Some),
+            Ok(b'#') => self.read_bool().await.map(|(b, n)| (b, n + 1)).map(Some),
+            Ok(b':') => self
+                .read_int()
+                .await
+                .map(|(i, n)| (DataType::Integer(i), n + 1))
+                .map(Some),
             Ok(b'+') => self
                 .read_simple()
                 .await
-                .map(DataType::SimpleString)
+                .map(|(s, n)| (DataType::SimpleString(s), n + 1))
                 .map(Some),
             Ok(b'-') => self
                 .read_simple()
                 .await
-                .map(DataType::SimpleError)
+                .map(|(s, n)| (DataType::SimpleError(s), n + 1))
                 .map(Some),
-            Ok(b'$') => self.read_bulk_string().await.map(Some),
-            Ok(b'*') => self.read_array().await.map(Some),
+            Ok(b'$') => self
+                .read_bulk_string()
+                .await
+                .map(|(s, n)| (s, n + 1))
+                .map(Some),
+            Ok(b'*') => self.read_array().await.map(|(s, n)| (s, n + 1)).map(Some),
             Ok(b) => bail!("protocol violation: unsupported control byte '{b}'"),
             Err(e) if matches!(e.kind(), ErrorKind::UnexpectedEof) => Ok(None),
             Err(e) => Err(e).context("failed to read next element"),
@@ -211,7 +219,7 @@ where
     ///
     /// Segment is a byte sequence ending with a CRLF byte sequence. Note that the trailing CRLF is
     /// stripped before return.
-    async fn read_segment(&mut self) -> Result<usize> {
+    async fn read_segment(&mut self) -> Result<(usize, Offset)> {
         let mut n = 0;
 
         while !self.buf[..n].ends_with(CRLF) {
@@ -226,46 +234,52 @@ where
         self.buf.pop();
         self.buf.pop();
 
-        Ok(n - 2)
+        Ok((n - 2, n.into()))
     }
 
-    async fn read_null(&mut self) -> Result<DataType> {
+    async fn read_null(&mut self) -> Result<(DataType, Offset)> {
         self.buf.clear();
 
-        let n = self.read_segment().await?;
+        let (n, offset) = self.read_segment().await?;
 
         ensure!(
             n == 0,
             "protocol violation: expected no data for null, got {n} bytes"
         );
 
-        Ok(DataType::Null)
+        Ok((DataType::Null, offset))
     }
 
     /// Read a boolean of the form `#<t|f>\r\n`
-    async fn read_bool(&mut self) -> Result<DataType> {
-        let boolean = self
-            .reader
-            .read_u8()
+    async fn read_bool(&mut self) -> Result<(DataType, Offset)> {
+        self.buf.clear();
+
+        let (n, offset) = self
+            .read_segment()
             .await
             .context("failed to read a boolean")?;
 
-        match boolean {
-            b't' => Ok(DataType::Boolean(true)),
-            b'f' => Ok(DataType::Boolean(false)),
+        ensure!(
+            n == 1,
+            "protocol violation: expected single byte for a boolean, got {n} bytes"
+        );
+
+        match self.buf[0] {
+            b't' => Ok((DataType::Boolean(true), offset)),
+            b'f' => Ok((DataType::Boolean(false), offset)),
             b => bail!("protocol violation: invalid boolean byte {b}"),
         }
     }
 
     /// Read an integer of the form `[:][<+|->]<value>\r\n`
-    async fn read_int<T>(&mut self) -> Result<T>
+    async fn read_int<T>(&mut self) -> Result<(T, Offset)>
     where
         T: FromStr,
         <T as FromStr>::Err: Debug,
     {
         self.buf.clear();
 
-        let n = self.read_segment().await?;
+        let (n, offset) = self.read_segment().await?;
 
         let bytes = &self.buf[..n];
 
@@ -274,24 +288,26 @@ where
         };
 
         match slice.parse() {
-            Ok(int) => Ok(int),
+            Ok(int) => Ok((int, offset)),
             Err(e) => Err(anyhow!("{e:?}: expected number, got: {slice}")),
         }
     }
 
     /// Read a simple strings or errors of the form `[<+|->]<data>\r\n`
-    async fn read_simple(&mut self) -> Result<Bytes> {
+    async fn read_simple(&mut self) -> Result<(Bytes, Offset)> {
         println!("reading simple data");
         self.buf.clear();
-        let n = self.read_segment().await?;
-        Ok(Bytes::copy_from_slice(&self.buf[..n]))
+        let (n, offset) = self.read_segment().await?;
+        Ok((Bytes::copy_from_slice(&self.buf[..n]), offset))
     }
 
     /// Read a bulk strings of the form `$<length>\r\n<data>\r\n`
-    async fn read_bulk_string(&mut self) -> Result<DataType> {
-        let Length::Some(len) = self.read_int().await? else {
+    async fn read_bulk_string(&mut self) -> Result<(DataType, Offset)> {
+        let (len, offset) = self.read_int().await?;
+
+        let Length::Some(len) = len else {
             println!("reading null bulk string");
-            return Ok(DataType::NullBulkString);
+            return Ok((DataType::NullBulkString, offset));
         };
 
         println!("reading bulk string of length: {len}");
@@ -311,14 +327,14 @@ where
         // TODO: do `let data = self.buf.split_to(len).freeze();` instead
 
         // TODO: ideally this could point to a pooled buffer and not allocate
-        Ok(DataType::BulkString(buf.into()))
+        Ok((DataType::BulkString(buf.into()), offset + read_len))
     }
 
     /// Read an array of the form: `*<number-of-elements>\r\n<element-1>...<element-n>`
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    fn read_array(&mut self) -> Pin<Box<dyn Future<Output = Result<DataType>> + Send + '_>> {
+    fn read_array(&mut self) -> Pin<Box<ReadArrayFut<'_>>> {
         Box::pin(async move {
-            let len = self.read_int().await?;
+            let (len, mut offset) = self.read_int().await?;
             println!("reading array of length: {len}");
 
             let mut items = VecDeque::with_capacity(len);
@@ -329,17 +345,20 @@ where
                     .await
                     .with_context(|| format!("failed to read array item {i}"))?;
 
-                let Some(item) = item else {
+                let Some((item, n)) = item else {
                     bail!("protocol violation: missing array item {i}");
                 };
 
                 items.push_back(item);
+                offset += n;
             }
 
-            Ok(DataType::Array(items))
+            Ok((DataType::Array(items), offset))
         })
     }
 }
+
+type ReadArrayFut<'a> = dyn Future<Output = Result<(DataType, Offset)>> + Send + 'a;
 
 #[derive(Debug)]
 enum Length {
