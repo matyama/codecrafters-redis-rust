@@ -18,7 +18,6 @@ use crate::{
 // TODO: support reconnect
 pub struct Connection {
     reader: DataReader<OwnedReadHalf>,
-    #[allow(dead_code)]
     writer: DataWriter<OwnedWriteHalf>,
 }
 
@@ -66,7 +65,7 @@ impl std::fmt::Display for ReplSubscriber {
 }
 
 pub struct Replication {
-    conn: TcpStream,
+    conn: Connection,
     repl: SocketAddr,
 }
 
@@ -76,6 +75,12 @@ impl Replication {
         let conn = TcpStream::connect(leader)
             .await
             .context("failed to establish connection")?;
+
+        let (reader, writer) = conn.into_split();
+        let reader = DataReader::new(reader);
+        let writer = DataWriter::new(writer);
+
+        let conn = Connection { reader, writer };
 
         Ok(Self {
             conn,
@@ -99,12 +104,7 @@ impl Replication {
             .await
             .context("handshake sync stage (PSYNC)")?;
 
-        let (reader, writer) = conn.into_split();
-
-        let subscriber = ReplSubscriber::RecvWrite(Connection {
-            reader: DataReader::new(reader),
-            writer: DataWriter::new(writer),
-        });
+        let subscriber = ReplSubscriber::RecvWrite(conn);
 
         Ok((rdb, subscriber))
     }
@@ -180,9 +180,7 @@ impl Replication {
         match resp {
             // TODO: don't forget about the state
             Resp::Cmd(Command::FullResync(_state)) => {
-                let (reader, _) = self.conn.split();
-                let mut reader = DataReader::new(reader);
-                let rdb = timeout(TIMEOUT, reader.read_rdb())
+                let rdb = timeout(TIMEOUT, self.conn.reader.read_rdb())
                     .await
                     .with_context(|| format!("reading RDB file after PSYNC {state} timed out"))?
                     .with_context(|| format!("reading RDB file after PSYNC {state}"))?;
@@ -193,9 +191,7 @@ impl Replication {
     }
 
     async fn request<const N: usize>(&mut self, args: [DataType; N]) -> Result<Resp> {
-        let (reader, writer) = self.conn.split();
-        let mut reader = DataReader::new(reader);
-        let mut writer = DataWriter::new(writer);
+        let Connection { reader, writer } = &mut self.conn;
 
         writer
             .write(&DataType::array(args))
