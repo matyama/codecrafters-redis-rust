@@ -4,13 +4,27 @@ use std::io::ErrorKind;
 use std::num::ParseIntError;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::{cmd, Command, DataExt, DataType, Offset, Resp, CRLF, FULLRESYNC, LF, OK, PONG, RDB};
+use crate::{cmd, Command, DataExt, DataType, Resp, CRLF, FULLRESYNC, LF, OK, PONG, RDB};
+
+trait ReadError {
+    fn terminates_read(&self) -> bool;
+}
+
+impl ReadError for std::io::Error {
+    #[inline]
+    fn terminates_read(&self) -> bool {
+        matches!(
+            self.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        )
+    }
+}
 
 pub struct DataReader<R> {
     reader: BufReader<R>,
@@ -70,36 +84,36 @@ where
         Ok(RDB(buf.freeze()))
     }
 
-    pub async fn read_next(&mut self) -> Result<Option<(Resp, Offset)>> {
-        let Some((data, offset)) = self.read_data().await? else {
+    pub async fn read_next(&mut self) -> Result<Option<(Resp, usize)>> {
+        let Some((data, bytes_read)) = self.read_data().await? else {
             return Ok(None);
         };
 
-        let (cmd, mut args) = match data {
-            s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => {
-                (s.to_uppercase(), VecDeque::new())
-            }
-            DataType::Array(mut args) => {
-                let Some(arg) = args.pop_front() else {
+        // println!("read {bytes_read}B of data: {data:?}");
+
+        let (cmd, args): (_, &[DataType]) = match &data {
+            s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => (s.to_uppercase(), &[]),
+            DataType::Array(args) => {
+                let Some(arg) = args.first() else {
                     bail!("protocol violation: no command found");
                 };
-                (arg.to_uppercase(), args)
+                (arg.to_uppercase(), &args[1..])
             }
-            data => return Ok(Some((data.into(), offset))),
+            _ => return Ok(Some((data.into(), bytes_read))),
         };
 
         let cmd = match cmd.as_slice() {
-            b"OK" => return Ok(Some((DataType::SimpleString(OK).into(), offset))),
+            b"OK" => return Ok(Some((DataType::SimpleString(OK).into(), bytes_read))),
 
-            b"PING" => match args.pop_front() {
+            b"PING" => match args.first().cloned() {
                 None => Command::Ping(None),
                 Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
                 Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
             },
 
-            b"PONG" => return Ok(Some((DataType::SimpleString(PONG).into(), offset))),
+            b"PONG" => return Ok(Some((DataType::SimpleString(PONG).into(), bytes_read))),
 
-            b"ECHO" => match args.pop_front() {
+            b"ECHO" => match args.first().cloned() {
                 Some(DataType::BulkString(msg)) => Command::Echo(msg),
                 Some(arg) => bail!("ECHO only accepts bulk strings as argument, got {arg:?}"),
                 None => bail!("ECHO requires an argument, got none"),
@@ -107,25 +121,26 @@ where
 
             b"INFO" => {
                 let sections = args
-                    .into_iter()
+                    .iter()
                     .filter_map(|arg| match arg {
                         DataType::BulkString(s) | DataType::SimpleString(s) => Some(s),
                         _ => None,
                     })
+                    .cloned()
                     .collect();
 
                 Command::Info(sections)
             }
 
-            b"GET" => match args.pop_front() {
+            b"GET" => match args.first().cloned() {
                 Some(DataType::BulkString(key)) => Command::Get(key.into()),
                 Some(arg) => bail!("GET only accepts bulk strings as argument, got {arg:?}"),
                 None => bail!("GET requires an argument, got none"),
             },
 
-            b"SET" => match (args.pop_front(), args.pop_front()) {
+            b"SET" => match (args.first().cloned(), args.get(1).cloned()) {
                 (Some(DataType::BulkString(key)), Some(DataType::BulkString(val))) => {
-                    let ops = cmd::set::Options::try_from(args)
+                    let ops = cmd::set::Options::try_from(&args[2..])
                         .with_context(|| format!("SET {key:?} {val:?} [options]"))?;
                     Command::Set(key.into(), val.into(), ops)
                 }
@@ -137,7 +152,7 @@ where
 
             b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
 
-            b"PSYNC" => match (args.pop_front(), args.pop_front()) {
+            b"PSYNC" => match (args.first().cloned(), args.get(1).cloned()) {
                 (Some(DataType::BulkString(repl_id)), Some(DataType::BulkString(repl_offset))) => {
                     let state = (repl_id.clone(), repl_offset.clone())
                         .try_into()
@@ -150,7 +165,7 @@ where
                 args => bail!("protocol violation: PSYNC with invalid argument types {args:?}"),
             },
 
-            b"WAIT" => match (args.pop_front(), args.pop_front()) {
+            b"WAIT" => match (args.first().cloned(), args.get(1).cloned()) {
                 (Some(num_replicas), Some(timeout)) => {
                     let Ok(DataType::Integer(num_replicas)) = num_replicas.parse_int() else {
                         bail!("protocol violation: WAIT with invalid numreplicas type");
@@ -202,10 +217,10 @@ where
             ),
         };
 
-        Ok(Some((cmd.into(), offset)))
+        Ok(Some((cmd.into(), bytes_read)))
     }
 
-    async fn read_data(&mut self) -> Result<Option<(DataType, Offset)>> {
+    async fn read_data(&mut self) -> Result<Option<(DataType, usize)>> {
         match self.reader.read_u8().await {
             Ok(b'_') => self.read_null().await.map(|(x, n)| (x, n + 1)).map(Some),
             Ok(b'#') => self.read_bool().await.map(|(b, n)| (b, n + 1)).map(Some),
@@ -231,16 +246,22 @@ where
                 .map(Some),
             Ok(b'*') => self.read_array().await.map(|(s, n)| (s, n + 1)).map(Some),
             Ok(b) => bail!("protocol violation: unsupported control byte '{b}'"),
-            Err(e) if matches!(e.kind(), ErrorKind::UnexpectedEof) => Ok(None),
+            Err(e) if e.terminates_read() => Ok(None),
             Err(e) => Err(e).context("failed to read next element"),
         }
     }
 
-    /// Reads next _segment_ into the given buffer.
+    /// Reads next _segment_ into an inner buffer.
     ///
     /// Segment is a byte sequence ending with a CRLF byte sequence. Note that the trailing CRLF is
     /// stripped before return.
-    async fn read_segment(&mut self) -> Result<(usize, Offset)> {
+    ///
+    /// Returns a pair of
+    ///  1. A view into `self.buf` of the data read (i.e., excluding CRLF)
+    ///  2. The total number of bytes read (i.e., including the CRLF)
+    async fn read_segment(&mut self) -> Result<(&[u8], usize)> {
+        self.buf.clear();
+
         let mut n = 0;
 
         while !self.buf[..n].ends_with(CRLF) {
@@ -255,83 +276,76 @@ where
         self.buf.pop();
         self.buf.pop();
 
-        Ok((n - 2, n.into()))
+        Ok((&self.buf, n))
     }
 
-    async fn read_null(&mut self) -> Result<(DataType, Offset)> {
-        self.buf.clear();
-
-        let (n, offset) = self.read_segment().await?;
+    async fn read_null(&mut self) -> Result<(DataType, usize)> {
+        let (bytes, n_read) = self.read_segment().await?;
 
         ensure!(
-            n == 0,
-            "protocol violation: expected no data for null, got {n} bytes"
+            bytes.is_empty(),
+            "protocol violation: expected no data for null, got {} bytes",
+            bytes.len(),
         );
 
-        Ok((DataType::Null, offset))
+        Ok((DataType::Null, n_read))
     }
 
     /// Read a boolean of the form `#<t|f>\r\n`
-    async fn read_bool(&mut self) -> Result<(DataType, Offset)> {
-        self.buf.clear();
-
-        let (n, offset) = self
+    async fn read_bool(&mut self) -> Result<(DataType, usize)> {
+        let (bytes, n_read) = self
             .read_segment()
             .await
             .context("failed to read a boolean")?;
 
         ensure!(
-            n == 1,
-            "protocol violation: expected single byte for a boolean, got {n} bytes"
+            bytes.len() == 1,
+            "protocol violation: expected single byte for a boolean, got {} bytes",
+            bytes.len(),
         );
 
-        match self.buf[0] {
-            b't' => Ok((DataType::Boolean(true), offset)),
-            b'f' => Ok((DataType::Boolean(false), offset)),
+        match bytes[0] {
+            b't' => Ok((DataType::Boolean(true), n_read)),
+            b'f' => Ok((DataType::Boolean(false), n_read)),
             b => bail!("protocol violation: invalid boolean byte {b}"),
         }
     }
 
     /// Read an integer of the form `[:][<+|->]<value>\r\n`
-    async fn read_int<T>(&mut self) -> Result<(T, Offset)>
+    async fn read_int<T>(&mut self) -> Result<(T, usize)>
     where
         T: FromStr,
         <T as FromStr>::Err: Debug,
     {
-        self.buf.clear();
-
-        let (n, offset) = self.read_segment().await?;
-
-        let bytes = &self.buf[..n];
+        let (bytes, n_read) = self.read_segment().await?;
 
         let Ok(slice) = std::str::from_utf8(bytes) else {
             bail!("expected UTF-8 digit sequence, got: {bytes:?}");
         };
 
         match slice.parse() {
-            Ok(int) => Ok((int, offset)),
+            Ok(int) => Ok((int, n_read)),
             Err(e) => Err(anyhow!("{e:?}: expected number, got: {slice}")),
         }
     }
 
     /// Read a simple strings or errors of the form `[<+|->]<data>\r\n`
-    async fn read_simple(&mut self) -> Result<(Bytes, Offset)> {
-        println!("reading simple data");
-        self.buf.clear();
-        let (n, offset) = self.read_segment().await?;
-        Ok((Bytes::copy_from_slice(&self.buf[..n]), offset))
+    async fn read_simple(&mut self) -> Result<(Bytes, usize)> {
+        // println!("reading simple data");
+        let (bytes, n_read) = self.read_segment().await?;
+        Ok((Bytes::copy_from_slice(bytes), n_read))
     }
 
     /// Read a bulk strings of the form `$<length>\r\n<data>\r\n`
-    async fn read_bulk_string(&mut self) -> Result<(DataType, Offset)> {
-        let (len, offset) = self.read_int().await?;
+    async fn read_bulk_string(&mut self) -> Result<(DataType, usize)> {
+        let (len, bytes_read) = self.read_int().await?;
 
         let Length::Some(len) = len else {
-            println!("reading null bulk string");
-            return Ok((DataType::NullBulkString, offset));
+            // println!("reading null bulk string");
+            return Ok((DataType::NullBulkString, bytes_read));
         };
 
-        println!("reading bulk string of length: {len}");
+        // println!("reading bulk string of length: {len}");
 
         let read_len = len + CRLF.len();
 
@@ -348,17 +362,17 @@ where
         // TODO: do `let data = self.buf.split_to(len).freeze();` instead
 
         // TODO: ideally this could point to a pooled buffer and not allocate
-        Ok((DataType::BulkString(buf.into()), offset + read_len))
+        Ok((DataType::BulkString(buf.into()), bytes_read + read_len))
     }
 
     /// Read an array of the form: `*<number-of-elements>\r\n<element-1>...<element-n>`
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn read_array(&mut self) -> Pin<Box<ReadArrayFut<'_>>> {
         Box::pin(async move {
-            let (len, mut offset) = self.read_int().await?;
-            println!("reading array of length: {len}");
+            let (len, mut n_total) = self.read_int().await?;
+            // println!("reading array of length: {len}");
 
-            let mut items = VecDeque::with_capacity(len);
+            let mut items = Vec::with_capacity(len);
 
             for i in 0..len {
                 let item = self
@@ -370,16 +384,16 @@ where
                     bail!("protocol violation: missing array item {i}");
                 };
 
-                items.push_back(item);
-                offset += n;
+                items.push(item);
+                n_total += n;
             }
 
-            Ok((DataType::Array(items), offset))
+            Ok((DataType::Array(items.into()), n_total))
         })
     }
 }
 
-type ReadArrayFut<'a> = dyn Future<Output = Result<(DataType, Offset)>> + Send + 'a;
+type ReadArrayFut<'a> = dyn Future<Output = Result<(DataType, usize)>> + Send + 'a;
 
 #[derive(Debug)]
 enum Length {

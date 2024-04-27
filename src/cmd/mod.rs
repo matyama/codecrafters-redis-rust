@@ -1,16 +1,15 @@
-use std::collections::VecDeque;
 use std::fmt::Write;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::vec;
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 
 use crate::store::{Key, Value};
 use crate::{
-    DataType, Instance, Protocol, ReplState, Role, ACK, ECHO, GET, INFO, OK, PING, PONG, PROTOCOL,
-    PSYNC, REPLCONF, SET, WAIT,
+    DataType, Instance, Protocol, ReplState, Role, ACK, ECHO, GET, GETACK, INFO, OK, PING, PONG,
+    PROTOCOL, PSYNC, REPLCONF, SET, WAIT,
 };
 
 pub mod info;
@@ -22,11 +21,11 @@ const NULL: DataType = match PROTOCOL {
     Protocol::RESP3 => DataType::Null,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub enum Command {
     Ping(Option<Bytes>),
     Echo(Bytes),
-    Info(Vec<Bytes>),
+    Info(Arc<[Bytes]>),
     Get(Key),
     Set(Key, Value, set::Options),
     Replconf(replconf::Conf),
@@ -44,7 +43,7 @@ impl Command {
 
             Self::Info(sections) => {
                 let num_sections = sections.len();
-                let info = info::Info::new(&instance, sections);
+                let info = info::Info::new(&instance, &sections);
                 let mut data = BytesMut::with_capacity(1024 * num_sections);
                 match write!(data, "{}", info) {
                     Ok(_) => DataType::BulkString(data.freeze()),
@@ -71,11 +70,11 @@ impl Command {
             }
 
             Self::Replconf(replconf::Conf::GetAck(_)) => {
-                let offset = instance.offset.load(Ordering::Acquire);
+                let ReplState { repl_offset, .. } = instance.state();
                 DataType::array([
                     DataType::BulkString(REPLCONF),
                     DataType::BulkString(ACK),
-                    DataType::BulkString(offset.to_string().into()),
+                    DataType::BulkString(repl_offset.to_string().into()),
                 ])
             }
 
@@ -89,10 +88,10 @@ impl Command {
 
             Self::PSync(ReplState {
                 repl_id: None,
-                repl_offset: -1,
-            }) => {
+                repl_offset,
+            }) if repl_offset.is_negative() => {
                 let mut data = BytesMut::with_capacity(64);
-                match write!(data, "FULLRESYNC {}", instance.state) {
+                match write!(data, "FULLRESYNC {}", instance.state()) {
                     Ok(_) => DataType::SimpleString(data.freeze()),
                     Err(e) => {
                         let error = format!("failed to write response to PSYNC ? -1: {e:?}");
@@ -111,13 +110,22 @@ impl Command {
                     ));
                 };
 
-                let num_acks = replicas
-                    .wait(num_replicas, timeout)
+                // Snapshot current replication state/offset. This will include all the writes in
+                // the master, including this connection's, completed _before_ this WAIT command.
+                let state = instance.state();
+
+                let result = replicas
+                    .wait(num_replicas, timeout, state)
                     .await
                     .with_context(|| format!("WAIT {num_replicas} {timeout:?}"));
 
-                match num_acks {
-                    Ok(n) => DataType::Integer(n as i64),
+                match result {
+                    Ok((n, offset)) if offset > 0 => {
+                        let (state, new_offset) = instance.shift_offset(offset);
+                        println!("master offset: {} -> {new_offset}", state.repl_offset);
+                        DataType::Integer(n as i64)
+                    }
+                    Ok((n, _)) => DataType::Integer(n as i64),
                     Err(e) => {
                         let error = format!("WAIT {num_replicas} {timeout:?} failed with {e:?}");
                         DataType::SimpleError(error.into())
@@ -125,6 +133,13 @@ impl Command {
                 }
             }
         }
+    }
+
+    /// Returns `true` iff this command represents either an operation that's subject to
+    /// replication or a command that can be forwarded to a replication connection.
+    #[inline]
+    pub(crate) fn is_repl(&self) -> bool {
+        self.is_write() || matches!(self, Self::Replconf(replconf::Conf::GetAck(_)))
     }
 
     /// Returns `true` iff this command represents a _write_ operation that's subject to
@@ -145,54 +160,53 @@ impl Command {
 impl From<Command> for DataType {
     fn from(cmd: Command) -> Self {
         let items = match cmd {
-            Command::Ping(None) => VecDeque::from([DataType::BulkString(PING)]),
+            Command::Ping(None) => vec![PING],
 
-            Command::Ping(Some(msg)) => {
-                VecDeque::from([DataType::BulkString(PING), DataType::BulkString(msg)])
-            }
+            Command::Ping(Some(msg)) => vec![PING, msg],
 
-            Command::Echo(msg) => {
-                VecDeque::from([DataType::BulkString(ECHO), DataType::BulkString(msg)])
-            }
+            Command::Echo(msg) => vec![ECHO, msg],
 
             Command::Info(sections) => {
-                let mut items = VecDeque::with_capacity(1 + sections.len());
-                items.push_back(DataType::BulkString(INFO));
-                items.extend(sections.into_iter().map(DataType::BulkString));
+                let mut items = Vec::with_capacity(1 + sections.len());
+                items.push(INFO);
+                items.extend(sections.iter().cloned());
                 items
             }
 
-            Command::Get(Key(key)) => {
-                VecDeque::from([DataType::BulkString(GET), DataType::BulkString(key)])
-            }
+            Command::Get(Key(key)) => vec![GET, key],
 
             Command::Set(Key(key), Value(value), ops) => {
-                // TODO(optimization): cmd writer with single BytesMut alloc and Bytes splits
-                let mut items: VecDeque<DataType> = ops.into();
-                items.push_front(DataType::BulkString(value));
-                items.push_front(DataType::BulkString(key));
-                items.push_front(DataType::BulkString(SET));
+                let mut items = Vec::with_capacity(8);
+                items.push(SET);
+                items.push(key);
+                items.push(value);
+                items.extend(ops.into_bytes());
                 items
             }
 
             Command::Replconf(replconf::Conf::ListeningPort(port)) => {
                 let port = port.to_string().into();
-                VecDeque::from([
-                    DataType::BulkString(REPLCONF),
-                    DataType::string(b"listening-port"),
-                    DataType::BulkString(port),
-                ])
+                vec![REPLCONF, Bytes::from_static(b"listening-port"), port]
             }
 
-            Command::Replconf(replconf::Conf::GetAck(dummy)) => VecDeque::from([
-                DataType::BulkString(REPLCONF),
-                DataType::string(b"getack"),
-                DataType::BulkString(dummy),
-            ]),
+            Command::Replconf(replconf::Conf::GetAck(dummy)) => {
+                vec![REPLCONF, GETACK, dummy]
+            }
 
-            Command::Replconf(replconf::Conf::Capabilities(mut capabilities)) => {
-                capabilities.push_front(REPLCONF);
-                capabilities.into_iter().map(DataType::BulkString).collect()
+            Command::Replconf(replconf::Conf::Ack(offset)) => {
+                let mut buf = BytesMut::with_capacity(16);
+                write!(buf, "{offset}").expect("failed to serialize REPLCONF ACK");
+                vec![REPLCONF, ACK, buf.freeze()]
+            }
+
+            Command::Replconf(replconf::Conf::Capabilities(capabilities)) => {
+                let mut items = Vec::with_capacity(1 + 2 * capabilities.len());
+                items.push(REPLCONF);
+                for capa in capabilities.iter().cloned() {
+                    items.push(Bytes::from_static(b"capa"));
+                    items.push(capa);
+                }
+                items
             }
 
             Command::PSync(ReplState {
@@ -201,11 +215,7 @@ impl From<Command> for DataType {
             }) => {
                 let repl_id = repl_id.unwrap_or_default().into();
                 let repl_offset = repl_offset.to_string().into();
-                VecDeque::from([
-                    DataType::BulkString(PSYNC),
-                    DataType::BulkString(repl_id),
-                    DataType::BulkString(repl_offset),
-                ])
+                vec![PSYNC, repl_id, repl_offset]
             }
 
             Command::FullResync(state) => {
@@ -214,13 +224,13 @@ impl From<Command> for DataType {
                 return DataType::SimpleString(data.freeze());
             }
 
-            Command::Wait(num_replicas, timeout) => VecDeque::from([
-                DataType::BulkString(WAIT),
-                DataType::BulkString(num_replicas.to_string().into()),
-                DataType::BulkString(timeout.as_millis().to_string().into()),
-            ]),
+            Command::Wait(num_replicas, timeout) => {
+                let num_replicas = num_replicas.to_string().into();
+                let timeout = timeout.as_millis().to_string().into();
+                vec![WAIT, num_replicas, timeout]
+            }
         };
 
-        DataType::Array(items)
+        DataType::cmd(items)
     }
 }

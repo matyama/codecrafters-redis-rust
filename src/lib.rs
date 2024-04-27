@@ -1,24 +1,28 @@
 use std::collections::HashMap;
-use std::future::ready;
+use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering::*};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use std::{collections::VecDeque, fmt::Debug};
 
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::{self, JoinSet};
 
-use repl::{ReplConnection, Replication};
+use cmd::replconf;
+use repl::{Connection, ReplConnection, Replication};
 
 pub(crate) use cmd::Command;
 pub(crate) use config::Config;
 pub(crate) use reader::DataReader;
+pub(crate) use repl::{ReplId, ReplState, UNKNOWN_REPL_STATE};
 pub(crate) use store::Store;
 pub(crate) use writer::DataWriter;
+
+use crate::writer::Serializer as _;
 
 pub(crate) mod cmd;
 pub(crate) mod config;
@@ -33,6 +37,8 @@ pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
 
 pub(crate) const EMPTY: Bytes = Bytes::from_static(b"");
+pub(crate) const DUMMY: Bytes = Bytes::from_static(b"*");
+pub(crate) const UNKNOWN: Bytes = Bytes::from_static(b"?");
 
 pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
 pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
@@ -46,9 +52,8 @@ pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
 pub(crate) const WAIT: Bytes = Bytes::from_static(b"WAIT");
 
 pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
+pub(crate) const GETACK: Bytes = Bytes::from_static(b"GETACK");
 pub(crate) const ACK: Bytes = Bytes::from_static(b"ACK");
-
-pub(crate) const DEFAULT_REPL_ID: Bytes = Bytes::from_static(b"?");
 
 // TODO: generalize to non-unix systems via cfg target_os
 const EMPTY_RDB: Bytes = Bytes::from_static(include_bytes!("../data/empty_rdb.dat"));
@@ -101,7 +106,8 @@ impl DataExt for Bytes {
     }
 }
 
-#[derive(Debug)]
+// NOTE: immutable with cheap Clone impl
+#[derive(Debug, Clone)]
 pub enum DataType {
     Null,
     NullBulkString,
@@ -110,18 +116,36 @@ pub enum DataType {
     SimpleString(Bytes),
     SimpleError(Bytes),
     BulkString(Bytes),
-    Array(VecDeque<DataType>),
+    Array(Arc<[DataType]>),
 }
 
 impl DataType {
     #[inline]
-    pub(crate) fn string(bytes: &'static [u8]) -> Self {
-        Self::BulkString(Bytes::from_static(bytes))
+    pub(crate) fn array<I>(items: I) -> Self
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        Self::Array(items.into_iter().collect())
     }
 
     #[inline]
-    pub(crate) fn array(items: impl Into<VecDeque<Self>>) -> Self {
-        Self::Array(items.into())
+    pub(crate) fn cmd<I>(args: I) -> Self
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        Self::array(args.into_iter().map(Self::BulkString))
+    }
+
+    /// Returns a static reference to the 'REPLCONF GETACK *' command and its serialized size
+    pub(crate) fn replconf_getack() -> &'static (Self, usize) {
+        static REPLCONF_GETACK: OnceLock<(DataType, usize)> = OnceLock::new();
+        REPLCONF_GETACK.get_or_init(|| {
+            let data = Self::from(Command::Replconf(cmd::replconf::Conf::GetAck(DUMMY)));
+            let size = BytesMut::serialized_size(&data)
+                .expect("'REPLCONF GETACK *' should be serializable");
+            debug_assert!(size > 0, "'{data:?}' got serialized to 0B");
+            (data, size)
+        })
     }
 
     pub(crate) fn parse_int(self) -> Result<Self> {
@@ -188,251 +212,178 @@ impl RDB {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(transparent)]
-pub struct Offset(usize);
-
-impl From<usize> for Offset {
-    #[inline]
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-impl From<Offset> for usize {
-    #[inline]
-    fn from(Offset(value): Offset) -> Self {
-        value
-    }
-}
-
-impl<T: Into<Self>> std::ops::Add<T> for Offset {
-    type Output = Self;
-
-    #[inline]
-    fn add(self, rhs: T) -> Self::Output {
-        Self(self.0 + rhs.into().0)
-    }
-}
-
-impl<T: Into<Self>> std::ops::AddAssign<T> for Offset {
-    #[inline]
-    fn add_assign(&mut self, rhs: T) {
-        self.0 += rhs.into().0;
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct ReplId(Bytes);
-
-impl ReplId {
-    #[inline]
-    pub fn new(repl_id: Bytes) -> Result<Option<ReplId>> {
-        match repl_id.as_ref() {
-            b"?" => Ok(None),
-            id if id.is_ascii() && id.len() == 40 => Ok(Some(Self(repl_id))),
-            id => bail!("invalid REPL_ID: {id:?}"),
-        }
-    }
-}
-
-impl From<ReplId> for Bytes {
-    #[inline]
-    fn from(ReplId(id): ReplId) -> Self {
-        id
-    }
-}
-
-impl Default for ReplId {
-    #[inline]
-    fn default() -> Self {
-        Self(DEFAULT_REPL_ID)
-    }
-}
-
-impl std::fmt::Display for ReplId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Ok(repl_id) = std::str::from_utf8(&self.0) else {
-            unreachable!("REPL_ID is valid UTF-8 by construction");
-        };
-        f.write_str(repl_id)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ReplState {
-    /// Pseudo random alphanumeric string of 40 characters
-    repl_id: Option<ReplId>,
-    repl_offset: isize,
-}
-
-impl<B> TryFrom<(Bytes, B)> for ReplState
-where
-    B: std::ops::Deref<Target = [u8]> + Debug,
-{
-    type Error = anyhow::Error;
-
-    fn try_from((repl_id, repl_offset): (Bytes, B)) -> Result<Self> {
-        let repl_id = ReplId::new(repl_id)?;
-
-        let Ok(repl_offset) = std::str::from_utf8(&repl_offset) else {
-            bail!("non-UTF-8 REPL_OFFSET: {repl_offset:?}");
-        };
-
-        let Ok(repl_offset) = repl_offset.parse() else {
-            bail!("non-int REPL_OFFSET: {repl_offset}");
-        };
-
-        Ok(ReplState {
-            repl_id,
-            repl_offset,
-        })
-    }
-}
-
-impl Default for ReplState {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            repl_id: None,
-            repl_offset: -1,
-        }
-    }
-}
-
-impl std::fmt::Display for ReplState {
-    #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} {}",
-            self.repl_id.clone().unwrap_or_default(),
-            self.repl_offset
-        )
-    }
-}
-
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct Leader(SocketAddr);
 
+// XXX: spawn an actor for each Replica from the set and implement forward/wait via a broadcast
 #[derive(Debug)]
 pub struct Replica {
-    addr: SocketAddr,
-    conn: TcpStream,
-}
-
-impl Replica {
-    pub(crate) async fn forward(&mut self, cmd: &DataType) -> Result<()> {
-        let (_, writer) = self.conn.split();
-        let mut writer = DataWriter::new(writer);
-
-        writer
-            .write(cmd)
-            .await
-            .with_context(|| format!("failed to forward a write command to {}", self.addr))?;
-
-        writer
-            .flush()
-            .await
-            .with_context(|| format!("failed to flush replication to {}", self.addr))?;
-
-        // NOTE: here we implement an async replication, so no sync waiting for a response
-
-        Ok(())
-    }
+    conn: Mutex<Connection>,
+    // TODO: AtomicPtr<ReplicaState { alive: bool, last_ack: Instant }>
+    // TODO: implement replica healthcheck (i.e, send periodic one-way PINGs)
+    #[allow(dead_code)]
+    alive: AtomicBool,
 }
 
 #[derive(Debug, Default)]
 #[repr(transparent)]
-pub struct ReplicaSet(RwLock<HashMap<SocketAddr, Arc<Mutex<Replica>>>>);
+pub struct ReplicaSet(RwLock<HashMap<SocketAddr, Arc<Replica>>>);
 
 impl ReplicaSet {
-    pub(crate) async fn register(&self, conn: TcpStream) -> Result<()> {
-        let Ok(addr) = conn.peer_addr() else {
-            bail!("cannot obtain replica address");
-        };
-        println!("registering new replica at {addr}");
-        let mut replicas = self.0.write().await;
-        let replica = Arc::new(Mutex::new(Replica { addr, conn }));
-        replicas.insert(addr, replica);
+    pub(crate) async fn register(&self, conn: TcpStream, state: ReplState) -> Result<()> {
+        let conn = Connection::new(conn, Some(state))?;
+        let addr = conn.peer();
+
+        let replica = Arc::new(Replica {
+            conn: Mutex::new(conn),
+            alive: AtomicBool::new(true),
+        });
+
+        {
+            let mut replicas = self.0.write().await;
+            replicas.insert(addr, Arc::clone(&replica));
+        }
+
+        {
+            let replicas = self.0.read().await;
+            println!(
+                "{addr} added to the current replica set: {:?}",
+                replicas.keys()
+            );
+        }
+
+        // TODO: register with a replica healthcheck service (i.e., periodic one-way PINGs)
+
         Ok(())
     }
 
     pub(crate) async fn forward(&self, cmd: Command) {
-        if !cmd.is_write() {
-            println!("WARN: only write commands can be forwarded to replicas, skipping {cmd:?}");
+        if !cmd.is_repl() {
+            println!("WARN: only some commands can be forwarded to replicas, skipping {cmd:?}");
             return;
         };
 
-        let cmd: Arc<DataType> = Arc::new(cmd.into());
+        println!("forwarding {cmd:?}");
+
+        let cmd = DataType::from(cmd);
 
         let replicas = self.0.read().await;
 
-        println!(
-            "forwarding {cmd:?} to current replica set {:?}",
-            replicas.keys()
-        );
-
         // NOTE: spawn should be fine (i.e., without ordering issues), since there's a replica lock
         for (&addr, replica) in replicas.iter() {
-            let cmd = Arc::clone(&cmd);
+            let cmd = cmd.clone();
             let replica = Arc::clone(replica);
             tokio::spawn(async move {
-                let mut replica = replica.lock().await;
-                let result = replica.forward(&cmd).await;
-                drop(replica);
-
-                // NOTE: when async replication fails, it's the failed replicas' job to re-sync
-                match result.with_context(|| format!("replicating to {addr}")) {
-                    Ok(_) => println!("update sent to replica {addr}"),
-                    Err(e) => eprintln!("write command replication failed with {e:?}"),
+                let mut replica = replica.conn.lock().await;
+                if let Err(e) = replica.forward(&cmd).await {
+                    // NOTE: when async replication fails, it's the failed replicas' job to re-sync
+                    eprintln!("replica {addr}: write command replication failed with {e:?}");
                 }
             });
         }
     }
 
-    pub(crate) async fn wait(&self, num_replicas: usize, timeout: Duration) -> Result<usize> {
-        let mut tasks = JoinSet::new();
-
+    pub(crate) async fn wait(
+        &self,
+        num_replicas: usize,
+        timeout: Duration,
+        state: ReplState,
+    ) -> Result<(usize, usize)> {
         let replicas = self.0.read().await;
 
-        println!(
-            "waiting for {num_replicas} (or {timeout:?}) from current replica set {:?}",
-            replicas.keys()
-        );
+        // Collect out-of-sync replicas, for the rest skip the GETACK request
+        let mut lagging = Vec::with_capacity(replicas.len());
+        for (&addr, replica) in replicas.iter() {
+            // XXX: this is very sad, here we'd be fine by just reading it via a simple ref
+            let repl = replica.conn.lock().await;
+            if state.repl_offset > repl.state().repl_offset {
+                lagging.push((addr, Arc::clone(replica)));
+            }
+        }
 
-        for (&_addr, replica) in replicas.iter() {
-            let replica = Arc::clone(replica);
+        if lagging.is_empty() {
+            return Ok((replicas.len(), 0));
+        }
+
+        let init_num_acks = replicas.len() - lagging.len();
+
+        let state = Arc::new(state);
+        let num_acks = Arc::new(AtomicUsize::new(init_num_acks));
+
+        let (getack, req_offset) = DataType::replconf_getack();
+
+        let mut tasks = JoinSet::new();
+
+        for (addr, replica) in lagging {
+            let state = Arc::clone(&state);
+            let num_acks = Arc::clone(&num_acks);
+
             tasks.spawn(async move {
-                let replica = replica.lock().await;
-                let ack = ready(1).await;
-                drop(replica);
-                Ok(ack)
+                // send REPLCONF GETACK * to the replica
+                let mut conn = replica.conn.lock().await;
+
+                let resp = conn.request(getack, timeout).await;
+
+                match resp.with_context(|| format!("replica {addr}")) {
+                    Ok((Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))), ..))
+                        if state.repl_offset <= repl_offset =>
+                    {
+                        conn.set_offset(repl_offset);
+
+                        if num_acks.fetch_add(1, AcqRel) > num_replicas {
+                            Ok(ControlFlow::Break(()))
+                        } else {
+                            Ok(ControlFlow::Continue(()))
+                        }
+                    }
+
+                    Ok((Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))), ..)) => {
+                        conn.set_offset(repl_offset);
+
+                        Ok(ControlFlow::Continue(()))
+                    }
+
+                    Ok((other, ..)) => {
+                        bail!("replica {addr}: expected 'REPLCONF ACK _' response, got {other:?}")
+                    }
+
+                    Err(e) => Err(e).context("failed to get ack"),
+                }
             });
         }
 
-        let num_acks = AtomicUsize::new(0);
+        drop(replicas);
 
         let sleep = tokio::time::sleep(timeout);
         tokio::pin!(sleep);
 
         loop {
             tokio::select! {
-                () = &mut sleep, if timeout > Duration::ZERO => break,
+                () = &mut sleep, if !timeout.is_zero() => break,
                 ack = tasks.join_next() => match ack {
-                    Some(Ok(Ok(ack))) => {
-                        let _ = num_acks.fetch_add(ack, Ordering::Release);
-                    }
-                    Some(Ok(Err(e)) | Err(e)) => eprintln!("replica failed to ack during wait: {e:?}"),
+                    Some(Ok(Ok(ControlFlow::Continue(_)))) => tokio::task::yield_now().await,
+                    Some(Ok(Ok(ControlFlow::Break(_)))) => break,
+                    Some(Ok(Err(e))) => eprintln!("replica failed to ack during wait: {e:?}"),
+                    Some(Err(e)) => eprintln!("task to get ack from replica panicked: {e:?}"),
+                    // NOTE: Redis waits for the whole timeout duration
+                    None if !timeout.is_zero() && num_replicas > 0 => {
+                        tokio::task::yield_now().await
+                    },
                     None => break,
                 },
-                else => tokio::task::yield_now().await,
             }
         }
 
-        Ok(num_acks.load(Ordering::Acquire))
+        let num_acks = num_acks.load(Acquire);
+
+        let req_offset = if num_acks > init_num_acks {
+            *req_offset
+        } else {
+            0
+        };
+
+        Ok((num_acks, req_offset))
     }
 }
 
@@ -452,51 +403,49 @@ impl std::fmt::Display for Role {
     }
 }
 
-// XXX: might need to store the both the state and store under a common mutex
 #[derive(Debug)]
 pub struct Instance {
     addr: SocketAddr,
     role: Role,
-    state: ReplState,
+    state: AtomicPtr<ReplState>,
     store: Store,
-    offset: AtomicUsize,
 }
 
 impl Instance {
     pub async fn new(cfg: Config) -> Result<(Self, ReplConnection)> {
-        // TODO: this is just an initial placeholder replication state
-        let state = ReplState {
-            repl_id: ReplId::new(Bytes::from_static(
-                b"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-            ))
-            .expect("valid REPL_ID"),
-            repl_offset: 0,
-        };
-
         let store = Store::default();
 
         let Some(leader) = cfg.replica_of else {
+            // TODO: this is just an initial placeholder replication state
+            let state = AtomicPtr::new(Box::into_raw(Box::new(ReplState {
+                repl_id: ReplId::new(Bytes::from_static(
+                    b"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+                ))
+                .expect("valid REPL_ID"),
+                repl_offset: 0,
+            })));
+
             let instance = Self {
                 addr: cfg.addr,
                 role: Role::Leader(ReplicaSet::default()),
                 state,
                 store,
-                offset: AtomicUsize::new(0),
             };
+
             return Ok((instance, ReplConnection::default()));
         };
 
-        // TODO: apply initial RDB
-        let (_rdb, subscriber) = Replication::handshake(leader, cfg.addr)
+        let (state, _rdb, subscriber) = Replication::handshake(leader, cfg.addr)
             .await
             .with_context(|| format!("handshake with leader at {leader}"))?;
+
+        // TODO: apply initial RDB
 
         let instance = Self {
             addr: cfg.addr,
             role: Role::Replica(Leader(leader)),
-            state,
+            state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             store,
-            offset: AtomicUsize::new(0),
         };
 
         Ok((instance, subscriber))
@@ -512,16 +461,53 @@ impl Instance {
         &self.role
     }
 
-    /// Returns previous [`Offset`]
-    pub fn shift_offset(&self, Offset(offset): Offset) -> Offset {
-        let mut old = self.offset.load(Ordering::Relaxed);
+    pub fn state(&self) -> ReplState {
+        let state = self.state.load(Acquire);
+        // NOTE: if the below is not correct, this could easily use some delayed reclamation scheme
+        // SAFETY: the Acquire load above should synchronize to see all the Release stores from the
+        // CAS in `shift_offset` - that is, it won't see any old values that would be dropped
+        let state = unsafe { &*state };
+        // NOTE: this is a cheap clone due to `Bytes::clone`
+        state.clone()
+    }
+
+    /// Returns previous state and the new offset
+    pub fn shift_offset(&self, offset: usize) -> (ReplState, isize) {
+        if offset == 0 {
+            let state = self.state();
+            return (state.clone(), state.repl_offset);
+        }
+        let mut old = self.state.load(Relaxed);
+        let new = Box::into_raw(Box::new(UNKNOWN_REPL_STATE));
         loop {
-            let new = old + offset;
-            match self
-                .offset
-                .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed)
             {
-                Ok(old) => break old.into(),
+                // SAFETY: always points to a valid allocation as long as self lives
+                //  1. `self.state` is initialized to a valid non-null allocation
+                //  2. The only way it changes is through the CAS below, which (if successful) sets
+                //     the value for the next iteration to the `new` allocation above.
+                //  3. If the CAS below fails, it's updated to some other valid allocation
+                //  4. Its allocation is freed only in the success case which breaks the loop and
+                //     we never give out references to it.
+                let old = unsafe { &*old };
+                // SAFETY: new never changes in these iterations and points to the allocation above
+                let new = unsafe { &mut *new };
+                new.repl_id = old.repl_id.clone();
+                new.repl_offset = old.repl_offset.max(0) + offset as isize;
+            }
+
+            match self.state.compare_exchange_weak(old, new, AcqRel, Acquire) {
+                Ok(old) => {
+                    // SAFETY: old is always a valid allocation and there cannot be refs to it
+                    //  1. It's been either created during instance initialization or
+                    //  2. It's been created during some previous invocation of this method
+                    let old_state = unsafe { Box::from_raw(old) };
+                    let old_state = ReplState {
+                        repl_id: old_state.repl_id.clone(),
+                        repl_offset: old_state.repl_offset,
+                    };
+                    let new_offset = old_state.repl_offset.max(0) + offset as isize;
+                    break (old_state, new_offset);
+                }
                 Err(new_old) => old = new_old,
             }
         }
@@ -540,45 +526,48 @@ impl Instance {
         let mut reader = DataReader::new(reader);
         let mut writer = DataWriter::new(writer);
 
-        while let Some((resp, _offset)) = reader.read_next().await? {
+        while let Some((resp, bytes_read)) = reader.read_next().await? {
             match resp {
                 Resp::Cmd(cmd @ Command::PSync(_)) => {
                     let Role::Leader(replicas) = &self.role else {
                         bail!("protocol violation: {cmd:?} is only supported by a leader");
                     };
 
-                    println!("executing {cmd:?}");
+                    println!("executing internal command: {cmd:?}");
                     let resp = cmd.exec(Arc::clone(&self)).await;
+
                     writer.write(&resp).await?;
 
                     let rdb = RDB::empty();
                     writer.write_rdb(rdb).await?;
                     writer.flush().await?;
 
-                    return replicas.register(conn).await;
+                    // assume that after PSYNC the replica will end up in the current state
+                    return replicas.register(conn, self.state()).await;
                 }
                 Resp::Cmd(cmd) if cmd.is_write() => {
-                    // TODO: skip this clone (should be cheap tho) on replicas
                     let repl_cmd = cmd.clone();
 
                     println!("executing write command {cmd:?}");
                     let resp = cmd.exec(Arc::clone(&self)).await;
-                    writer.write(&resp).await?;
 
-                    println!("flushing and closing connection");
+                    writer.write(&resp).await?;
                     writer.flush().await?;
 
                     if let Role::Leader(replicas) = &self.role {
+                        let (old_state, new_offset) = self.shift_offset(bytes_read);
+                        println!("master offset: {} -> {new_offset}", old_state.repl_offset);
                         replicas.forward(repl_cmd).await;
                     }
+
+                    println!("write command handled: {resp:?}");
                 }
                 Resp::Cmd(cmd) => {
                     println!("executing non-write command {cmd:?}");
                     let resp = cmd.exec(Arc::clone(&self)).await;
                     writer.write(&resp).await?;
-
-                    println!("flushing and closing connection");
                     writer.flush().await?;
+                    println!("non-write command handled: {resp:?}");
                 }
                 Resp::Data(resp) => {
                     bail!("protocol violation: expected a command, got {resp:?} instead")
@@ -603,15 +592,14 @@ impl Instance {
 
                 task::spawn(async move {
                     while let Some(ReplCommand { cmd, ack }) = rx.recv().await {
-                        println!("replication: executing command {cmd:?}");
+                        println!("replica: executing command {cmd:?}");
 
                         let resp = cmd.exec(Arc::clone(&instance)).await;
-                        println!("command replicated: {resp:?}");
 
                         if let Some(ack) = ack {
-                            println!("replying with replication response: {resp:?}");
+                            println!("replica: responding with {resp:?}");
                             if let Err(e) = ack.send(resp) {
-                                eprintln!("replication: response dropped due to {e:?}");
+                                eprintln!("replica: response dropped due to {e:?}");
                             }
                         }
                     }
@@ -623,9 +611,19 @@ impl Instance {
     }
 }
 
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let state = self.state.swap(std::ptr::null_mut(), AcqRel);
+        if !std::ptr::eq(state, std::ptr::null_mut()) {
+            // SAFETY: always points to a valid allocation of a state and never gives out refs
+            let _ = unsafe { Box::from_raw(state) };
+        }
+    }
+}
+
 impl std::fmt::Display for Instance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} @ {} ({})", self.role, self.addr, self.state)
+        write!(f, "{} @ {} ({})", self.role, self.addr, self.state())
     }
 }
 

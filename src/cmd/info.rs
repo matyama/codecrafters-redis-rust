@@ -1,4 +1,4 @@
-use crate::{Instance, ReplId};
+use crate::{Instance, ReplId, ReplState};
 
 #[derive(Debug)]
 pub enum Role {
@@ -104,15 +104,19 @@ impl std::fmt::Display for Replication {
 }
 
 impl Replication {
-    #[inline]
     pub(crate) fn new(instance: &Instance) -> Self {
+        let ReplState {
+            repl_id,
+            repl_offset,
+        } = instance.state();
+
         Self {
             role: Role::from(&instance.role),
             connected_slaves: 0,
             master_failover_state: FailoverState::default(),
-            master_replid: instance.state.repl_id.clone().unwrap_or_default(),
-            master_replid2: instance.state.repl_id.clone().unwrap_or_default(),
-            master_repl_offset: instance.state.repl_offset,
+            master_replid: repl_id.clone().unwrap_or_default(),
+            master_replid2: repl_id.clone().unwrap_or_default(),
+            master_repl_offset: repl_offset,
             second_repl_offset: -1,
             repl_backlog_active: false,
             repl_backlog_size: 0,
@@ -128,7 +132,7 @@ pub struct Info {
 }
 
 impl Info {
-    pub(crate) fn new(instance: &Instance, sections: Vec<bytes::Bytes>) -> Self {
+    pub(crate) fn new(instance: &Instance, sections: &[bytes::Bytes]) -> Self {
         if sections.is_empty() {
             return Self {
                 replication: Some(Replication::new(instance)),

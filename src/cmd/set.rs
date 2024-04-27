@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 use tokio::time::Duration;
@@ -45,6 +43,50 @@ impl From<Expiry> for [Bytes; 2] {
     }
 }
 
+#[allow(clippy::upper_case_acronyms)]
+enum ExpiryBytesIter {
+    EX(Option<Bytes>, Option<Duration>),
+    PX(Option<Bytes>, Option<Duration>),
+    EXAT(Option<Bytes>, Option<i64>),
+    PXAT(Option<Bytes>, Option<i64>),
+    KeepTTL(Option<Bytes>),
+}
+
+impl From<Expiry> for ExpiryBytesIter {
+    #[inline]
+    fn from(exp: Expiry) -> Self {
+        match exp {
+            Expiry::EX(ex) => Self::EX(Some(EX), Some(ex)),
+            Expiry::PX(px) => Self::PX(Some(PX), Some(px)),
+            Expiry::EXAT(exat) => Self::EXAT(Some(EXAT), Some(exat)),
+            Expiry::PXAT(pxat) => Self::PXAT(Some(PXAT), Some(pxat)),
+            Expiry::KeepTTL => Self::KeepTTL(Some(KEEPTTL)),
+        }
+    }
+}
+
+impl Iterator for ExpiryBytesIter {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::EX(op, ex) => op
+                .take()
+                .or_else(|| ex.take().map(|ex| ex.as_secs().to_string().into())),
+            Self::PX(op, px) => op
+                .take()
+                .or_else(|| px.take().map(|px| px.as_millis().to_string().into())),
+            Self::EXAT(op, exat) => op
+                .take()
+                .or_else(|| exat.take().map(|exat| exat.to_string().into())),
+            Self::PXAT(op, pxat) => op
+                .take()
+                .or_else(|| pxat.take().map(|pxat| pxat.to_string().into())),
+            Self::KeepTTL(op) => op.take(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Condition {
     /// Only set the key if it does not already exist
@@ -60,6 +102,25 @@ impl From<Condition> for Bytes {
             Condition::NX => NX,
             Condition::XX => XX,
         }
+    }
+}
+
+#[repr(transparent)]
+struct CondBytesIter(Option<Bytes>);
+
+impl From<Condition> for CondBytesIter {
+    #[inline]
+    fn from(cond: Condition) -> Self {
+        Self(Some(cond.into()))
+    }
+}
+
+impl Iterator for CondBytesIter {
+    type Item = Bytes;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.take()
     }
 }
 
@@ -111,21 +172,31 @@ impl Options {
     pub fn with_get(&mut self) {
         self.get = true;
     }
+
+    pub fn into_bytes(self) -> impl Iterator<Item = Bytes> {
+        OptionsBytesIter(
+            self.exp.map(ExpiryBytesIter::from),
+            self.cond.map(CondBytesIter::from),
+            if self.get { Some(GET) } else { None },
+        )
+    }
 }
 
-impl TryFrom<VecDeque<DataType>> for Options {
+impl TryFrom<&[DataType]> for Options {
     type Error = anyhow::Error;
 
-    fn try_from(mut args: VecDeque<DataType>) -> Result<Self> {
+    fn try_from(args: &[DataType]) -> Result<Self> {
         let mut ops = Options::default();
 
-        while let Some(arg) = args.pop_front() {
+        let mut args = args.iter().cloned();
+
+        while let Some(arg) = args.next() {
             match arg.to_uppercase().as_slice() {
                 b"NX" => ops.with_nx()?,
                 b"XX" => ops.with_xx()?,
                 b"GET" => ops.with_get(),
                 o @ b"EX" | o @ b"PX" | o @ b"EXAT" | o @ b"PXAT" => {
-                    let Some(arg) = args.pop_front() else {
+                    let Some(arg) = args.next() else {
                         bail!(
                             "syntax error: {} _ is missing an argument",
                             std::str::from_utf8(o).unwrap_or_default()
@@ -157,33 +228,35 @@ impl TryFrom<VecDeque<DataType>> for Options {
     }
 }
 
-impl From<Options> for VecDeque<DataType> {
-    fn from(Options { exp, cond, get }: Options) -> Self {
-        // NOTE: capacity = SET <key> <value> EX <ex> <cond> GET?
-        let mut ops = VecDeque::with_capacity(8);
+struct OptionsBytesIter(
+    Option<ExpiryBytesIter>,
+    Option<CondBytesIter>,
+    Option<Bytes>,
+);
 
-        match exp {
-            Some(exp @ Expiry::KeepTTL) => {
-                let [keep_ttl, _] = exp.into();
-                ops.push_back(DataType::BulkString(keep_ttl));
+impl Iterator for OptionsBytesIter {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Self(exp, cond, get) = self;
+
+        if let Some(it) = exp {
+            if let item @ Some(_) = it.next() {
+                return item;
+            } else {
+                exp.take();
             }
-            Some(exp) => {
-                for op in Into::<[Bytes; 2]>::into(exp) {
-                    ops.push_back(DataType::BulkString(op));
-                }
+        }
+
+        if let Some(it) = cond {
+            if let item @ Some(_) = it.next() {
+                return item;
+            } else {
+                cond.take();
             }
-            None => {}
         }
 
-        if let Some(cond) = cond {
-            ops.push_back(DataType::BulkString(cond.into()));
-        }
-
-        if get {
-            ops.push_back(DataType::BulkString(GET));
-        }
-
-        ops
+        get.take()
     }
 }
 

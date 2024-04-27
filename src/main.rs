@@ -26,13 +26,13 @@ async fn main() -> Result<()> {
 
             result = &mut repl_recv, if instance.is_replica() => match result {
                 Ok((mut repl, cmd, offset)) => {
-                    println!("received command {cmd:?}");
+                    // println!("replica received command: {cmd:?}");
                     if let Some(data) = replicator.exec(cmd).await? {
-                        println!("replication response: {data:?}");
+                        // println!("replica response: {data:?}");
                         repl.resp(data).await?;
                     }
-                    let old_offset = instance.shift_offset(offset);
-                    println!("replica offset: {old_offset:?} -> {:?}", old_offset + offset);
+                    let (old_state, new_offset) = instance.shift_offset(offset);
+                    println!("replica offset: {} -> {new_offset}", old_state.repl_offset);
                     repl_recv = repl.recv();
                 },
                 Err((repl, err)) => {
@@ -43,8 +43,9 @@ async fn main() -> Result<()> {
 
             conn = listener.accept() => {
                 match conn {
-                    Ok((stream, addr)) => {
-                        println!("{instance}: accepted new connection at {addr}");
+                    Ok((stream, _addr)) => {
+                        // println!("{instance}: accepted new connection at {addr}");
+                        stream.set_nodelay(true).context("enable TCP_NODELAY on connection")?;
                         let instance = Arc::clone(&instance);
                         task::spawn(async move {
                             if let Err(e) = instance.handle_connection(stream).await {
