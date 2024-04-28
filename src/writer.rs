@@ -136,6 +136,32 @@ where
 
                     bytes_written
                 }
+
+                // map: `%<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>`
+                DataType::Map(items) => {
+                    self.writer.write_u8(b'%').await?;
+
+                    self.buf.clear();
+                    write!(self.buf, "{}", items.len())?;
+                    self.writer.write_all(self.buf.as_bytes()).await?;
+                    self.writer.write_all(CRLF).await?;
+
+                    let mut bytes_written = 1 + self.buf.len() + CRLF.len();
+
+                    for (key, value) in items.iter() {
+                        // print!("map[{key:?}]: {value:?}");
+                        bytes_written += self
+                            .write(key)
+                            .await
+                            .with_context(|| format!("failed to write map key {key:?}"))?;
+                        bytes_written += self
+                            .write(value)
+                            .await
+                            .with_context(|| format!("failed to write map value {value:?}"))?;
+                    }
+
+                    bytes_written
+                }
             };
 
             //self.flush().await?;
@@ -231,6 +257,18 @@ impl Serializer for BytesMut {
                         .with_context(|| format!("failed to serialize array item {i}"))?;
                 }
             }
+
+            // map: `%<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>`
+            DataType::Map(items) if items.is_empty() => write!(self, "%{}\r\n", items.len())?,
+            DataType::Map(items) => {
+                write!(self, "%{}\r\n", items.len())?;
+                for (key, value) in items.iter() {
+                    self.serialize(key)
+                        .with_context(|| format!("failed to serialize map key {key:?}"))?;
+                    self.serialize(value)
+                        .with_context(|| format!("failed to serialize map value {value:?}"))?;
+                }
+            }
         }
 
         Ok(())
@@ -314,6 +352,18 @@ mod tests {
             DataType::array([]) => b"*0\r\n",
             ints => b"*2\r\n:1\r\n:2\r\n",
             array => b"*2\r\n$12\r\nsome message\r\n$12\r\nsome message\r\n"
+        }
+    }
+
+    #[test]
+    fn serialize_map() {
+        let keys = [DataType::Integer(1), DataType::Integer(2)];
+        let vals = [DataType::BulkString(DATA), DataType::BulkString(DATA)];
+        let items = keys.into_iter().zip(vals.into_iter());
+        let expected = b"%2\r\n:1\r\n$12\r\nsome message\r\n:2\r\n$12\r\nsome message\r\n";
+        test_serialize! {
+            DataType::map([]) => b"%0\r\n",
+            DataType::map(items) => expected
         }
     }
 }

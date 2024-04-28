@@ -1,12 +1,18 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinSet;
 
 use crate::cmd::replconf;
 use crate::{Command, DataExt as _, DataReader, DataType, DataWriter, Resp, RDB, TIMEOUT, UNKNOWN};
@@ -278,6 +284,177 @@ impl std::fmt::Display for ReplConnection {
             Self::Noop => write!(f, "ReplSubscriber::Noop"),
             Self::Recv(_) => write!(f, "ReplSubscriber::RecvWrite"),
         }
+    }
+}
+
+// XXX: spawn an actor for each Replica from the set and implement forward/wait via a broadcast
+#[derive(Debug)]
+pub struct Replica {
+    conn: Mutex<Connection>,
+    // TODO: AtomicPtr<ReplicaState { alive: bool, last_ack: Instant }>
+    // TODO: implement replica healthcheck (i.e, send periodic one-way PINGs)
+    #[allow(dead_code)]
+    alive: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct ReplicaSet(RwLock<HashMap<SocketAddr, Arc<Replica>>>);
+
+impl ReplicaSet {
+    pub(crate) async fn register(&self, conn: TcpStream, state: ReplState) -> Result<()> {
+        let conn = Connection::new(conn, Some(state))?;
+        let addr = conn.peer();
+
+        let replica = Arc::new(Replica {
+            conn: Mutex::new(conn),
+            alive: AtomicBool::new(true),
+        });
+
+        {
+            let mut replicas = self.0.write().await;
+            replicas.insert(addr, Arc::clone(&replica));
+        }
+
+        {
+            let replicas = self.0.read().await;
+            println!(
+                "{addr} added to the current replica set: {:?}",
+                replicas.keys()
+            );
+        }
+
+        // TODO: register with a replica healthcheck service (i.e., periodic one-way PINGs)
+
+        Ok(())
+    }
+
+    pub(crate) async fn forward(&self, cmd: Command) {
+        if !cmd.is_repl() {
+            println!("WARN: only some commands can be forwarded to replicas, skipping {cmd:?}");
+            return;
+        };
+
+        println!("forwarding {cmd:?}");
+
+        let cmd = DataType::from(cmd);
+
+        let replicas = self.0.read().await;
+
+        // NOTE: spawn should be fine (i.e., without ordering issues), since there's a replica lock
+        for (&addr, replica) in replicas.iter() {
+            let cmd = cmd.clone();
+            let replica = Arc::clone(replica);
+            tokio::spawn(async move {
+                let mut replica = replica.conn.lock().await;
+                if let Err(e) = replica.forward(&cmd).await {
+                    // NOTE: when async replication fails, it's the failed replicas' job to re-sync
+                    eprintln!("replica {addr}: write command replication failed with {e:?}");
+                }
+            });
+        }
+    }
+
+    pub(crate) async fn wait(
+        &self,
+        num_replicas: usize,
+        timeout: Duration,
+        state: ReplState,
+    ) -> Result<(usize, usize)> {
+        let replicas = self.0.read().await;
+
+        // Collect out-of-sync replicas, for the rest skip the GETACK request
+        let mut lagging = Vec::with_capacity(replicas.len());
+        for (&addr, replica) in replicas.iter() {
+            // XXX: this is very sad, here we'd be fine by just reading it via a simple ref
+            let repl = replica.conn.lock().await;
+            if state.repl_offset > repl.state().repl_offset {
+                lagging.push((addr, Arc::clone(replica)));
+            }
+        }
+
+        if lagging.is_empty() {
+            return Ok((replicas.len(), 0));
+        }
+
+        let init_num_acks = replicas.len() - lagging.len();
+
+        let state = Arc::new(state);
+        let num_acks = Arc::new(AtomicUsize::new(init_num_acks));
+
+        let (getack, req_offset) = DataType::replconf_getack();
+
+        let mut tasks = JoinSet::new();
+
+        for (addr, replica) in lagging {
+            let state = Arc::clone(&state);
+            let num_acks = Arc::clone(&num_acks);
+
+            tasks.spawn(async move {
+                // send REPLCONF GETACK * to the replica
+                let mut conn = replica.conn.lock().await;
+
+                let resp = conn.request(getack, timeout).await;
+
+                match resp.with_context(|| format!("replica {addr}")) {
+                    Ok((Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))), ..))
+                        if state.repl_offset <= repl_offset =>
+                    {
+                        conn.set_offset(repl_offset);
+
+                        if num_acks.fetch_add(1, AcqRel) > num_replicas {
+                            Ok(ControlFlow::Break(()))
+                        } else {
+                            Ok(ControlFlow::Continue(()))
+                        }
+                    }
+
+                    Ok((Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))), ..)) => {
+                        conn.set_offset(repl_offset);
+
+                        Ok(ControlFlow::Continue(()))
+                    }
+
+                    Ok((other, ..)) => {
+                        bail!("replica {addr}: expected 'REPLCONF ACK _' response, got {other:?}")
+                    }
+
+                    Err(e) => Err(e).context("failed to get ack"),
+                }
+            });
+        }
+
+        drop(replicas);
+
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+
+        loop {
+            tokio::select! {
+                () = &mut sleep, if !timeout.is_zero() => break,
+                ack = tasks.join_next() => match ack {
+                    Some(Ok(Ok(ControlFlow::Continue(_)))) => tokio::task::yield_now().await,
+                    Some(Ok(Ok(ControlFlow::Break(_)))) => break,
+                    Some(Ok(Err(e))) => eprintln!("replica failed to ack during wait: {e:?}"),
+                    Some(Err(e)) => eprintln!("task to get ack from replica panicked: {e:?}"),
+                    // NOTE: Redis waits for the whole timeout duration
+                    None if !timeout.is_zero() && num_replicas > 0 => {
+                        tokio::task::yield_now().await
+                    },
+                    None => break,
+                },
+            }
+        }
+
+        let num_acks = num_acks.load(Acquire);
+
+        let req_offset = if num_acks > init_num_acks {
+            *req_offset
+        } else {
+            0
+        };
+
+        Ok((num_acks, req_offset))
     }
 }
 

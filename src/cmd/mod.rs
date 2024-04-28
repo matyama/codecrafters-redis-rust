@@ -8,8 +8,8 @@ use bytes::{Bytes, BytesMut};
 
 use crate::store::{Key, Value};
 use crate::{
-    DataType, Instance, Protocol, ReplState, Role, ACK, ECHO, GET, GETACK, INFO, OK, PING, PONG,
-    PROTOCOL, PSYNC, REPLCONF, SET, WAIT,
+    DataType, Instance, Protocol, ReplState, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, OK, PING,
+    PONG, PROTOCOL, PSYNC, REPLCONF, SET, WAIT,
 };
 
 pub mod info;
@@ -25,6 +25,7 @@ const NULL: DataType = match PROTOCOL {
 pub enum Command {
     Ping(Option<Bytes>),
     Echo(Bytes),
+    Config(Arc<[Bytes]>),
     Info(Arc<[Bytes]>),
     Get(Key),
     Set(Key, Value, set::Options),
@@ -40,6 +41,24 @@ impl Command {
             Self::Ping(msg) => msg.map_or(DataType::SimpleString(PONG), DataType::BulkString),
 
             Self::Echo(msg) => DataType::BulkString(msg),
+
+            Self::Config(params) if params.is_empty() => DataType::SimpleError(Bytes::from_static(
+                b"ERR wrong number of arguments for 'config|get' command",
+            )),
+
+            Self::Config(params) => {
+                let items = params.iter().filter_map(|param| {
+                    instance
+                        .cfg
+                        .get(param)
+                        .map(|value| (DataType::BulkString(param.clone()), value))
+                });
+
+                match PROTOCOL {
+                    Protocol::RESP2 => DataType::array(items.flat_map(|(k, v)| [k, v])),
+                    Protocol::RESP3 => DataType::map(items),
+                }
+            }
 
             Self::Info(sections) => {
                 let num_sections = sections.len();
@@ -165,6 +184,14 @@ impl From<Command> for DataType {
             Command::Ping(Some(msg)) => vec![PING, msg],
 
             Command::Echo(msg) => vec![ECHO, msg],
+
+            Command::Config(params) => {
+                let mut items = Vec::with_capacity(2 + params.len());
+                items.push(CONFIG);
+                items.push(GET);
+                items.extend(params.iter().cloned());
+                items
+            }
 
             Command::Info(sections) => {
                 let mut items = Vec::with_capacity(1 + sections.len());

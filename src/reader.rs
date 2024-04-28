@@ -119,6 +119,32 @@ where
                 None => bail!("ECHO requires an argument, got none"),
             },
 
+            b"CONFIG" => {
+                let Some(arg) = args.first() else {
+                    bail!("protocol violation: CONFIG without arguments");
+                };
+
+                let (DataType::BulkString(s) | DataType::SimpleString(s)) = arg else {
+                    bail!("protocol violation: expected 'CONFIG GET ...', got {arg:?}");
+                };
+
+                if !matches!(s.to_uppercase().as_slice(), b"GET") {
+                    bail!("protocol violation: expected 'CONFIG GET ...', got 'CONFIG {s:?} ...'");
+                }
+
+                let params = args
+                    .iter()
+                    .skip(1)
+                    .filter_map(|arg| match arg {
+                        DataType::BulkString(s) | DataType::SimpleString(s) => Some(s),
+                        _ => None,
+                    })
+                    .cloned()
+                    .collect();
+
+                Command::Config(params)
+            }
+
             b"INFO" => {
                 let sections = args
                     .iter()
