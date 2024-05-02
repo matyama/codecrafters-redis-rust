@@ -15,6 +15,13 @@ impl From<ValueCell> for rdb::Value {
     }
 }
 
+impl From<&ValueCell> for rdb::ValueType {
+    #[inline]
+    fn from(value: &ValueCell) -> Self {
+        Self::from(&value.data)
+    }
+}
+
 #[derive(Debug)]
 pub struct ValueCell {
     data: rdb::Value,
@@ -128,6 +135,12 @@ impl Store {
         let store = self.0.read().await;
         let guard = store.db().await;
         guard.db.keys().cloned().collect()
+    }
+
+    pub async fn ty(&self, key: rdb::String) -> Option<rdb::ValueType> {
+        let store = self.0.read().await;
+        let guard = store.db().await;
+        guard.db.get(&key).map(rdb::ValueType::from)
     }
 
     pub async fn get(&self, key: rdb::String) -> Option<rdb::Value> {

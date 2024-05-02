@@ -6,10 +6,12 @@ use std::vec;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 
+use crate::data::DataType;
 use crate::rdb;
+use crate::repl::ReplState;
 use crate::{
-    DataType, Instance, Protocol, ReplState, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, OK,
-    PING, PONG, PROTOCOL, PSYNC, REPLCONF, SET, WAIT,
+    Instance, Protocol, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, NONE, OK, PING, PONG,
+    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT,
 };
 
 pub mod info;
@@ -27,6 +29,7 @@ pub enum Command {
     Echo(rdb::String),
     Config(Arc<[Bytes]>),
     Info(Arc<[Bytes]>),
+    Type(rdb::String),
     Keys(rdb::String),
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
@@ -71,6 +74,12 @@ impl Command {
                     Err(e) => DataType::err(format!("failed to serialize {info:?}: {e:?}")),
                 }
             }
+
+            Self::Type(key) => instance
+                .store
+                .ty(key)
+                .await
+                .map_or(DataType::str(NONE), DataType::str),
 
             Self::Keys(pattern @ (Int8(_) | Int16(_) | Int32(_))) => {
                 // TODO: impl as `store.contains(pattern)`
@@ -209,6 +218,8 @@ impl From<Command> for DataType {
                 items.extend(sections.iter().cloned().map(Self::string));
                 items
             }
+
+            Command::Type(key) => vec![Self::string(TYPE), Self::string(key)],
 
             Command::Keys(pattern) => vec![Self::string(KEYS), Self::string(pattern)],
 

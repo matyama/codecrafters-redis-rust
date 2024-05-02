@@ -25,6 +25,16 @@ mod encoding {
     pub(super) const ENC_VAL: u8 = 3;
 }
 
+mod valtype {
+    use bytes::Bytes;
+    pub(super) const STRING: Bytes = Bytes::from_static(b"string");
+    pub(super) const LIST: Bytes = Bytes::from_static(b"list");
+    pub(super) const SET: Bytes = Bytes::from_static(b"set");
+    pub(super) const ZSET: Bytes = Bytes::from_static(b"zset");
+    pub(super) const HASH: Bytes = Bytes::from_static(b"hash");
+    pub(super) const STREAM: Bytes = Bytes::from_static(b"stream");
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum String {
     Str(Bytes),
@@ -139,7 +149,7 @@ where
     Ok((string, bytes_read))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum ValueType {
     String = 0,
@@ -179,6 +189,34 @@ impl TryFrom<u8> for ValueType {
     }
 }
 
+impl From<ValueType> for Bytes {
+    #[inline]
+    fn from(ty: ValueType) -> Self {
+        use valtype::*;
+        match ty {
+            ValueType::String => STRING,
+            ValueType::List => LIST,
+            ValueType::Set => SET,
+            ValueType::ZSet => ZSET,
+            ValueType::Hash => HASH,
+            ValueType::HashZipMap => HASH,
+            ValueType::ListZipList => LIST,
+            ValueType::SetIntSet => SET,
+            ValueType::ZSetZipList => ZSET,
+            ValueType::HashZipList => HASH,
+            ValueType::ListQuickList => LIST,
+            ValueType::Stream => STREAM,
+        }
+    }
+}
+
+impl From<ValueType> for String {
+    #[inline]
+    fn from(ty: ValueType) -> Self {
+        Self::Str(ty.into())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Value {
     String(String),
@@ -211,6 +249,16 @@ impl From<Value> for String {
     fn from(value: Value) -> Self {
         match value {
             Value::String(s) => s,
+        }
+    }
+}
+
+impl From<&Value> for ValueType {
+    #[inline]
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::String(_) => ValueType::String,
+            // TODO: other value types
         }
     }
 }

@@ -342,6 +342,12 @@ where
                 Command::Info(sections)
             }
 
+            b"TYPE" => match args.first().cloned() {
+                Some(DataType::BulkString(key) | DataType::SimpleString(key)) => Command::Type(key),
+                Some(arg) => bail!("TYPE only accepts strings as argument, got {arg:?}"),
+                None => bail!("TYPE requires an argument, got none"),
+            },
+
             b"KEYS" => match args.first().cloned() {
                 Some(DataType::BulkString(pattern)) => Command::Keys(pattern),
                 Some(arg) => bail!("KEYS only accepts bulk strings as argument, got {arg:?}"),

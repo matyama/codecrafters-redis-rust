@@ -38,12 +38,14 @@ pub(crate) const NULL: &[u8] = b"_\r\n";
 pub(crate) const EMPTY: Bytes = Bytes::from_static(b"");
 pub(crate) const ANY: Bytes = Bytes::from_static(b"*");
 pub(crate) const UNKNOWN: Bytes = Bytes::from_static(b"?");
+pub(crate) const NONE: Bytes = Bytes::from_static(b"none");
 
 pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
 pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
 pub(crate) const ECHO: Bytes = Bytes::from_static(b"ECHO");
 pub(crate) const CONFIG: Bytes = Bytes::from_static(b"CONFIG");
 pub(crate) const KEYS: Bytes = Bytes::from_static(b"KEYS");
+pub(crate) const TYPE: Bytes = Bytes::from_static(b"TYPE");
 pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
 pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
 pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
