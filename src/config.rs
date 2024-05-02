@@ -1,8 +1,7 @@
-use std::borrow::Cow;
 use std::env::Args;
 use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -20,18 +19,23 @@ pub struct Config {
     pub(crate) addr: SocketAddr,
     pub(crate) replica_of: Option<SocketAddr>,
     pub(crate) dir: PathBuf,
-    pub(crate) dbfilename: Cow<'static, str>,
+    pub(crate) dbfilename: PathBuf,
 }
 
 impl Config {
+    #[inline]
+    pub(crate) fn db_path(&self) -> impl AsRef<Path> {
+        self.dir.join(self.dbfilename.as_path())
+    }
+
     // TODO: support glob params
     pub(crate) fn get(&self, param: &Bytes) -> Option<DataType> {
         match param.to_lowercase().as_slice() {
-            b"dir" => Some(DataType::BulkString(Bytes::copy_from_slice(
+            b"dir" => Some(DataType::string(Bytes::copy_from_slice(
                 self.dir.as_os_str().as_bytes(),
             ))),
-            b"dbfilename" => Some(DataType::BulkString(Bytes::copy_from_slice(
-                self.dbfilename.as_bytes(),
+            b"dbfilename" => Some(DataType::string(Bytes::copy_from_slice(
+                self.dbfilename.as_os_str().as_bytes(),
             ))),
             _ => None,
         }
@@ -45,7 +49,7 @@ impl Default for Config {
             addr: listen_socket_addr(&6379).expect("default listen address"),
             replica_of: None,
             dir: PathBuf::from("./"),
-            dbfilename: String::from_utf8_lossy(b"dump.rdb"),
+            dbfilename: PathBuf::from("dump.rdb"),
         }
     }
 }
@@ -99,7 +103,7 @@ impl TryFrom<Args> for Config {
                 }
 
                 "--dbfilename" => {
-                    let Some(dbfilename) = args.next().map(Cow::from) else {
+                    let Some(dbfilename) = args.next().map(PathBuf::from) else {
                         bail!("missing argument value for --dbfilename");
                     };
 

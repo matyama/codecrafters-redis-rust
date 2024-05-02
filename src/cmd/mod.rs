@@ -6,10 +6,10 @@ use std::vec;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 
-use crate::store::{Key, Value};
+use crate::rdb;
 use crate::{
-    DataType, Instance, Protocol, ReplState, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, OK, PING,
-    PONG, PROTOCOL, PSYNC, REPLCONF, SET, WAIT,
+    DataType, Instance, Protocol, ReplState, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, OK,
+    PING, PONG, PROTOCOL, PSYNC, REPLCONF, SET, WAIT,
 };
 
 pub mod info;
@@ -23,12 +23,13 @@ const NULL: DataType = match PROTOCOL {
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    Ping(Option<Bytes>),
-    Echo(Bytes),
+    Ping(Option<rdb::String>),
+    Echo(rdb::String),
     Config(Arc<[Bytes]>),
     Info(Arc<[Bytes]>),
-    Get(Key),
-    Set(Key, Value, set::Options),
+    Keys(rdb::String),
+    Get(rdb::String),
+    Set(rdb::String, rdb::Value, set::Options),
     Replconf(replconf::Conf),
     PSync(ReplState),
     FullResync(ReplState),
@@ -37,21 +38,22 @@ pub enum Command {
 
 impl Command {
     pub async fn exec(self, instance: Arc<Instance>) -> DataType {
+        use rdb::String::*;
         match self {
-            Self::Ping(msg) => msg.map_or(DataType::SimpleString(PONG), DataType::BulkString),
+            Self::Ping(msg) => msg.map_or(DataType::str(PONG), DataType::BulkString),
 
-            Self::Echo(msg) => DataType::BulkString(msg),
+            Self::Echo(msg) => DataType::string(msg),
 
-            Self::Config(params) if params.is_empty() => DataType::SimpleError(Bytes::from_static(
-                b"ERR wrong number of arguments for 'config|get' command",
-            )),
+            Self::Config(params) if params.is_empty() => {
+                DataType::err("ERR wrong number of arguments for 'config|get' command")
+            }
 
             Self::Config(params) => {
                 let items = params.iter().filter_map(|param| {
                     instance
                         .cfg
                         .get(param)
-                        .map(|value| (DataType::BulkString(param.clone()), value))
+                        .map(|value| (DataType::string(param.clone()), value))
                 });
 
                 match PROTOCOL {
@@ -65,44 +67,56 @@ impl Command {
                 let info = info::Info::new(&instance, &sections);
                 let mut data = BytesMut::with_capacity(1024 * num_sections);
                 match write!(data, "{}", info) {
-                    Ok(_) => DataType::BulkString(data.freeze()),
-                    Err(e) => {
-                        let error = format!("failed to serialize {info:?}: {e:?}");
-                        DataType::SimpleError(error.into())
-                    }
+                    Ok(_) => DataType::string(data),
+                    Err(e) => DataType::err(format!("failed to serialize {info:?}: {e:?}")),
                 }
             }
 
-            Self::Get(key) => instance
-                .store
-                .get(key)
-                .await
-                .map_or(NULL, |Value(value)| DataType::BulkString(value)),
+            Self::Keys(pattern @ (Int8(_) | Int16(_) | Int32(_))) => {
+                // TODO: impl as `store.contains(pattern)`
+                eprintln!("KEYS {pattern:?} is not supported");
+                DataType::array([])
+            }
 
-            Self::Set(key, value, ops) => {
+            Self::Keys(Str(pattern)) => match pattern.as_ref() {
+                b"*" => {
+                    let keys = instance
+                        .store
+                        .keys()
+                        .await
+                        .into_iter()
+                        .map(DataType::BulkString);
+
+                    DataType::array(keys)
+                }
+                pattern => {
+                    eprintln!("KEYS {pattern:?} is not supported");
+                    DataType::array([])
+                }
+            },
+
+            Self::Get(key) => instance.store.get(key).await.map_or(NULL, DataType::string),
+
+            Self::Set(key, val, ops) => {
                 let (ops, get) = ops.into();
-                match instance.store.set(key, value, ops).await {
-                    Ok(Some(Value(data))) if get => DataType::BulkString(data),
-                    Ok(_) => DataType::SimpleString(OK),
+                match instance.store.set(key, val, ops).await {
+                    Ok(Some(val)) if get => DataType::string(val),
+                    Ok(_) => DataType::str(OK),
                     Err(_) => NULL,
                 }
             }
 
             Self::Replconf(replconf::Conf::GetAck(_)) => {
                 let ReplState { repl_offset, .. } = instance.state();
-                DataType::array([
-                    DataType::BulkString(REPLCONF),
-                    DataType::BulkString(ACK),
-                    DataType::BulkString(repl_offset.to_string().into()),
-                ])
+                let repl_offset = repl_offset.to_string().into();
+                DataType::cmd([REPLCONF, ACK, repl_offset])
             }
 
             // TODO: handle ListeningPort | Capabilities
-            Self::Replconf(_) => DataType::SimpleString(OK),
+            Self::Replconf(_) => DataType::str(OK),
 
             Self::PSync(state) if matches!(instance.role, Role::Replica(_)) => {
-                let error = format!("unsupported command in a replica: PSYNC {state} ");
-                DataType::SimpleError(error.into())
+                DataType::err(format!("unsupported command in a replica: PSYNC {state} "))
             }
 
             Self::PSync(ReplState {
@@ -111,10 +125,9 @@ impl Command {
             }) if repl_offset.is_negative() => {
                 let mut data = BytesMut::with_capacity(64);
                 match write!(data, "FULLRESYNC {}", instance.state()) {
-                    Ok(_) => DataType::SimpleString(data.freeze()),
+                    Ok(_) => DataType::str(data),
                     Err(e) => {
-                        let error = format!("failed to write response to PSYNC ? -1: {e:?}");
-                        DataType::SimpleError(error.into())
+                        DataType::err(format!("failed to write response to PSYNC ? -1: {e:?}"))
                     }
                 }
             }
@@ -124,9 +137,7 @@ impl Command {
 
             Self::Wait(num_replicas, timeout) => {
                 let Role::Leader(replicas) = instance.role() else {
-                    return DataType::SimpleError(Bytes::from_static(
-                        b"protocol violation: WAIT is only supported by a leader",
-                    ));
+                    return DataType::err("protocol violation: WAIT is only supported by a leader");
                 };
 
                 // Snapshot current replication state/offset. This will include all the writes in
@@ -146,8 +157,7 @@ impl Command {
                     }
                     Ok((n, _)) => DataType::Integer(n as i64),
                     Err(e) => {
-                        let error = format!("WAIT {num_replicas} {timeout:?} failed with {e:?}");
-                        DataType::SimpleError(error.into())
+                        DataType::err(format!("WAIT {num_replicas} {timeout:?} failed with {e:?}"))
                     }
                 }
             }
@@ -179,59 +189,68 @@ impl Command {
 impl From<Command> for DataType {
     fn from(cmd: Command) -> Self {
         let items = match cmd {
-            Command::Ping(None) => vec![PING],
+            Command::Ping(None) => vec![Self::string(PING)],
 
-            Command::Ping(Some(msg)) => vec![PING, msg],
+            Command::Ping(Some(msg)) => vec![Self::string(PING), Self::string(msg)],
 
-            Command::Echo(msg) => vec![ECHO, msg],
+            Command::Echo(msg) => vec![Self::string(ECHO), Self::string(msg)],
 
             Command::Config(params) => {
                 let mut items = Vec::with_capacity(2 + params.len());
-                items.push(CONFIG);
-                items.push(GET);
-                items.extend(params.iter().cloned());
+                items.push(Self::string(CONFIG));
+                items.push(Self::string(GET));
+                items.extend(params.iter().cloned().map(Self::string));
                 items
             }
 
             Command::Info(sections) => {
                 let mut items = Vec::with_capacity(1 + sections.len());
-                items.push(INFO);
-                items.extend(sections.iter().cloned());
+                items.push(Self::string(INFO));
+                items.extend(sections.iter().cloned().map(Self::string));
                 items
             }
 
-            Command::Get(Key(key)) => vec![GET, key],
+            Command::Keys(pattern) => vec![Self::string(KEYS), Self::string(pattern)],
 
-            Command::Set(Key(key), Value(value), ops) => {
+            Command::Get(key) => vec![Self::string(GET), Self::string(key)],
+
+            Command::Set(key, val, ops) => {
                 let mut items = Vec::with_capacity(8);
-                items.push(SET);
-                items.push(key);
-                items.push(value);
-                items.extend(ops.into_bytes());
+                items.push(DataType::string(SET));
+                items.push(DataType::string(key));
+                items.push(DataType::string(val));
+                items.extend(ops.into_bytes().map(DataType::string));
                 items
             }
 
             Command::Replconf(replconf::Conf::ListeningPort(port)) => {
-                let port = port.to_string().into();
-                vec![REPLCONF, Bytes::from_static(b"listening-port"), port]
+                vec![
+                    Self::string(REPLCONF),
+                    Self::string("listening-port"),
+                    Self::string(port.to_string()),
+                ]
             }
 
             Command::Replconf(replconf::Conf::GetAck(dummy)) => {
-                vec![REPLCONF, GETACK, dummy]
+                vec![
+                    Self::string(REPLCONF),
+                    Self::string(GETACK),
+                    Self::string(dummy),
+                ]
             }
 
             Command::Replconf(replconf::Conf::Ack(offset)) => {
                 let mut buf = BytesMut::with_capacity(16);
                 write!(buf, "{offset}").expect("failed to serialize REPLCONF ACK");
-                vec![REPLCONF, ACK, buf.freeze()]
+                vec![Self::string(REPLCONF), Self::string(ACK), Self::string(buf)]
             }
 
             Command::Replconf(replconf::Conf::Capabilities(capabilities)) => {
                 let mut items = Vec::with_capacity(1 + 2 * capabilities.len());
-                items.push(REPLCONF);
+                items.push(Self::string(REPLCONF));
                 for capa in capabilities.iter().cloned() {
-                    items.push(Bytes::from_static(b"capa"));
-                    items.push(capa);
+                    items.push(Self::string("capa"));
+                    items.push(Self::string(capa));
                 }
                 items
             }
@@ -240,24 +259,28 @@ impl From<Command> for DataType {
                 repl_id,
                 repl_offset,
             }) => {
-                let repl_id = repl_id.unwrap_or_default().into();
-                let repl_offset = repl_offset.to_string().into();
-                vec![PSYNC, repl_id, repl_offset]
+                vec![
+                    Self::string(PSYNC),
+                    Self::string(repl_id.unwrap_or_default()),
+                    Self::string(repl_offset.to_string()),
+                ]
             }
 
             Command::FullResync(state) => {
                 let mut data = BytesMut::with_capacity(64);
                 write!(data, "FULLRESYNC {state}").expect("failed to serialize FULLRESYNC");
-                return DataType::SimpleString(data.freeze());
+                return DataType::SimpleString(data.freeze().into());
             }
 
             Command::Wait(num_replicas, timeout) => {
-                let num_replicas = num_replicas.to_string().into();
-                let timeout = timeout.as_millis().to_string().into();
-                vec![WAIT, num_replicas, timeout]
+                vec![
+                    Self::string(WAIT),
+                    Self::string(num_replicas.to_string()),
+                    Self::string(timeout.as_millis().to_string()),
+                ]
             }
         };
 
-        DataType::cmd(items)
+        Self::array(items)
     }
 }

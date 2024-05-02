@@ -15,7 +15,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
 use crate::cmd::replconf;
-use crate::{Command, DataExt as _, DataReader, DataType, DataWriter, Resp, RDB, TIMEOUT, UNKNOWN};
+use crate::rdb;
+use crate::{Command, DataReader, DataType, DataWriter, RDBData, Resp, TIMEOUT, UNKNOWN};
 
 pub(crate) const UNKNOWN_REPL_STATE: ReplState = ReplState {
     repl_id: None,
@@ -41,6 +42,13 @@ impl From<ReplId> for Bytes {
     #[inline]
     fn from(ReplId(id): ReplId) -> Self {
         id
+    }
+}
+
+impl From<ReplId> for rdb::String {
+    #[inline]
+    fn from(ReplId(id): ReplId) -> Self {
+        Self::from(id)
     }
 }
 
@@ -87,6 +95,30 @@ where
 
         Ok(ReplState {
             repl_id,
+            repl_offset,
+        })
+    }
+}
+
+impl TryFrom<(rdb::String, rdb::String)> for ReplState {
+    type Error = anyhow::Error;
+
+    fn try_from((repl_id, repl_offset): (rdb::String, rdb::String)) -> Result<Self> {
+        use rdb::String::*;
+
+        let Some(repl_id) = repl_id.bytes() else {
+            bail!("invalid REPL_ID: {repl_id:?}");
+        };
+
+        let repl_offset = match repl_offset {
+            Str(repl_offset) => return (repl_id, repl_offset).try_into(),
+            Int8(offset) => offset as isize,
+            Int16(offset) => offset as isize,
+            Int32(offset) => offset as isize,
+        };
+
+        Ok(ReplState {
+            repl_id: ReplId::new(repl_id)?,
             repl_offset,
         })
     }
@@ -209,7 +241,6 @@ impl Connection {
     }
 
     pub async fn ping(&mut self) -> Result<(usize, usize)> {
-        let pong = |s| String::from_utf8_lossy(s).to_uppercase() == "PONG";
         let ping = DataType::from(Command::Ping(None));
 
         let resp = self
@@ -218,7 +249,7 @@ impl Connection {
             .context("init replication")?;
 
         match resp {
-            (Resp::Data(DataType::SimpleString(s)), bytes_req, bytes_resp) if pong(&s) => {
+            (Resp::Data(DataType::SimpleString(s)), bytes_req, bytes_resp) if s.matches("PONG") => {
                 Ok((bytes_req, bytes_resp))
             }
             other => bail!("unexpected response {other:?}"),
@@ -480,7 +511,7 @@ impl Replication {
     pub async fn handshake(
         leader: SocketAddr,
         replica: SocketAddr,
-    ) -> Result<(ReplState, RDB, ReplConnection)> {
+    ) -> Result<(ReplState, RDBData, ReplConnection)> {
         let (Replication { conn, .. }, state, rdb) = Self::new(leader, replica)
             .await?
             .ping()
@@ -504,8 +535,6 @@ impl Replication {
 
     async fn conf(mut self) -> Result<Self> {
         // TODO: replace with an optimized Matcher<'_> that uses Cow internally and is_lowercase
-        let ok = |s: &Bytes| s.to_uppercase() == b"OK";
-
         let replconf = Command::Replconf(replconf::Conf::ListeningPort(self.repl.port()));
         let replconf = DataType::from(replconf);
 
@@ -516,7 +545,7 @@ impl Replication {
             .with_context(|| format!("{replconf:?}"))?;
 
         match resp {
-            Resp::Data(DataType::SimpleString(s)) if ok(&s) => {}
+            Resp::Data(DataType::SimpleString(s)) if s.matches("OK") => {}
             other => bail!("unexpected response {other:?}"),
         }
 
@@ -535,12 +564,12 @@ impl Replication {
             .with_context(|| format!("{replconf:?}"))?;
 
         match resp {
-            Resp::Data(DataType::SimpleString(s)) if ok(&s) => Ok(self),
+            Resp::Data(DataType::SimpleString(s)) if s.matches("OK") => Ok(self),
             other => bail!("unexpected response {other:?}"),
         }
     }
 
-    async fn sync(mut self) -> Result<(Self, ReplState, RDB)> {
+    async fn sync(mut self) -> Result<(Self, ReplState, RDBData)> {
         let state = ReplState::default();
 
         let psync = DataType::from(Command::PSync(state));

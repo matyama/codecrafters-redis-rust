@@ -5,7 +5,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use reader::RDBFileReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -19,10 +20,11 @@ pub(crate) use repl::{ReplId, ReplState, ReplicaSet, UNKNOWN_REPL_STATE};
 pub(crate) use store::Store;
 pub(crate) use writer::DataWriter;
 
-use crate::writer::Serializer as _;
+use crate::writer::{DataSerializer, Serializer as _};
 
 pub(crate) mod cmd;
 pub(crate) mod config;
+pub(crate) mod rdb;
 pub(crate) mod reader;
 pub(crate) mod repl;
 pub(crate) mod store;
@@ -34,13 +36,14 @@ pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
 
 pub(crate) const EMPTY: Bytes = Bytes::from_static(b"");
-pub(crate) const DUMMY: Bytes = Bytes::from_static(b"*");
+pub(crate) const ANY: Bytes = Bytes::from_static(b"*");
 pub(crate) const UNKNOWN: Bytes = Bytes::from_static(b"?");
 
 pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
 pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
 pub(crate) const ECHO: Bytes = Bytes::from_static(b"ECHO");
 pub(crate) const CONFIG: Bytes = Bytes::from_static(b"CONFIG");
+pub(crate) const KEYS: Bytes = Bytes::from_static(b"KEYS");
 pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
 pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
 pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
@@ -104,6 +107,32 @@ impl DataExt for Bytes {
     }
 }
 
+impl DataExt for rdb::String {
+    fn to_uppercase(&self) -> Vec<u8> {
+        use rdb::String::*;
+        let mut s = match self {
+            Str(s) => return s.to_uppercase(),
+            Int8(i) => i.to_string(),
+            Int16(i) => i.to_string(),
+            Int32(i) => i.to_string(),
+        };
+        s.make_ascii_uppercase();
+        s.into()
+    }
+
+    fn to_lowercase(&self) -> Vec<u8> {
+        use rdb::String::*;
+        let mut s = match self {
+            Str(s) => return s.to_lowercase(),
+            Int8(i) => i.to_string(),
+            Int16(i) => i.to_string(),
+            Int32(i) => i.to_string(),
+        };
+        s.make_ascii_lowercase();
+        s.into()
+    }
+}
+
 // NOTE: immutable with cheap Clone impl
 #[derive(Debug, Clone)]
 pub enum DataType {
@@ -111,14 +140,28 @@ pub enum DataType {
     NullBulkString,
     Boolean(bool),
     Integer(i64),
-    SimpleString(Bytes),
-    SimpleError(Bytes),
-    BulkString(Bytes),
+    SimpleString(rdb::String),
+    SimpleError(rdb::String),
+    BulkString(rdb::String),
     Array(Arc<[DataType]>),
     Map(Arc<[(DataType, DataType)]>),
 }
 
 impl DataType {
+    pub(crate) fn err(e: impl Into<rdb::String>) -> Self {
+        Self::SimpleError(e.into())
+    }
+
+    #[inline]
+    pub(crate) fn str(s: impl Into<rdb::String>) -> Self {
+        Self::SimpleString(s.into())
+    }
+
+    #[inline]
+    pub(crate) fn string(s: impl Into<rdb::String>) -> Self {
+        Self::BulkString(s.into())
+    }
+
     #[inline]
     pub(crate) fn array<I>(items: I) -> Self
     where
@@ -136,19 +179,20 @@ impl DataType {
     }
 
     #[inline]
-    pub(crate) fn cmd<I>(args: I) -> Self
+    pub(crate) fn cmd<T, I>(args: I) -> Self
     where
-        I: IntoIterator<Item = Bytes>,
+        T: Into<rdb::String>,
+        I: IntoIterator<Item = T>,
     {
-        Self::array(args.into_iter().map(Self::BulkString))
+        Self::array(args.into_iter().map(Self::string))
     }
 
     /// Returns a static reference to the 'REPLCONF GETACK *' command and its serialized size
     pub(crate) fn replconf_getack() -> &'static (Self, usize) {
         static REPLCONF_GETACK: OnceLock<(DataType, usize)> = OnceLock::new();
         REPLCONF_GETACK.get_or_init(|| {
-            let data = Self::from(Command::Replconf(cmd::replconf::Conf::GetAck(DUMMY)));
-            let size = BytesMut::serialized_size(&data)
+            let data = Self::from(Command::Replconf(cmd::replconf::Conf::GetAck(ANY)));
+            let size = DataSerializer::serialized_size(&data)
                 .expect("'REPLCONF GETACK *' should be serializable");
             debug_assert!(size > 0, "'{data:?}' got serialized to 0B");
             (data, size)
@@ -156,17 +200,23 @@ impl DataType {
     }
 
     pub(crate) fn parse_int(self) -> Result<Self> {
+        use rdb::String::*;
         match self {
             Self::Null => bail!("null cannot be converted to an integer"),
             Self::Boolean(b) => Ok(Self::Integer(b.into())),
             i @ Self::Integer(_) => Ok(i),
-            Self::SimpleString(s) | Self::BulkString(s) => {
-                let s = std::str::from_utf8(&s)
-                    .with_context(|| format!("{s:?} is not a UTF-8 string"))?;
-                s.parse()
-                    .map(Self::Integer)
-                    .with_context(|| format!("'{s}' does not represent an integer"))
-            }
+            Self::SimpleString(s) | Self::BulkString(s) => match s {
+                Str(s) => {
+                    let s = std::str::from_utf8(&s)
+                        .with_context(|| format!("{s:?} is not a UTF-8 string"))?;
+                    s.parse()
+                        .map(Self::Integer)
+                        .with_context(|| format!("'{s}' does not represent an integer"))
+                }
+                Int8(i) => Ok(Self::Integer(i as i64)),
+                Int16(i) => Ok(Self::Integer(i as i64)),
+                Int32(i) => Ok(Self::Integer(i as i64)),
+            },
             Self::NullBulkString => bail!("null bulk string cannot be converted to an integer"),
             Self::SimpleError(_) => bail!("simple error cannot be converted to an integer"),
             Self::Array(_) => bail!("array cannot be converted to an integer"),
@@ -203,11 +253,12 @@ impl DataExt for DataType {
     }
 }
 
+// TODO: deprecate in favor of RDB
 #[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct RDB(pub(crate) Bytes);
+pub struct RDBData(pub(crate) Bytes);
 
-impl RDB {
+impl RDBData {
     #[inline]
     pub fn empty() -> Self {
         Self(EMPTY_RDB)
@@ -250,7 +301,18 @@ pub struct Instance {
 
 impl Instance {
     pub async fn new(cfg: Config) -> Result<(Self, ReplConnection)> {
-        let store = Store::default();
+        let store = if let Some(mut reader) = RDBFileReader::new(cfg.db_path()).await? {
+            let (rdb, bytes_read) = reader.read().await?;
+
+            println!(
+                "read initial RDB (v{}, {bytes_read}B) {:?} // {:x?}",
+                rdb.version, rdb.aux, rdb.checksum
+            );
+
+            Store::from(rdb)
+        } else {
+            Store::default()
+        };
 
         let Some(leader) = cfg.replica_of else {
             // TODO: this is just an initial placeholder replication state
@@ -375,7 +437,7 @@ impl Instance {
 
                     writer.write(&resp).await?;
 
-                    let rdb = RDB::empty();
+                    let rdb = RDBData::empty();
                     writer.write_rdb(rdb).await?;
                     writer.flush().await?;
 

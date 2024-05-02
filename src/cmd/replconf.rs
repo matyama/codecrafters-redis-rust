@@ -26,6 +26,7 @@ impl TryFrom<&[DataType]> for Conf {
                 continue;
             };
 
+            // TODO: match by letters (upper/lowercase) without alloc
             match key.to_lowercase().as_slice() {
                 b"listening-port" => {
                     let Some(port) = args.next() else {
@@ -42,6 +43,9 @@ impl TryFrom<&[DataType]> for Conf {
 
                 b"getack" => match args.next() {
                     Some(DataType::BulkString(dummy) | DataType::SimpleString(dummy)) => {
+                        let Some(dummy) = dummy.bytes() else {
+                            bail!("protocol violation: REPLCONF GETACK {dummy:?}");
+                        };
                         return Ok(Self::GetAck(dummy));
                     }
                     other => {
@@ -67,6 +71,9 @@ impl TryFrom<&[DataType]> for Conf {
 
                 b"capa" | b"capabilities" => match args.next() {
                     Some(DataType::BulkString(capa) | DataType::SimpleString(capa)) => {
+                        let Some(capa) = capa.bytes() else {
+                            bail!("protocol violation: REPLCONF {key:?} {capa:?}");
+                        };
                         capabilities.push(capa);
                     }
                     other => bail!("protocol violation: REPLCONF {key:?} {other:?}"),
