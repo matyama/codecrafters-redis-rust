@@ -35,16 +35,6 @@ pub enum String {
 }
 
 impl String {
-    // TODO: replace by optimized utility comparator which does not allocate (deprecate `DataExt`)
-    /// Returns `true` iff this string matches `other` assuming it's in uppercase
-    #[inline]
-    pub fn matches(&self, other: &'static str) -> bool {
-        match self {
-            Self::Str(s) => std::string::String::from_utf8_lossy(s).to_uppercase() == other,
-            _ => false,
-        }
-    }
-
     #[inline]
     pub fn bytes(&self) -> Option<Bytes> {
         match self {

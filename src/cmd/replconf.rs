@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 
-use crate::{DataExt as _, DataType};
+use crate::data::{DataExt as _, DataType};
+use crate::{rdb, ACK, GETACK};
 
 #[derive(Clone, Debug)]
 pub enum Conf {
@@ -22,12 +23,44 @@ impl TryFrom<&[DataType]> for Conf {
         let mut args = args.iter().cloned();
 
         while let Some(key) = args.next() {
-            let key @ (DataType::BulkString(_) | DataType::SimpleString(_)) = key else {
+            let (DataType::BulkString(key) | DataType::SimpleString(key)) = key else {
                 continue;
             };
 
-            // TODO: match by letters (upper/lowercase) without alloc
-            match key.to_lowercase().as_slice() {
+            if key.matches(GETACK) {
+                match args.next() {
+                    Some(DataType::BulkString(dummy) | DataType::SimpleString(dummy)) => {
+                        let Some(dummy) = dummy.bytes() else {
+                            bail!("protocol violation: REPLCONF GETACK {dummy:?}");
+                        };
+                        return Ok(Self::GetAck(dummy));
+                    }
+                    other => bail!("protocol violation: REPLCONF GETACK {other:?}"),
+                }
+            }
+
+            if key.matches(ACK) {
+                let Some(offset) = args.next() else {
+                    bail!("protocol violation: REPLCONF ACK _ is missing an offset argument");
+                };
+
+                let offset = offset
+                    .parse_int()
+                    .context("protocol violation: REPLCONF ACK _ with an invalid offset")?;
+
+                let DataType::Integer(offset) = offset else {
+                    unreachable!("if parse_int succeeds, then only with integers");
+                };
+
+                return Ok(Self::Ack(offset as isize));
+            }
+
+            let rdb::String::Str(key) = key else {
+                continue;
+            };
+
+            // NOTE: configuration options seems to always be lowercase, thus matched exactly
+            match key.as_ref() {
                 b"listening-port" => {
                     let Some(port) = args.next() else {
                         bail!("protocol violation: REPLCONF {key:?} _ is missing an argument");
@@ -39,34 +72,6 @@ impl TryFrom<&[DataType]> for Conf {
                         }
                         other => bail!("protocol violation: REPLCONF {key:?} {other:?}"),
                     }
-                }
-
-                b"getack" => match args.next() {
-                    Some(DataType::BulkString(dummy) | DataType::SimpleString(dummy)) => {
-                        let Some(dummy) = dummy.bytes() else {
-                            bail!("protocol violation: REPLCONF GETACK {dummy:?}");
-                        };
-                        return Ok(Self::GetAck(dummy));
-                    }
-                    other => {
-                        bail!("protocol violation: REPLCONF GETACK {other:?}");
-                    }
-                },
-
-                b"ack" => {
-                    let Some(offset) = args.next() else {
-                        bail!("protocol violation: REPLCONF ACK _ is missing an offset argument");
-                    };
-
-                    let offset = offset
-                        .parse_int()
-                        .context("protocol violation: REPLCONF ACK _ with an invalid offset")?;
-
-                    let DataType::Integer(offset) = offset else {
-                        unreachable!("if parse_int succeeds, then only with integers");
-                    };
-
-                    return Ok(Self::Ack(offset as isize));
                 }
 
                 b"capa" | b"capabilities" => match args.next() {

@@ -109,7 +109,7 @@ impl Default for StoreInner {
             db: HashMap::default(),
         };
 
-        let mut dbs = HashMap::with_capacity(16);
+        let mut dbs = HashMap::with_capacity(Store::DEFAULT_SIZE);
         dbs.insert(ix, Mutex::new(db));
 
         Self { ix, dbs }
@@ -120,6 +120,9 @@ impl Default for StoreInner {
 pub struct Store(RwLock<StoreInner>);
 
 impl Store {
+    /// Default number of databases this store starts with
+    pub(crate) const DEFAULT_SIZE: usize = 16;
+
     // TODO: support patters other than *
     pub async fn keys(&self) -> Vec<rdb::String> {
         let store = self.0.read().await;

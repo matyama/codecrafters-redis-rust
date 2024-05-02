@@ -14,9 +14,10 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
 };
 
+use crate::data::{DataExt as _, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
-use crate::{cmd, Command, DataExt, DataType, RDBData, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
+use crate::{cmd, Command, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
 
 pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
 
@@ -313,13 +314,9 @@ where
                     bail!("protocol violation: CONFIG without arguments");
                 };
 
-                let (DataType::BulkString(s) | DataType::SimpleString(s)) = arg else {
+                if !arg.matches(GET) {
                     bail!("protocol violation: expected 'CONFIG GET ...', got {arg:?}");
                 };
-
-                if !matches!(s.to_uppercase().as_slice(), b"GET") {
-                    bail!("protocol violation: expected 'CONFIG GET ...', got 'CONFIG {s:?} ...'");
-                }
 
                 let params = args
                     .iter()

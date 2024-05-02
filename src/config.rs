@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 
-use crate::{DataExt, DataType};
+use crate::data::{DataExt as _, DataType};
 
 fn listen_socket_addr(port: &impl std::fmt::Display) -> Result<SocketAddr> {
     format!("0.0.0.0:{port}")
@@ -30,15 +30,19 @@ impl Config {
 
     // TODO: support glob params
     pub(crate) fn get(&self, param: &Bytes) -> Option<DataType> {
-        match param.to_lowercase().as_slice() {
-            b"dir" => Some(DataType::string(Bytes::copy_from_slice(
+        if param.matches("dir") {
+            return Some(DataType::string(Bytes::copy_from_slice(
                 self.dir.as_os_str().as_bytes(),
-            ))),
-            b"dbfilename" => Some(DataType::string(Bytes::copy_from_slice(
-                self.dbfilename.as_os_str().as_bytes(),
-            ))),
-            _ => None,
+            )));
         }
+
+        if param.matches("dbfilename") {
+            return Some(DataType::string(Bytes::copy_from_slice(
+                self.dbfilename.as_os_str().as_bytes(),
+            )));
+        }
+
+        None
     }
 }
 

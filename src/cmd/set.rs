@@ -2,7 +2,8 @@ use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 use tokio::time::Duration;
 
-use crate::{DataExt as _, DataType, EMPTY, GET};
+use crate::data::{DataExt as _, DataType};
+use crate::{EMPTY, GET};
 
 const EX: Bytes = Bytes::from_static(b"EX");
 const PX: Bytes = Bytes::from_static(b"PX");
@@ -191,6 +192,7 @@ impl TryFrom<&[DataType]> for Options {
         let mut args = args.iter().cloned();
 
         while let Some(arg) = args.next() {
+            // TODO: match individually and deprecate `to_uppercase`
             match arg.to_uppercase().as_slice() {
                 b"NX" => ops.with_nx()?,
                 b"XX" => ops.with_xx()?,

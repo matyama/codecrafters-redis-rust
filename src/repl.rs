@@ -15,8 +15,9 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
 use crate::cmd::replconf;
+use crate::data::{DataExt as _, DataType};
 use crate::rdb;
-use crate::{Command, DataReader, DataType, DataWriter, RDBData, Resp, TIMEOUT, UNKNOWN};
+use crate::{Command, DataReader, DataWriter, RDBData, Resp, TIMEOUT, UNKNOWN};
 
 pub(crate) const UNKNOWN_REPL_STATE: ReplState = ReplState {
     repl_id: None,

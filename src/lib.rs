@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicPtr, Ordering::*};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -15,15 +15,15 @@ use repl::{ReplConnection, Replication};
 
 pub(crate) use cmd::Command;
 pub(crate) use config::Config;
+pub(crate) use data::DataType;
 pub(crate) use reader::DataReader;
 pub(crate) use repl::{ReplId, ReplState, ReplicaSet, UNKNOWN_REPL_STATE};
 pub(crate) use store::Store;
 pub(crate) use writer::DataWriter;
 
-use crate::writer::{DataSerializer, Serializer as _};
-
 pub(crate) mod cmd;
 pub(crate) mod config;
+pub(crate) mod data;
 pub(crate) mod rdb;
 pub(crate) mod reader;
 pub(crate) mod repl;
@@ -86,170 +86,6 @@ impl From<DataType> for Resp {
     #[inline]
     fn from(resp: DataType) -> Self {
         Self::Data(resp)
-    }
-}
-
-pub trait DataExt {
-    // NOTE: this could probably benefit from small vec optimization
-    fn to_uppercase(&self) -> Vec<u8>;
-    fn to_lowercase(&self) -> Vec<u8>;
-}
-
-impl DataExt for Bytes {
-    #[inline]
-    fn to_uppercase(&self) -> Vec<u8> {
-        self.to_ascii_uppercase()
-    }
-
-    #[inline]
-    fn to_lowercase(&self) -> Vec<u8> {
-        self.to_ascii_lowercase()
-    }
-}
-
-impl DataExt for rdb::String {
-    fn to_uppercase(&self) -> Vec<u8> {
-        use rdb::String::*;
-        let mut s = match self {
-            Str(s) => return s.to_uppercase(),
-            Int8(i) => i.to_string(),
-            Int16(i) => i.to_string(),
-            Int32(i) => i.to_string(),
-        };
-        s.make_ascii_uppercase();
-        s.into()
-    }
-
-    fn to_lowercase(&self) -> Vec<u8> {
-        use rdb::String::*;
-        let mut s = match self {
-            Str(s) => return s.to_lowercase(),
-            Int8(i) => i.to_string(),
-            Int16(i) => i.to_string(),
-            Int32(i) => i.to_string(),
-        };
-        s.make_ascii_lowercase();
-        s.into()
-    }
-}
-
-// NOTE: immutable with cheap Clone impl
-#[derive(Debug, Clone)]
-pub enum DataType {
-    Null,
-    NullBulkString,
-    Boolean(bool),
-    Integer(i64),
-    SimpleString(rdb::String),
-    SimpleError(rdb::String),
-    BulkString(rdb::String),
-    Array(Arc<[DataType]>),
-    Map(Arc<[(DataType, DataType)]>),
-}
-
-impl DataType {
-    pub(crate) fn err(e: impl Into<rdb::String>) -> Self {
-        Self::SimpleError(e.into())
-    }
-
-    #[inline]
-    pub(crate) fn str(s: impl Into<rdb::String>) -> Self {
-        Self::SimpleString(s.into())
-    }
-
-    #[inline]
-    pub(crate) fn string(s: impl Into<rdb::String>) -> Self {
-        Self::BulkString(s.into())
-    }
-
-    #[inline]
-    pub(crate) fn array<I>(items: I) -> Self
-    where
-        I: IntoIterator<Item = Self>,
-    {
-        Self::Array(items.into_iter().collect())
-    }
-
-    #[inline]
-    pub(crate) fn map<I>(items: I) -> Self
-    where
-        I: IntoIterator<Item = (Self, Self)>,
-    {
-        Self::Map(items.into_iter().collect())
-    }
-
-    #[inline]
-    pub(crate) fn cmd<T, I>(args: I) -> Self
-    where
-        T: Into<rdb::String>,
-        I: IntoIterator<Item = T>,
-    {
-        Self::array(args.into_iter().map(Self::string))
-    }
-
-    /// Returns a static reference to the 'REPLCONF GETACK *' command and its serialized size
-    pub(crate) fn replconf_getack() -> &'static (Self, usize) {
-        static REPLCONF_GETACK: OnceLock<(DataType, usize)> = OnceLock::new();
-        REPLCONF_GETACK.get_or_init(|| {
-            let data = Self::from(Command::Replconf(cmd::replconf::Conf::GetAck(ANY)));
-            let size = DataSerializer::serialized_size(&data)
-                .expect("'REPLCONF GETACK *' should be serializable");
-            debug_assert!(size > 0, "'{data:?}' got serialized to 0B");
-            (data, size)
-        })
-    }
-
-    pub(crate) fn parse_int(self) -> Result<Self> {
-        use rdb::String::*;
-        match self {
-            Self::Null => bail!("null cannot be converted to an integer"),
-            Self::Boolean(b) => Ok(Self::Integer(b.into())),
-            i @ Self::Integer(_) => Ok(i),
-            Self::SimpleString(s) | Self::BulkString(s) => match s {
-                Str(s) => {
-                    let s = std::str::from_utf8(&s)
-                        .with_context(|| format!("{s:?} is not a UTF-8 string"))?;
-                    s.parse()
-                        .map(Self::Integer)
-                        .with_context(|| format!("'{s}' does not represent an integer"))
-                }
-                Int8(i) => Ok(Self::Integer(i as i64)),
-                Int16(i) => Ok(Self::Integer(i as i64)),
-                Int32(i) => Ok(Self::Integer(i as i64)),
-            },
-            Self::NullBulkString => bail!("null bulk string cannot be converted to an integer"),
-            Self::SimpleError(_) => bail!("simple error cannot be converted to an integer"),
-            Self::Array(_) => bail!("array cannot be converted to an integer"),
-            Self::Map(_) => bail!("map cannot be converted to an integer"),
-        }
-    }
-}
-
-impl DataExt for DataType {
-    fn to_uppercase(&self) -> Vec<u8> {
-        match self {
-            Self::NullBulkString => vec![],
-            Self::SimpleString(s) => s.to_uppercase(),
-            Self::BulkString(s) => s.to_uppercase(),
-            other => {
-                let mut other = format!("{other:?}");
-                other.make_ascii_uppercase();
-                other.into()
-            }
-        }
-    }
-
-    fn to_lowercase(&self) -> Vec<u8> {
-        match self {
-            Self::NullBulkString => vec![],
-            Self::SimpleString(s) => s.to_lowercase(),
-            Self::BulkString(s) => s.to_lowercase(),
-            other => {
-                let mut other = format!("{other:?}");
-                other.make_ascii_lowercase();
-                other.into()
-            }
-        }
     }
 }
 
