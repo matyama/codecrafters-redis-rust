@@ -462,9 +462,14 @@ where
                 .map(|(s, n)| (DataType::SimpleError(s), n + 1))
                 .map(Some),
             Ok(b'$') => self
-                .read_bulk_string()
+                .read_bulk()
                 .await
-                .map(|(s, n)| (s, n + 1))
+                .map(|(s, n)| (s.map_or(DataType::NullBulkString, DataType::string), n + 1))
+                .map(Some),
+            Ok(b'!') => self
+                .read_bulk()
+                .await
+                .map(|(s, n)| (s.map_or(DataType::NullBulkError, DataType::error), n + 1))
                 .map(Some),
             Ok(b'*') => self.read_array().await.map(|(s, n)| (s, n + 1)).map(Some),
             Ok(b) => bail!("protocol violation: unsupported control byte '{b}'"),
@@ -553,22 +558,18 @@ where
 
     /// Read a simple strings or errors of the form `[<+|->]<data>\r\n`
     async fn read_simple(&mut self) -> Result<(rdb::String, usize)> {
-        // println!("reading simple data");
         let (bytes, n_read) = self.read_segment().await?;
         let data = Bytes::copy_from_slice(bytes);
         Ok((data.into(), n_read))
     }
 
-    /// Read a bulk strings of the form `$<length>\r\n<data>\r\n`
-    async fn read_bulk_string(&mut self) -> Result<(DataType, usize)> {
+    /// Read a bulk strings|errors of the form `<$|!><length>\r\n<data>\r\n`
+    async fn read_bulk(&mut self) -> Result<(Option<rdb::String>, usize)> {
         let (len, bytes_read) = self.read_int().await?;
 
         let Length::Some(len) = len else {
-            // println!("reading null bulk string");
-            return Ok((DataType::NullBulkString, bytes_read));
+            return Ok((None, bytes_read));
         };
-
-        // println!("reading bulk string of length: {len}");
 
         let read_len = len + CRLF.len();
 
@@ -578,14 +579,14 @@ where
         self.reader
             .read_exact(&mut buf)
             .await
-            .with_context(|| format!("failed to read {read_len} bytes of a bulk string's data"))?;
+            .with_context(|| format!("failed to read {read_len} bytes of bulk data"))?;
 
         // strip trailing CRLF
         buf.truncate(len);
         // TODO: do `let data = self.buf.split_to(len).freeze();` instead
 
         // TODO: ideally this could point to a pooled buffer and not allocate
-        Ok((DataType::BulkString(buf.into()), bytes_read + read_len))
+        Ok((Some(buf.into()), bytes_read + read_len))
     }
 
     /// Read an array of the form: `*<number-of-elements>\r\n<element-1>...<element-n>`
@@ -593,7 +594,6 @@ where
     fn read_array(&mut self) -> Pin<Box<ReadArrayFut<'_>>> {
         Box::pin(async move {
             let (len, mut n_total) = self.read_int().await?;
-            // println!("reading array of length: {len}");
 
             let mut items = Vec::with_capacity(len);
 

@@ -13,11 +13,13 @@ use crate::ANY;
 pub enum DataType {
     Null,
     NullBulkString,
+    NullBulkError,
     Boolean(bool),
     Integer(i64),
     SimpleString(rdb::String),
     SimpleError(rdb::String),
     BulkString(rdb::String),
+    BulkError(rdb::String),
     Array(Arc<[DataType]>),
     Map(Arc<[(DataType, DataType)]>),
 }
@@ -35,6 +37,11 @@ impl DataType {
     #[inline]
     pub(crate) fn string(s: impl Into<rdb::String>) -> Self {
         Self::BulkString(s.into())
+    }
+
+    #[inline]
+    pub(crate) fn error(s: impl Into<rdb::String>) -> Self {
+        Self::BulkError(s.into())
     }
 
     #[inline]
@@ -92,8 +99,12 @@ impl DataType {
                 Int16(i) => Ok(Self::Integer(i as i64)),
                 Int32(i) => Ok(Self::Integer(i as i64)),
             },
-            Self::NullBulkString => bail!("null bulk string cannot be converted to an integer"),
-            Self::SimpleError(_) => bail!("simple error cannot be converted to an integer"),
+            Self::NullBulkString | Self::NullBulkError => {
+                bail!("null bulk string|erorr cannot be converted to an integer")
+            }
+            Self::SimpleError(_) | Self::BulkError(_) => {
+                bail!("error cannot be converted to an integer")
+            }
             Self::Array(_) => bail!("array cannot be converted to an integer"),
             Self::Map(_) => bail!("map cannot be converted to an integer"),
         }

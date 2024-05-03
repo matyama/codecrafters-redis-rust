@@ -71,7 +71,7 @@ impl Command {
                 let mut data = BytesMut::with_capacity(1024 * num_sections);
                 match write!(data, "{}", info) {
                     Ok(_) => DataType::string(data),
-                    Err(e) => DataType::err(format!("failed to serialize {info:?}: {e:?}")),
+                    Err(e) => DataType::error(format!("failed to serialize {info:?}: {e:?}")),
                 }
             }
 

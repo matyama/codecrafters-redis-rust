@@ -42,14 +42,9 @@ where
                     NULL.len()
                 }
 
-                // null bulk string: `$-1\r\n`
-                DataType::NullBulkString => {
-                    self.buf.clear();
-                    write!(self.buf, "$-1")?;
-                    self.writer.write_all(self.buf.as_bytes()).await?;
-                    self.writer.write_all(CRLF).await?;
-                    self.buf.len() + CRLF.len()
-                }
+                // null bulk string|error: `<$|!>-1\r\n`
+                DataType::NullBulkString => self.write_bulk('$', None).await?,
+                DataType::NullBulkError => self.write_bulk('!', None).await?,
 
                 // boolean: `#<t|f>\r\n`
                 DataType::Boolean(boolean) => {
@@ -69,41 +64,16 @@ where
                 }
 
                 // simple strings: `+<data>\r\n`
-                DataType::SimpleString(data) => {
-                    self.buf.clear();
-                    let data = write_str(&mut self.buf, data)?;
-                    self.writer.write_u8(b'+').await?;
-                    self.writer.write_all(data).await?;
-                    self.writer.write_all(CRLF).await?;
-                    1 + data.len() + CRLF.len()
-                }
+                DataType::SimpleString(data) => self.write_simple(b'+', data).await?,
 
                 // simple errors: `-<data>\r\n`
-                DataType::SimpleError(data) => {
-                    self.buf.clear();
-                    let data = write_str(&mut self.buf, data)?;
-                    self.writer.write_u8(b'-').await?;
-                    self.writer.write_all(data).await?;
-                    self.writer.write_all(CRLF).await?;
-                    1 + data.len() + CRLF.len()
-                }
+                DataType::SimpleError(data) => self.write_simple(b'-', data).await?,
 
-                // TODO: extend to BulkError with (`!` instead of `$`)
                 // bulk strings: `$<length>\r\n<data>\r\n`
-                DataType::BulkString(data) => {
-                    self.buf.clear();
-                    self.aux.clear();
+                DataType::BulkString(data) => self.write_bulk('$', Some(data)).await?,
 
-                    let data = write_str(&mut self.aux, data)?;
-                    let len = data.len();
-
-                    write!(self.buf, "${len}\r\n")?;
-                    self.writer.write_all(self.buf.as_bytes()).await?;
-                    self.writer.write_all(data).await?;
-                    self.writer.write_all(CRLF).await?;
-
-                    self.buf.len() + len + CRLF.len()
-                }
+                // bulk errors: `!<length>\r\n<data>\r\n`
+                DataType::BulkError(data) => self.write_bulk('!', Some(data)).await?,
 
                 // array: `*<number-of-elements>\r\n<element-1>...<element-n>`
                 DataType::Array(items) => {
@@ -160,6 +130,36 @@ where
         })
     }
 
+    async fn write_simple(&mut self, tag: u8, data: &rdb::String) -> Result<usize> {
+        self.buf.clear();
+        let data = write_str(&mut self.buf, data)?;
+        self.writer.write_u8(tag).await?;
+        self.writer.write_all(data).await?;
+        self.writer.write_all(CRLF).await?;
+        Ok(1 + data.len() + CRLF.len())
+    }
+
+    async fn write_bulk(&mut self, tag: char, data: Option<&rdb::String>) -> Result<usize> {
+        self.buf.clear();
+        self.aux.clear();
+
+        let Some(data) = data else {
+            write!(self.buf, "{tag}-1\r\n")?;
+            self.writer.write_all(self.buf.as_bytes()).await?;
+            return Ok(self.buf.len());
+        };
+
+        let data = write_str(&mut self.aux, data)?;
+        let len = data.len();
+
+        write!(self.buf, "{tag}{len}\r\n")?;
+        self.writer.write_all(self.buf.as_bytes()).await?;
+        self.writer.write_all(data).await?;
+        self.writer.write_all(CRLF).await?;
+
+        Ok(self.buf.len() + len + CRLF.len())
+    }
+
     /// Write a RDB file
     ///
     /// # Format
@@ -202,6 +202,29 @@ pub struct DataSerializer {
     aux: String,
 }
 
+impl DataSerializer {
+    fn serialize_simple(&mut self, tag: char, data: &rdb::String) -> Result<()> {
+        self.aux.clear();
+        let data = write_str(&mut self.aux, data)?;
+        self.buf.reserve(1 + data.len() + CRLF.len());
+        self.buf.write_char(tag)?;
+        self.buf.put_slice(data);
+        write!(self.buf, "\r\n")?;
+        Ok(())
+    }
+
+    fn serialize_bulk(&mut self, tag: char, data: &rdb::String) -> Result<()> {
+        self.aux.clear();
+        let data = write_str(&mut self.aux, data)?;
+        let len = data.len();
+        self.buf.reserve(1 + CRLF.len() + len + CRLF.len());
+        write!(self.buf, "{tag}{len}\r\n")?;
+        self.buf.put_slice(data);
+        write!(self.buf, "\r\n")?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 impl DataSerializer {
     pub fn clear(&mut self) {
@@ -226,8 +249,9 @@ impl Serializer for DataSerializer {
                 self.buf.put_slice(NULL);
             }
 
-            // null bulk string: `$-1\r\n`
+            // null bulk string|eror: `<$|!>-1\r\n`
             DataType::NullBulkString => self.buf.write_str("$-1\r\n")?,
+            DataType::NullBulkError => self.buf.write_str("!-1\r\n")?,
 
             // boolean: `#<t|f>\r\n`
             DataType::Boolean(true) => self.buf.write_str("#t\r\n")?,
@@ -237,35 +261,16 @@ impl Serializer for DataSerializer {
             DataType::Integer(int) => write!(self.buf, ":{int}\r\n")?,
 
             // simple strings: `+<data>\r\n`
-            DataType::SimpleString(data) => {
-                self.aux.clear();
-                let data = write_str(&mut self.aux, data)?;
-                self.buf.reserve(1 + data.len() + CRLF.len());
-                self.buf.write_char('+')?;
-                self.buf.put_slice(data);
-                write!(self.buf, "\r\n")?;
-            }
+            DataType::SimpleString(data) => self.serialize_simple('+', data)?,
 
             // simple errors: `-<data>\r\n`
-            DataType::SimpleError(data) => {
-                self.aux.clear();
-                let data = write_str(&mut self.aux, data)?;
-                self.buf.reserve(1 + data.len() + CRLF.len());
-                self.buf.write_char('-')?;
-                self.buf.put_slice(data);
-                write!(self.buf, "\r\n")?;
-            }
+            DataType::SimpleError(data) => self.serialize_simple('-', data)?,
 
             // bulk strings: `$<length>\r\n<data>\r\n`
-            DataType::BulkString(data) => {
-                self.aux.clear();
-                let data = write_str(&mut self.aux, data)?;
-                let len = data.len();
-                self.buf.reserve(1 + CRLF.len() + len + CRLF.len());
-                write!(self.buf, "${len}\r\n")?;
-                self.buf.put_slice(data);
-                write!(self.buf, "\r\n")?;
-            }
+            DataType::BulkString(data) => self.serialize_bulk('$', data)?,
+
+            // bulk error: `!<length>\r\n<data>\r\n`
+            DataType::BulkError(data) => self.serialize_bulk('!', data)?,
 
             // array: `*<number-of-elements>\r\n<element-1>...<element-n>`
             DataType::Array(items) if items.is_empty() => write!(self.buf, "*{}\r\n", items.len())?,
@@ -350,10 +355,12 @@ mod tests {
     }
 
     #[test]
-    fn serialize_bulk_string() {
+    fn serialize_bulk() {
         test_serialize! {
             DataType::NullBulkString => b"$-1\r\n",
-            DataType::string(DATA) => b"$12\r\nsome message\r\n"
+            DataType::NullBulkError => b"!-1\r\n",
+            DataType::string(DATA) => b"$12\r\nsome message\r\n",
+            DataType::error(DATA) => b"!12\r\nsome message\r\n"
         }
     }
 
