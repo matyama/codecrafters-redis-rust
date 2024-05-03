@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::*};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,11 +151,10 @@ pub struct Connection {
     peer: SocketAddr,
     reader: DataReader<OwnedReadHalf>,
     writer: DataWriter<OwnedWriteHalf>,
-    state: ReplState,
 }
 
 impl Connection {
-    pub fn new(conn: TcpStream, state: Option<ReplState>) -> Result<Self> {
+    pub fn new(conn: TcpStream) -> Result<Self> {
         let peer = conn.peer_addr().context("replication connection")?;
 
         let (reader, writer) = conn.into_split();
@@ -166,23 +165,12 @@ impl Connection {
             peer,
             reader,
             writer,
-            state: state.unwrap_or_default(),
         })
     }
 
     #[inline]
     pub fn peer(&self) -> SocketAddr {
         self.peer
-    }
-
-    #[inline]
-    pub fn state(&self) -> &ReplState {
-        &self.state
-    }
-
-    #[inline]
-    pub fn set_offset(&mut self, offset: isize) {
-        self.state.repl_offset = offset;
     }
 
     pub async fn forward(&mut self, cmd: &DataType) -> Result<usize> {
@@ -229,9 +217,6 @@ impl Connection {
                 .context("request timed out")?
                 .context("request failed")?
         };
-
-        // NOTE: contrary to forward, here the response witnesses that the request went through
-        self.state.repl_offset += bytes_req as isize;
 
         match resp {
             Some((resp, bytes_resp)) => Ok((resp, bytes_req, bytes_resp)),
@@ -317,14 +302,34 @@ impl std::fmt::Display for ReplConnection {
     }
 }
 
-// XXX: spawn an actor for each Replica from the set and implement forward/wait via a broadcast
 #[derive(Debug)]
 pub struct Replica {
     conn: Mutex<Connection>,
+    #[allow(dead_code)]
+    repl_id: ReplId,
+    repl_offset: AtomicIsize,
     // TODO: AtomicPtr<ReplicaState { alive: bool, last_ack: Instant }>
     // TODO: implement replica healthcheck (i.e, send periodic one-way PINGs)
     #[allow(dead_code)]
     alive: AtomicBool,
+}
+
+impl Replica {
+    #[inline]
+    pub fn new(
+        conn: Connection,
+        ReplState {
+            repl_id,
+            repl_offset,
+        }: ReplState,
+    ) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            repl_id: repl_id.unwrap_or_default(),
+            repl_offset: AtomicIsize::new(repl_offset),
+            alive: AtomicBool::new(true),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -333,13 +338,10 @@ pub struct ReplicaSet(RwLock<HashMap<SocketAddr, Arc<Replica>>>);
 
 impl ReplicaSet {
     pub(crate) async fn register(&self, conn: TcpStream, state: ReplState) -> Result<()> {
-        let conn = Connection::new(conn, Some(state))?;
+        let conn = Connection::new(conn)?;
         let addr = conn.peer();
 
-        let replica = Arc::new(Replica {
-            conn: Mutex::new(conn),
-            alive: AtomicBool::new(true),
-        });
+        let replica = Arc::new(Replica::new(conn, state));
 
         {
             let mut replicas = self.0.write().await;
@@ -391,28 +393,15 @@ impl ReplicaSet {
         timeout: Duration,
         state: ReplState,
     ) -> Result<(usize, usize)> {
-        let state = Arc::new(state);
-
         let replicas = self.0.read().await;
         let num_registered = replicas.len();
 
         // fast path: if all replicas are sufficiently up to date, then skip sending GETACK
-        let mut tasks = JoinSet::new();
-
-        for replica in replicas.values().cloned() {
-            let state = Arc::clone(&state);
-            tasks.spawn(async move {
-                let repl = replica.conn.lock().await;
-                state.repl_offset <= repl.state().repl_offset
-            });
-        }
-
-        let mut num_acks = 0;
-        while let Some(in_sync) = tasks.join_next().await {
-            if in_sync.unwrap_or(false) {
-                num_acks += 1;
-            }
-        }
+        let num_acks: usize = replicas
+            .values()
+            .map(|replica| state.repl_offset <= replica.repl_offset.load(Acquire))
+            .map(usize::from)
+            .sum();
 
         if num_acks >= num_replicas.min(num_registered) {
             return Ok((num_registered, 0));
@@ -421,6 +410,7 @@ impl ReplicaSet {
         // slow path: send GETACK to all replicas with given timeout
         let (getack, req_offset) = DataType::replconf_getack();
 
+        let state = Arc::new(state);
         let num_acks = Arc::new(AtomicUsize::new(0));
 
         let mut tasks = JoinSet::new();
@@ -436,39 +426,23 @@ impl ReplicaSet {
                 // NOTE: use default timeout for per request as there's an overall wait timeout
                 let resp = conn.request(getack, Duration::ZERO).await;
 
+                // NOTE: ok response witnesses that the request went through, so update offset
                 match resp.with_context(|| format!("replica {addr}")) {
                     Ok((
                         Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))),
                         req_offset,
                         ..,
-                    )) if state.repl_offset <= repl_offset => {
-                        let old_repl_offset = conn.state().repl_offset;
-
-                        conn.set_offset(repl_offset + req_offset as isize);
-
-                        println!(
-                            "replica {addr} offset: {old_repl_offset} -> {}",
-                            conn.state().repl_offset
-                        );
-
-                        num_acks.fetch_add(1, AcqRel);
-
-                        Ok(())
-                    }
-
-                    Ok((
-                        Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))),
-                        req_offset,
-                        ..,
                     )) => {
-                        let old_repl_offset = conn.state().repl_offset;
+                        let new_repl_offset = repl_offset + req_offset as isize;
+                        let old_repl_offset = replica.repl_offset.swap(new_repl_offset, AcqRel);
+                        println!("replica {addr} offset: {old_repl_offset} -> {new_repl_offset}");
 
-                        conn.set_offset(repl_offset + req_offset as isize);
+                        // hold the lock up until the offset is updated
+                        drop(conn);
 
-                        println!(
-                            "replica {addr} offset: {old_repl_offset} -> {}",
-                            conn.state().repl_offset
-                        );
+                        if state.repl_offset <= repl_offset {
+                            num_acks.fetch_add(1, AcqRel);
+                        }
 
                         Ok(())
                     }
@@ -516,7 +490,7 @@ impl Replication {
         let conn = TcpStream::connect(leader)
             .await
             .with_context(|| format!("replication connection: {leader} - {replica}"))
-            .and_then(|conn| Connection::new(conn, None))?;
+            .and_then(Connection::new)?;
 
         Ok(Self {
             conn,
