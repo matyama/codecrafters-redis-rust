@@ -228,7 +228,7 @@ impl Instance {
                 let old = unsafe { &*old };
                 // SAFETY: new never changes in these iterations and points to the allocation above
                 let new = unsafe { &mut *new };
-                new.repl_id = old.repl_id.clone();
+                new.repl_id.clone_from(&old.repl_id);
                 new.repl_offset = old.repl_offset.max(0) + offset as isize;
             }
 
