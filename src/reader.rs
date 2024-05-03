@@ -471,7 +471,8 @@ where
                 .await
                 .map(|(s, n)| (s.map_or(DataType::NullBulkError, DataType::error), n + 1))
                 .map(Some),
-            Ok(b'*') => self.read_array().await.map(|(s, n)| (s, n + 1)).map(Some),
+            Ok(b'*') => self.read_array().await.map(|(a, n)| (a, n + 1)).map(Some),
+            Ok(b'%') => self.read_map().await.map(|(m, n)| (m, n + 1)).map(Some),
             Ok(b) => bail!("protocol violation: unsupported control byte '{b}'"),
             Err(e) if e.terminates_read() => Ok(None),
             Err(e) => Err(e).context("failed to read next element"),
@@ -591,7 +592,7 @@ where
 
     /// Read an array of the form: `*<number-of-elements>\r\n<element-1>...<element-n>`
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    fn read_array(&mut self) -> Pin<Box<ReadArrayFut<'_>>> {
+    fn read_array(&mut self) -> Pin<Box<ReadRecFut<'_>>> {
         Box::pin(async move {
             let (len, mut n_total) = self.read_int().await?;
 
@@ -614,9 +615,44 @@ where
             Ok((DataType::Array(items.into()), n_total))
         })
     }
+
+    /// Read a map of the form: `%<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>`
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    fn read_map(&mut self) -> Pin<Box<ReadRecFut<'_>>> {
+        Box::pin(async move {
+            let (len, mut n_total) = self.read_int().await?;
+
+            let mut items = Vec::with_capacity(len);
+
+            for i in 0..len {
+                let key = self
+                    .read_data()
+                    .await
+                    .with_context(|| format!("failed to read map key {i}"))?;
+
+                let Some((key, n_key)) = key else {
+                    bail!("protocol violation: missing map key {i}");
+                };
+
+                let val = self
+                    .read_data()
+                    .await
+                    .with_context(|| format!("failed to read map val {i}"))?;
+
+                let Some((val, n_val)) = val else {
+                    bail!("protocol violation: missing map val {i}");
+                };
+
+                items.push((key, val));
+                n_total += n_key + n_val;
+            }
+
+            Ok((DataType::Map(items.into()), n_total))
+        })
+    }
 }
 
-type ReadArrayFut<'a> = dyn Future<Output = Result<(DataType, usize)>> + Send + 'a;
+type ReadRecFut<'a> = dyn Future<Output = Result<(DataType, usize)>> + Send + 'a;
 
 #[repr(transparent)]
 pub struct RDBFileReader(DataReader<File>);
