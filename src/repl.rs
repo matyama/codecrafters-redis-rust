@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
 use std::sync::Arc;
@@ -147,7 +146,6 @@ impl std::fmt::Display for ReplState {
     }
 }
 
-// NOTE: it's actually necessary not to shutdown the write part to keep the connection alive
 // TODO: support reconnect
 pub struct Connection {
     peer: SocketAddr,
@@ -393,32 +391,41 @@ impl ReplicaSet {
         timeout: Duration,
         state: ReplState,
     ) -> Result<(usize, usize)> {
-        let replicas = self.0.read().await;
+        let state = Arc::new(state);
 
-        // Collect out-of-sync replicas, for the rest skip the GETACK request
-        let mut lagging = Vec::with_capacity(replicas.len());
-        for (&addr, replica) in replicas.iter() {
-            // XXX: this is very sad, here we'd be fine by just reading it via a simple ref
-            let repl = replica.conn.lock().await;
-            if state.repl_offset > repl.state().repl_offset {
-                lagging.push((addr, Arc::clone(replica)));
+        let replicas = self.0.read().await;
+        let num_registered = replicas.len();
+
+        // fast path: if all replicas are sufficiently up to date, then skip sending GETACK
+        let mut tasks = JoinSet::new();
+
+        for replica in replicas.values().cloned() {
+            let state = Arc::clone(&state);
+            tasks.spawn(async move {
+                let repl = replica.conn.lock().await;
+                state.repl_offset <= repl.state().repl_offset
+            });
+        }
+
+        let mut num_acks = 0;
+        while let Some(in_sync) = tasks.join_next().await {
+            if in_sync.unwrap_or(false) {
+                num_acks += 1;
             }
         }
 
-        if lagging.is_empty() {
-            return Ok((replicas.len(), 0));
+        if num_acks >= num_replicas.min(num_registered) {
+            return Ok((num_registered, 0));
         }
 
-        let init_num_acks = replicas.len() - lagging.len();
-
-        let state = Arc::new(state);
-        let num_acks = Arc::new(AtomicUsize::new(init_num_acks));
-
+        // slow path: send GETACK to all replicas with given timeout
         let (getack, req_offset) = DataType::replconf_getack();
+
+        let num_acks = Arc::new(AtomicUsize::new(0));
 
         let mut tasks = JoinSet::new();
 
-        for (addr, replica) in lagging {
+        for (addr, replica) in replicas.iter().map(|(&a, r)| (a, Arc::clone(r))) {
             let state = Arc::clone(&state);
             let num_acks = Arc::clone(&num_acks);
 
@@ -426,25 +433,44 @@ impl ReplicaSet {
                 // send REPLCONF GETACK * to the replica
                 let mut conn = replica.conn.lock().await;
 
-                let resp = conn.request(getack, timeout).await;
+                // NOTE: use default timeout for per request as there's an overall wait timeout
+                let resp = conn.request(getack, Duration::ZERO).await;
 
                 match resp.with_context(|| format!("replica {addr}")) {
-                    Ok((Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))), ..))
-                        if state.repl_offset <= repl_offset =>
-                    {
-                        conn.set_offset(repl_offset);
+                    Ok((
+                        Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))),
+                        req_offset,
+                        ..,
+                    )) if state.repl_offset <= repl_offset => {
+                        let old_repl_offset = conn.state().repl_offset;
 
-                        if num_acks.fetch_add(1, AcqRel) > num_replicas {
-                            Ok(ControlFlow::Break(()))
-                        } else {
-                            Ok(ControlFlow::Continue(()))
-                        }
+                        conn.set_offset(repl_offset + req_offset as isize);
+
+                        println!(
+                            "replica {addr} offset: {old_repl_offset} -> {}",
+                            conn.state().repl_offset
+                        );
+
+                        num_acks.fetch_add(1, AcqRel);
+
+                        Ok(())
                     }
 
-                    Ok((Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))), ..)) => {
-                        conn.set_offset(repl_offset);
+                    Ok((
+                        Resp::Cmd(Command::Replconf(replconf::Conf::Ack(repl_offset))),
+                        req_offset,
+                        ..,
+                    )) => {
+                        let old_repl_offset = conn.state().repl_offset;
 
-                        Ok(ControlFlow::Continue(()))
+                        conn.set_offset(repl_offset + req_offset as isize);
+
+                        println!(
+                            "replica {addr} offset: {old_repl_offset} -> {}",
+                            conn.state().repl_offset
+                        );
+
+                        Ok(())
                     }
 
                     Ok((other, ..)) => {
@@ -465,14 +491,9 @@ impl ReplicaSet {
             tokio::select! {
                 () = &mut sleep, if !timeout.is_zero() => break,
                 ack = tasks.join_next() => match ack {
-                    Some(Ok(Ok(ControlFlow::Continue(_)))) => tokio::task::yield_now().await,
-                    Some(Ok(Ok(ControlFlow::Break(_)))) => break,
+                    Some(Ok(Ok(_))) => tokio::task::yield_now().await,
                     Some(Ok(Err(e))) => eprintln!("replica failed to ack during wait: {e:?}"),
                     Some(Err(e)) => eprintln!("task to get ack from replica panicked: {e:?}"),
-                    // NOTE: Redis waits for the whole timeout duration
-                    None if !timeout.is_zero() && num_replicas > 0 => {
-                        tokio::task::yield_now().await
-                    },
                     None => break,
                 },
             }
@@ -480,13 +501,7 @@ impl ReplicaSet {
 
         let num_acks = num_acks.load(Acquire);
 
-        let req_offset = if num_acks > init_num_acks {
-            *req_offset
-        } else {
-            0
-        };
-
-        Ok((num_acks, req_offset))
+        Ok((num_acks, *req_offset))
     }
 }
 
