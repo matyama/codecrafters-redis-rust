@@ -390,6 +390,12 @@ where
                 Command::XAdd(key, entry, ops)
             }
 
+            b"XLEN" => match args.first().cloned() {
+                Some(DataType::BulkString(key) | DataType::SimpleString(key)) => Command::XLen(key),
+                Some(arg) => bail!("XLEN only accepts bulk strings as key, got {arg:?}"),
+                None => bail!("XLEN requires an argument, got none"),
+            },
+
             b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
 
             b"PSYNC" => match (args.first().cloned(), args.get(1).cloned()) {

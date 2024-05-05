@@ -274,6 +274,22 @@ impl Store {
             }
         }
     }
+
+    pub async fn xlen(&self, key: rdb::String) -> usize {
+        let store = self.0.read().await;
+        let guard = store.db().await;
+
+        let Some(ValueCell {
+            data: rdb::Value::Stream(s),
+            ..
+        }) = guard.db.get(&key)
+        else {
+            return 0;
+        };
+
+        let s = s.lock().await;
+        s.length
+    }
 }
 
 impl From<rdb::RDB> for Store {

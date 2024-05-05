@@ -50,6 +50,7 @@ pub(crate) const TYPE: Bytes = Bytes::from_static(b"TYPE");
 pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
 pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
 pub(crate) const XADD: Bytes = Bytes::from_static(b"XADD");
+pub(crate) const XLEN: Bytes = Bytes::from_static(b"XLEN");
 pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
 pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
 pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");

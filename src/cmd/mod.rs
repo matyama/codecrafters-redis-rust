@@ -8,10 +8,10 @@ use bytes::{Bytes, BytesMut};
 
 use crate::data::DataType;
 use crate::repl::ReplState;
-use crate::{rdb, stream, XADD};
+use crate::{rdb, stream};
 use crate::{
     Instance, Protocol, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, NONE, OK, PING, PONG,
-    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT,
+    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN,
 };
 
 pub mod info;
@@ -35,6 +35,7 @@ pub enum Command {
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
     XAdd(rdb::String, stream::Entry, xadd::Options),
+    XLen(rdb::String),
     Replconf(replconf::Conf),
     PSync(ReplState),
     FullResync(ReplState),
@@ -126,6 +127,8 @@ impl Command {
                     Err(e) => DataType::err(format!("ERR {e}")),
                 }
             }
+
+            Self::XLen(key) => DataType::Integer(instance.store.xlen(key).await as i64),
 
             Self::Replconf(replconf::Conf::GetAck(_)) => {
                 let ReplState { repl_offset, .. } = instance.state();
@@ -258,6 +261,8 @@ impl From<Command> for DataType {
                 }
                 items
             }
+
+            Command::XLen(key) => vec![Self::string(XLEN), Self::string(key)],
 
             Command::Replconf(replconf::Conf::ListeningPort(port)) => {
                 vec![
