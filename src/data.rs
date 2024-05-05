@@ -25,6 +25,19 @@ pub enum DataType {
 }
 
 impl DataType {
+    #[inline]
+    pub(crate) fn is_ok(&self) -> bool {
+        !matches!(
+            self,
+            Self::Null
+                | Self::NullBulkString
+                | Self::NullBulkError
+                | Self::SimpleError(_)
+                | Self::BulkError(_)
+        )
+    }
+
+    #[inline]
     pub(crate) fn err(e: impl Into<rdb::String>) -> Self {
         Self::SimpleError(e.into())
     }
@@ -150,6 +163,8 @@ pub trait DataExt {
     fn to_uppercase(&self) -> Vec<u8>;
 
     fn matches(&self, target: impl AsRef<[u8]>) -> bool;
+
+    fn contains(&self, target: u8) -> bool;
 }
 
 impl DataExt for Bytes {
@@ -161,6 +176,11 @@ impl DataExt for Bytes {
     #[inline]
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         matches(self, target)
+    }
+
+    #[inline]
+    fn contains(&self, target: u8) -> bool {
+        self.as_ref().contains(&target)
     }
 }
 
@@ -185,6 +205,14 @@ impl DataExt for rdb::String {
             _ => false,
         }
     }
+
+    #[inline]
+    fn contains(&self, target: u8) -> bool {
+        match self {
+            Self::Str(s) => s.contains(target),
+            _ => false,
+        }
+    }
 }
 
 impl DataExt for DataType {
@@ -205,6 +233,14 @@ impl DataExt for DataType {
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         match self {
             Self::BulkString(s) | Self::SimpleString(s) => s.matches(target),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn contains(&self, target: u8) -> bool {
+        match self {
+            Self::BulkString(s) | Self::SimpleString(s) => s.contains(target),
             _ => false,
         }
     }
@@ -233,5 +269,14 @@ mod tests {
 
         // different commands, different length, same casing
         assert!(!CONFIG.matches(PING), "{CONFIG:?} ~ {PING:?}");
+    }
+
+    #[test]
+    fn string_contains() {
+        let id = Bytes::from_static(b"123-4");
+        assert!(id.contains(b'-'), "'-' in {id:?}");
+
+        let key = Bytes::from_static(b"some_key");
+        assert!(!key.contains(b'-'), "'-' not in {key:?}");
     }
 }

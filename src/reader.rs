@@ -17,6 +17,7 @@ use tokio::{
 use crate::data::{DataExt as _, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
+use crate::stream;
 use crate::{cmd, Command, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
 
 pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
@@ -371,6 +372,23 @@ where
                 (None, None) => bail!("SET requires two arguments, got none"),
                 args => bail!("protocol violation: SET with invalid argument types {args:?}"),
             },
+
+            // TODO: support options
+            b"XADD" => {
+                let key = match args.first().cloned() {
+                    Some(DataType::BulkString(key) | DataType::SimpleString(key)) => key,
+                    Some(arg) => bail!("XADD only accepts bulk strings as key, got {arg:?}"),
+                    None => bail!("XADD requires an argument, got none"),
+                };
+
+                let ops =
+                    cmd::xadd::Options::try_from(&args[1..]).context("XADD: parse options")?;
+
+                let entry =
+                    stream::Entry::try_from(&args[1 + ops.len()..]).context("XADD: parse entry")?;
+
+                Command::XAdd(key, entry, ops)
+            }
 
             b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
 

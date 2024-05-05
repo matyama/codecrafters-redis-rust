@@ -7,8 +7,8 @@ use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 
 use crate::data::DataType;
-use crate::rdb;
 use crate::repl::ReplState;
+use crate::{rdb, stream, XADD};
 use crate::{
     Instance, Protocol, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, NONE, OK, PING, PONG,
     PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT,
@@ -17,6 +17,7 @@ use crate::{
 pub mod info;
 pub mod replconf;
 pub mod set;
+pub mod xadd;
 
 const NULL: DataType = match PROTOCOL {
     Protocol::RESP2 => DataType::NullBulkString,
@@ -33,6 +34,7 @@ pub enum Command {
     Keys(rdb::String),
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
+    XAdd(rdb::String, stream::Entry, xadd::Options),
     Replconf(replconf::Conf),
     PSync(ReplState),
     FullResync(ReplState),
@@ -115,6 +117,16 @@ impl Command {
                 }
             }
 
+            Self::XAdd(.., ops) if ops.no_mkstream => NULL,
+            Self::XAdd(key, entry, ops) => {
+                let id = entry.id;
+                match instance.store.xadd(key, entry, ops).await {
+                    Ok(true) => DataType::string(id),
+                    Ok(false) => NULL,
+                    Err(e) => DataType::err(format!("ERR {e}")),
+                }
+            }
+
             Self::Replconf(replconf::Conf::GetAck(_)) => {
                 let ReplState { repl_offset, .. } = instance.state();
                 let repl_offset = repl_offset.to_string().into();
@@ -184,7 +196,7 @@ impl Command {
     /// replication.
     #[inline]
     pub(crate) fn is_write(&self) -> bool {
-        matches!(self, Self::Set(..))
+        matches!(self, Self::Set(..) | Self::XAdd(_, _, _))
     }
 
     /// Returns `true` iff this command represents a replicated operation that should be
@@ -231,6 +243,19 @@ impl From<Command> for DataType {
                 items.push(DataType::string(key));
                 items.push(DataType::string(val));
                 items.extend(ops.into_bytes().map(DataType::string));
+                items
+            }
+
+            Command::XAdd(key, stream::Entry { id, fields }, ops) => {
+                let mut items = Vec::with_capacity(2 + ops.len() + 1 + 2 * fields.len());
+                items.push(DataType::string(XADD));
+                items.push(DataType::string(key));
+                items.extend(ops.into_bytes().map(DataType::string));
+                items.push(DataType::string(id));
+                for (key, val) in fields.iter() {
+                    items.push(DataType::string(key.clone()));
+                    items.push(DataType::string(val.clone()));
+                }
                 items
             }
 

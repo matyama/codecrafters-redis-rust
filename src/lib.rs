@@ -28,6 +28,7 @@ pub(crate) mod rdb;
 pub(crate) mod reader;
 pub(crate) mod repl;
 pub(crate) mod store;
+pub(crate) mod stream;
 pub(crate) mod writer;
 
 // pub(crate) const EOF: u8 = b'\xFF'; // 0xFF (e.g., RDB EOF op code)
@@ -48,6 +49,7 @@ pub(crate) const KEYS: Bytes = Bytes::from_static(b"KEYS");
 pub(crate) const TYPE: Bytes = Bytes::from_static(b"TYPE");
 pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
 pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
+pub(crate) const XADD: Bytes = Bytes::from_static(b"XADD");
 pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
 pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
 pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
@@ -292,9 +294,11 @@ impl Instance {
                     writer.flush().await?;
 
                     if let Role::Leader(replicas) = &self.role {
-                        let (old_state, new_offset) = self.shift_offset(bytes_read);
-                        println!("master offset: {} -> {new_offset}", old_state.repl_offset);
-                        replicas.forward(repl_cmd).await;
+                        if resp.is_ok() {
+                            let (old_state, new_offset) = self.shift_offset(bytes_read);
+                            println!("master offset: {} -> {new_offset}", old_state.repl_offset);
+                            replicas.forward(repl_cmd).await;
+                        }
                     }
 
                     println!("write command handled: {resp:?}");

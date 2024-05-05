@@ -2,11 +2,11 @@ use std::collections::hash_map::{Entry, OccupiedEntry, VacantEntry};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::cmd::set;
-use crate::rdb;
+use crate::cmd::{set, xadd};
+use crate::{rdb, stream};
 
 impl From<ValueCell> for rdb::Value {
     #[inline]
@@ -219,6 +219,60 @@ impl Store {
         };
 
         value
+    }
+
+    pub async fn xadd(
+        &self,
+        key: rdb::String,
+        entry: stream::Entry,
+        ops: xadd::Options,
+    ) -> Result<bool> {
+        if ops.no_mkstream {
+            return Ok(false);
+        }
+
+        let store = self.0.read().await;
+        let mut guard = store.db().await;
+
+        match guard.db.entry(key) {
+            Entry::Occupied(mut e) => {
+                let ValueCell { data, .. } = e.get_mut();
+
+                let rdb::Value::Stream(s) = data else {
+                    bail!("value is not a stream");
+                };
+
+                let mut s = s.lock().await;
+
+                ensure!(
+                    entry.id > s.last_entry,
+                    "The ID specified in XADD is equal or smaller than the target stream top item",
+                );
+
+                s.last_entry = entry.id;
+                s.entries.push(entry);
+                s.length += 1;
+                // TODO: update cgroups?
+
+                Ok(true)
+            }
+
+            Entry::Vacant(e) => {
+                let last_entry = entry.id;
+
+                let entries = vec![entry];
+                let cgroups = vec![];
+
+                let stream = stream::Stream::new(entries, 1, last_entry, cgroups);
+
+                e.insert(ValueCell {
+                    data: rdb::Value::Stream(stream),
+                    expiry: None,
+                });
+
+                Ok(true)
+            }
+        }
     }
 }
 

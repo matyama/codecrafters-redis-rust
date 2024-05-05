@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncReadExt;
 
 use crate::store::Database;
+use crate::stream::Stream;
 
 pub(crate) mod opcode {
     pub(crate) const EOF: u8 = 0xFF;
@@ -149,6 +150,17 @@ where
     Ok((string, bytes_read))
 }
 
+// TODO: implement
+pub async fn read_stream<R>(_reader: &mut R, _buf: &mut BytesMut) -> io::Result<(Stream, usize)>
+where
+    R: AsyncReadExt + Unpin,
+{
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "RDB: reading streams is not supported",
+    ))
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum ValueType {
@@ -163,7 +175,19 @@ pub enum ValueType {
     ZSetZipList = 12,
     HashZipList = 13,
     ListQuickList = 14,
-    Stream = 15,
+    StreamListPacks = 15,
+    StreamListPacks2 = 19,
+    StreamListPacks3 = 21,
+}
+
+impl ValueType {
+    #[inline]
+    pub fn is_stream(val: impl std::ops::Deref<Target = Value>) -> bool {
+        matches!(
+            Self::from(&*val),
+            Self::StreamListPacks | Self::StreamListPacks2 | Self::StreamListPacks3
+        )
+    }
 }
 
 impl TryFrom<u8> for ValueType {
@@ -183,7 +207,9 @@ impl TryFrom<u8> for ValueType {
             12 => Ok(Self::ZSetZipList),
             13 => Ok(Self::HashZipList),
             14 => Ok(Self::ListQuickList),
-            15 => Ok(Self::Stream),
+            15 => Ok(Self::StreamListPacks),
+            19 => Ok(Self::StreamListPacks2),
+            21 => Ok(Self::StreamListPacks3),
             ty => Err(invalid_data(format!("RDB: invalid value type {ty}"))),
         }
     }
@@ -205,7 +231,9 @@ impl From<ValueType> for Bytes {
             ValueType::ZSetZipList => ZSET,
             ValueType::HashZipList => HASH,
             ValueType::ListQuickList => LIST,
-            ValueType::Stream => STREAM,
+            ValueType::StreamListPacks
+            | ValueType::StreamListPacks2
+            | ValueType::StreamListPacks3 => STREAM,
         }
     }
 }
@@ -217,10 +245,11 @@ impl From<ValueType> for String {
     }
 }
 
+// TODO: other "valtype"s
 #[derive(Clone, Debug)]
 pub enum Value {
     String(String),
-    // TODO: other "valtype"s
+    Stream(Stream),
 }
 
 impl Value {
@@ -237,6 +266,11 @@ impl Value {
             ValueType::String => read_string(reader, buf)
                 .await
                 .map(|(s, n)| (Self::String(s), n)),
+            ValueType::StreamListPacks
+            | ValueType::StreamListPacks2
+            | ValueType::StreamListPacks3 => read_stream(reader, buf)
+                .await
+                .map(|(s, n)| (Self::Stream(s), n)),
             other => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!("RDB: reading {other:?} is not supported"),
@@ -249,6 +283,8 @@ impl From<Value> for String {
     fn from(value: Value) -> Self {
         match value {
             Value::String(s) => s,
+            // TODO: implement
+            v => unimplemented!("{v:?} -> rdb::String"),
         }
     }
 }
@@ -258,6 +294,7 @@ impl From<&Value> for ValueType {
     fn from(value: &Value) -> Self {
         match value {
             Value::String(_) => ValueType::String,
+            Value::Stream(_) => ValueType::StreamListPacks3,
             // TODO: other value types
         }
     }
@@ -380,12 +417,17 @@ where
             let time = UNIX_EPOCH + Duration::from_secs(secs as u64);
             Ok((time, 4))
         }
-        ExpiryUnit::Millis => {
-            let millis = reader.read_u64_le().await?;
-            let time = UNIX_EPOCH + Duration::from_millis(millis);
-            Ok((time, 8))
-        }
+        ExpiryUnit::Millis => read_time_ms(reader).await,
     }
+}
+
+async fn read_time_ms<R>(reader: &mut R) -> io::Result<(SystemTime, usize)>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let millis = reader.read_u64_le().await?;
+    let time = UNIX_EPOCH + Duration::from_millis(millis);
+    Ok((time, 8))
 }
 
 #[derive(Debug, Default)]
