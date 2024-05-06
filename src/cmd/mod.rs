@@ -118,6 +118,9 @@ impl Command {
                 }
             }
 
+            Self::XAdd(_, entry, _) if entry.id.is_zero() => {
+                DataType::err("ERR The ID specified in XADD must be greater than 0-0")
+            }
             Self::XAdd(.., ops) if ops.no_mkstream => NULL,
             Self::XAdd(key, entry, ops) => {
                 let id = entry.id;

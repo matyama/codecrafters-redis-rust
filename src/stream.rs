@@ -15,18 +15,12 @@ pub struct StreamId {
 }
 
 impl StreamId {
-    const MIN: StreamId = StreamId { ms: 0, seq: 1 };
+    pub const ZERO: StreamId = StreamId { ms: 0, seq: 0 };
+    pub const MIN: StreamId = StreamId { ms: 0, seq: 1 };
 
     #[inline]
-    pub fn new<T, S>(ms: T, seq: S) -> Option<Self>
-    where
-        T: Into<u64>,
-        S: Into<u64>,
-    {
-        match seq.into() {
-            0 => None,
-            seq => Some(Self { ms: ms.into(), seq }),
-        }
+    pub fn is_zero(&self) -> bool {
+        *self == Self::ZERO
     }
 }
 
@@ -62,7 +56,7 @@ impl TryFrom<rdb::String> for StreamId {
         let ms: u64 = std::str::from_utf8(&s.slice(..sep))?.parse()?;
         let seq: u64 = std::str::from_utf8(&s.slice(sep + 1..))?.parse()?;
 
-        Self::new(ms, seq).context("zero sequence number")
+        Ok(Self { ms, seq })
     }
 }
 
