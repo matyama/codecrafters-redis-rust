@@ -6,6 +6,7 @@ use std::{collections::HashMap, fmt::Write};
 use anyhow::{bail, Context as _};
 use tokio::sync::Mutex;
 
+use crate::data::DataExt;
 use crate::{rdb, DataType};
 
 fn timestamp_ms() -> u64 {
@@ -14,7 +15,7 @@ fn timestamp_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Id {
     pub(crate) ms: Option<u64>,
     pub(crate) seq: Option<u64>,
@@ -95,10 +96,11 @@ impl TryFrom<rdb::String> for Id {
             bail!("cannot parse stream id from {s:?}");
         };
 
-        let sep = s
-            .iter()
-            .position(|&b| b == b'-')
-            .context("stream id must contain '-'")?;
+        let sep = match s.iter().position(|&b| b == b'-') {
+            Some(sep) => sep,
+            None if s.matches("*") => return Ok(Self::default()),
+            None => bail!("ID must either be '*' or contain '-'"),
+        };
 
         let ms = match std::str::from_utf8(&s.slice(..sep))? {
             "*" => None,
