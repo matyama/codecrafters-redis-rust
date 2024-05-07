@@ -224,11 +224,11 @@ impl Store {
     pub async fn xadd(
         &self,
         key: rdb::String,
-        entry: stream::Entry,
+        entry: stream::EntryArg,
         ops: xadd::Options,
-    ) -> Result<bool> {
+    ) -> Result<Option<stream::StreamId>> {
         if ops.no_mkstream {
-            return Ok(false);
+            return Ok(None);
         }
 
         let store = self.0.read().await;
@@ -244,6 +244,8 @@ impl Store {
 
                 let mut s = s.lock().await;
 
+                let entry = entry.next(Some(s.last_entry));
+
                 ensure!(
                     entry.id > s.last_entry,
                     "The ID specified in XADD is equal or smaller than the target stream top item",
@@ -254,10 +256,13 @@ impl Store {
                 s.length += 1;
                 // TODO: update cgroups?
 
-                Ok(true)
+                Ok(Some(s.last_entry))
             }
 
             Entry::Vacant(e) => {
+                let entry = entry.next(None);
+
+                let id = entry.id;
                 let last_entry = entry.id;
 
                 let entries = vec![entry];
@@ -270,7 +275,7 @@ impl Store {
                     expiry: None,
                 });
 
-                Ok(true)
+                Ok(Some(id))
             }
         }
     }

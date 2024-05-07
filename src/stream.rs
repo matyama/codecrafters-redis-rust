@@ -1,12 +1,118 @@
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, fmt::Write};
 
 use anyhow::{bail, Context as _};
 use tokio::sync::Mutex;
 
 use crate::{rdb, DataType};
+
+fn timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Id {
+    pub(crate) ms: Option<u64>,
+    pub(crate) seq: Option<u64>,
+}
+
+impl Id {
+    pub const ZERO: Id = Id {
+        ms: Some(0),
+        seq: Some(0),
+    };
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        *self == Self::ZERO
+    }
+
+    pub(crate) fn next(self, last: Option<StreamId>) -> StreamId {
+        let last = last.unwrap_or(StreamId::ZERO);
+        match self.ms {
+            Some(ms) => {
+                let seq = match self.seq {
+                    Some(seq) => seq,
+                    None if ms == last.ms => last.seq.wrapping_add(1),
+                    None => 0,
+                };
+                StreamId { ms, seq }
+            }
+
+            None => {
+                let ms = timestamp_ms();
+                if ms > last.ms {
+                    StreamId { ms, seq: 0 }
+                } else {
+                    last.wrapping_inc()
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Id {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.ms, self.seq) {
+            (Some(ms), Some(seq)) => write!(f, "{ms}-{seq}"),
+            (Some(ms), None) => write!(f, "{ms}-*"),
+            (None, Some(_)) => Err(std::fmt::Error),
+            (None, None) => f.write_char('*'),
+        }
+    }
+}
+
+impl From<StreamId> for Id {
+    #[inline]
+    fn from(StreamId { ms, seq }: StreamId) -> Self {
+        Self {
+            ms: Some(ms),
+            seq: Some(seq),
+        }
+    }
+}
+
+// XXX: it's a bit sad that this allocates
+impl From<Id> for rdb::String {
+    #[inline]
+    fn from(id: Id) -> Self {
+        Self::from(id.to_string())
+    }
+}
+
+impl TryFrom<rdb::String> for Id {
+    type Error = anyhow::Error;
+
+    fn try_from(s: rdb::String) -> Result<Self, Self::Error> {
+        use rdb::String::*;
+
+        let Str(s) = s else {
+            bail!("cannot parse stream id from {s:?}");
+        };
+
+        let sep = s
+            .iter()
+            .position(|&b| b == b'-')
+            .context("stream id must contain '-'")?;
+
+        let ms = match std::str::from_utf8(&s.slice(..sep))? {
+            "*" => None,
+            ms => Some(ms.parse()?),
+        };
+
+        let seq = match std::str::from_utf8(&s.slice(sep + 1..))? {
+            "*" => None,
+            seq => Some(seq.parse()?),
+        };
+
+        Ok(Self { ms, seq })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId {
@@ -22,12 +128,17 @@ impl StreamId {
     pub fn is_zero(&self) -> bool {
         *self == Self::ZERO
     }
-}
 
-impl Default for StreamId {
-    #[inline]
-    fn default() -> Self {
-        Self::MIN
+    /// Increment this ID, wrapping around to 0-0 if any overflow would occur
+    fn wrapping_inc(self) -> Self {
+        if let Some(seq) = self.seq.checked_add(1) {
+            Self { ms: self.ms, seq }
+        } else {
+            Self {
+                ms: self.ms.wrapping_add(1),
+                seq: 0,
+            }
+        }
     }
 }
 
@@ -53,8 +164,8 @@ impl TryFrom<rdb::String> for StreamId {
             .position(|&b| b == b'-')
             .context("stream id must contain '-'")?;
 
-        let ms: u64 = std::str::from_utf8(&s.slice(..sep))?.parse()?;
-        let seq: u64 = std::str::from_utf8(&s.slice(sep + 1..))?.parse()?;
+        let ms = std::str::from_utf8(&s.slice(..sep))?.parse()?;
+        let seq = std::str::from_utf8(&s.slice(sep + 1..))?.parse()?;
 
         Ok(Self { ms, seq })
     }
@@ -70,12 +181,24 @@ impl From<StreamId> for rdb::String {
 
 // NOTE: fields would better be an `IndexMap` to preserve RDB read/write order
 #[derive(Clone, Debug)]
-pub struct Entry {
-    pub(crate) id: StreamId,
+pub struct Entry<Id = StreamId> {
+    pub(crate) id: Id,
     pub(crate) fields: Arc<HashMap<rdb::String, rdb::Value>>,
 }
 
-impl TryFrom<&[DataType]> for Entry {
+pub type EntryArg = Entry<Id>;
+
+impl Entry<Id> {
+    #[inline]
+    pub(crate) fn next(self, last: Option<StreamId>) -> Entry {
+        Entry {
+            id: self.id.next(last),
+            fields: self.fields,
+        }
+    }
+}
+
+impl TryFrom<&[DataType]> for Entry<Id> {
     type Error = anyhow::Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {

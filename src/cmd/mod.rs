@@ -34,7 +34,7 @@ pub enum Command {
     Keys(rdb::String),
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
-    XAdd(rdb::String, stream::Entry, xadd::Options),
+    XAdd(rdb::String, stream::EntryArg, xadd::Options),
     XLen(rdb::String),
     Replconf(replconf::Conf),
     PSync(ReplState),
@@ -122,14 +122,10 @@ impl Command {
                 DataType::err("ERR The ID specified in XADD must be greater than 0-0")
             }
             Self::XAdd(.., ops) if ops.no_mkstream => NULL,
-            Self::XAdd(key, entry, ops) => {
-                let id = entry.id;
-                match instance.store.xadd(key, entry, ops).await {
-                    Ok(true) => DataType::string(id),
-                    Ok(false) => NULL,
-                    Err(e) => DataType::err(format!("ERR {e}")),
-                }
-            }
+            Self::XAdd(key, entry, ops) => match instance.store.xadd(key, entry, ops).await {
+                Ok(id) => id.map_or(NULL, DataType::string),
+                Err(e) => DataType::err(format!("ERR {e}")),
+            },
 
             Self::XLen(key) => DataType::Integer(instance.store.xlen(key).await as i64),
 
