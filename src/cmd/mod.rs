@@ -11,13 +11,14 @@ use crate::repl::ReplState;
 use crate::{rdb, stream};
 use crate::{
     Instance, Protocol, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, NONE, OK, PING, PONG,
-    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN,
+    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN, XRANGE,
 };
 
 pub mod info;
 pub mod replconf;
 pub mod set;
 pub mod xadd;
+pub mod xrange;
 
 const NULL: DataType = match PROTOCOL {
     Protocol::RESP2 => DataType::NullBulkString,
@@ -35,6 +36,7 @@ pub enum Command {
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
     XAdd(rdb::String, stream::EntryArg, xadd::Options),
+    XRange(rdb::String, xrange::Range, xrange::Count),
     XLen(rdb::String),
     Replconf(replconf::Conf),
     PSync(ReplState),
@@ -122,12 +124,27 @@ impl Command {
                 DataType::err("ERR The ID specified in XADD must be greater than 0-0")
             }
             Self::XAdd(.., ops) if ops.no_mkstream => NULL,
-            Self::XAdd(key, entry, ops) => match instance.store.xadd(key, entry, ops).await {
-                Ok(id) => id.map_or(NULL, DataType::string),
-                Err(e) => DataType::err(format!("ERR {e}")),
-            },
+            Self::XAdd(key, entry, ops) => instance
+                .store
+                .xadd(key, entry, ops)
+                .await
+                .map_or_else(DataType::err, |id| id.map_or(NULL, DataType::string)),
 
-            Self::XLen(key) => DataType::Integer(instance.store.xlen(key).await as i64),
+            Self::XRange(key, range, xrange::Count(count)) => instance
+                .store
+                .xrange(key, range, count)
+                .await
+                .map_or_else(DataType::err, |entries| {
+                    entries.map_or(NULL, |es| {
+                        DataType::array(es.into_iter().map(DataType::from))
+                    })
+                }),
+
+            Self::XLen(key) => instance
+                .store
+                .xlen(key)
+                .await
+                .map_or_else(DataType::err, |len| DataType::Integer(len as i64)),
 
             Self::Replconf(replconf::Conf::GetAck(_)) => {
                 let ReplState { repl_offset, .. } = instance.state();
@@ -257,6 +274,19 @@ impl From<Command> for DataType {
                 for (key, val) in fields.iter() {
                     items.push(DataType::string(key.clone()));
                     items.push(DataType::string(val.clone()));
+                }
+                items
+            }
+
+            Command::XRange(key, range, count) => {
+                let (start, end) = range.into();
+                let mut items = Vec::with_capacity(5);
+                items.push(DataType::string(XRANGE));
+                items.push(DataType::string(key));
+                items.push(DataType::string(start));
+                items.push(DataType::string(end));
+                if let xrange::Count(Some(count)) = count {
+                    items.push(DataType::string(count.to_string()));
                 }
                 items
             }

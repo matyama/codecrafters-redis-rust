@@ -1,11 +1,11 @@
 use std::collections::hash_map::{Entry, OccupiedEntry, VacantEntry};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, Result};
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::cmd::{set, xadd};
+use crate::cmd::{set, xadd, xrange};
 use crate::{rdb, stream};
 
 impl From<ValueCell> for rdb::Value {
@@ -85,6 +85,22 @@ impl DatabaseBuilder {
             (Some(ix), Some(db)) => Ok(Database { ix, db }),
             (ix, _) => bail!("incomplete db={ix:?}"),
         }
+    }
+}
+
+// XXX: probably move to lib
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
+    WrongType,
+    #[error("ERR {0}")]
+    Err(#[from] anyhow::Error),
+}
+
+impl From<Error> for rdb::String {
+    #[inline]
+    fn from(error: Error) -> Self {
+        Self::from(error.to_string())
     }
 }
 
@@ -226,7 +242,7 @@ impl Store {
         key: rdb::String,
         entry: stream::EntryArg,
         ops: xadd::Options,
-    ) -> Result<Option<stream::StreamId>> {
+    ) -> Result<Option<stream::StreamId>, Error> {
         if ops.no_mkstream {
             return Ok(None);
         }
@@ -239,20 +255,20 @@ impl Store {
                 let ValueCell { data, .. } = e.get_mut();
 
                 let rdb::Value::Stream(s) = data else {
-                    bail!("value is not a stream");
+                    return Err(Error::WrongType);
                 };
 
                 let mut s = s.lock().await;
 
                 let entry = entry.next(Some(s.last_entry));
 
-                ensure!(
-                    entry.id > s.last_entry,
-                    "The ID specified in XADD is equal or smaller than the target stream top item",
-                );
+                if entry.id <= s.last_entry {
+                    let err = "The ID specified in XADD is equal or smaller than the target stream top item";
+                    return Err(Error::Err(anyhow!(err)));
+                }
 
                 s.last_entry = entry.id;
-                s.entries.push(entry);
+                s.entries.insert(entry.id, entry);
                 s.length += 1;
                 // TODO: update cgroups?
 
@@ -265,7 +281,9 @@ impl Store {
                 let id = entry.id;
                 let last_entry = entry.id;
 
-                let entries = vec![entry];
+                let mut entries = BTreeMap::new();
+                entries.insert(entry.id, entry);
+
                 let cgroups = vec![];
 
                 let stream = stream::Stream::new(entries, 1, last_entry, cgroups);
@@ -280,20 +298,57 @@ impl Store {
         }
     }
 
-    pub async fn xlen(&self, key: rdb::String) -> usize {
+    pub async fn xrange(
+        &self,
+        key: rdb::String,
+        range: xrange::Range,
+        count: Option<usize>,
+    ) -> Result<Option<Vec<stream::Entry>>, Error> {
         let store = self.0.read().await;
         let guard = store.db().await;
 
-        let Some(ValueCell {
-            data: rdb::Value::Stream(s),
-            ..
-        }) = guard.db.get(&key)
-        else {
-            return 0;
+        let Some(ValueCell { data, .. }) = guard.db.get(&key) else {
+            return Ok(Some(vec![]));
+        };
+
+        let rdb::Value::Stream(s) = data else {
+            return Err(Error::WrongType);
+        };
+
+        let count = match count {
+            Some(0) => return Ok(None),
+            Some(c) => c,
+            None => usize::MAX,
+        };
+
+        // NOTE: returns an error if start > end (i.e., trivially empty interval)
+        let Some(range): Option<xrange::IdRange> = range.into() else {
+            return Ok(None);
         };
 
         let s = s.lock().await;
-        s.length
+
+        let entries = s
+            .entries
+            .range(range)
+            .take(count)
+            .map(|(_, e)| e.clone())
+            .collect();
+
+        Ok(Some(entries))
+    }
+
+    pub async fn xlen(&self, key: rdb::String) -> Result<usize, Error> {
+        let store = self.0.read().await;
+        let guard = store.db().await;
+        match guard.db.get(&key) {
+            Some(ValueCell {
+                data: rdb::Value::Stream(s),
+                ..
+            }) => Ok(s.lock().await.length),
+            Some(_) => Err(Error::WrongType),
+            None => Ok(0),
+        }
     }
 }
 

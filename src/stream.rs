@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -151,6 +152,22 @@ impl std::fmt::Display for StreamId {
     }
 }
 
+impl TryFrom<&[u8]> for StreamId {
+    type Error = anyhow::Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let sep = bytes
+            .iter()
+            .position(|&b| b == b'-')
+            .context("stream id must contain '-'")?;
+
+        let ms = std::str::from_utf8(&bytes[..sep])?.parse()?;
+        let seq = std::str::from_utf8(&bytes[sep + 1..])?.parse()?;
+
+        Ok(Self { ms, seq })
+    }
+}
+
 impl TryFrom<rdb::String> for StreamId {
     type Error = anyhow::Error;
 
@@ -161,15 +178,16 @@ impl TryFrom<rdb::String> for StreamId {
             bail!("cannot parse stream id from {s:?}");
         };
 
-        let sep = s
-            .iter()
-            .position(|&b| b == b'-')
-            .context("stream id must contain '-'")?;
+        s.as_ref().try_into()
+    }
+}
 
-        let ms = std::str::from_utf8(&s.slice(..sep))?.parse()?;
-        let seq = std::str::from_utf8(&s.slice(sep + 1..))?.parse()?;
+impl TryFrom<&rdb::String> for StreamId {
+    type Error = anyhow::Error;
 
-        Ok(Self { ms, seq })
+    #[inline]
+    fn try_from(s: &rdb::String) -> Result<Self, Self::Error> {
+        s.clone().try_into()
     }
 }
 
@@ -247,6 +265,20 @@ impl TryFrom<&[DataType]> for Entry<Id> {
     }
 }
 
+impl From<Entry<StreamId>> for DataType {
+    #[inline]
+    fn from(Entry { id, fields }: Entry<StreamId>) -> Self {
+        DataType::array([
+            DataType::string(id),
+            DataType::array(
+                fields
+                    .iter()
+                    .flat_map(|(k, v)| [DataType::string(k.clone()), DataType::string(v.clone())]),
+            ),
+        ])
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct PendingEntry {
@@ -311,7 +343,7 @@ impl CGroup {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct StreamInner {
-    pub(crate) entries: Vec<Entry>,
+    pub(crate) entries: BTreeMap<StreamId, Entry>,
     pub(crate) length: usize,
     pub(crate) last_entry: StreamId,
     pub(crate) cgroups: Vec<CGroup>,
@@ -324,7 +356,7 @@ pub struct Stream(Arc<Mutex<StreamInner>>);
 impl Stream {
     #[inline]
     pub fn new(
-        entries: Vec<Entry>,
+        entries: BTreeMap<StreamId, Entry>,
         length: usize,
         last_entry: StreamId,
         cgroups: Vec<CGroup>,

@@ -9,11 +9,10 @@ use std::{fmt::Debug, path::Path};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
-use tokio::{
-    fs::File,
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-};
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
+use crate::cmd::xrange;
 use crate::data::{DataExt as _, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -390,8 +389,21 @@ where
                 Command::XAdd(key, entry, ops)
             }
 
+            b"XRANGE" => {
+                let key = match args.first().cloned() {
+                    Some(DataType::BulkString(key) | DataType::SimpleString(key)) => key,
+                    Some(arg) => bail!("XRANGE only accepts bulk strings as key, got {arg:?}"),
+                    None => bail!("XRANGE requires an argument, got none"),
+                };
+
+                let range = xrange::Range::try_from(&args[1..]).context("XRANGE: parse range")?;
+                let count = xrange::Count::try_from(&args[3..]).context("XRANGE: parse COUNT")?;
+
+                Command::XRange(key, range, count)
+            }
+
             b"XLEN" => match args.first().cloned() {
-                Some(DataType::BulkString(key) | DataType::SimpleString(key)) => Command::XLen(key),
+                Some(DataType::BulkString(len) | DataType::SimpleString(len)) => Command::XLen(len),
                 Some(arg) => bail!("XLEN only accepts bulk strings as key, got {arg:?}"),
                 None => bail!("XLEN requires an argument, got none"),
             },
