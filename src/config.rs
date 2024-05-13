@@ -81,15 +81,14 @@ impl TryFrom<Args> for Config {
                 }
 
                 "--replicaof" => {
-                    let Some(host) = args.next() else {
-                        bail!("missing host part of --replicaof <MASTER_HOST> <MASTER_PORT>");
+                    let Some(replica_of) = args.next() else {
+                        bail!(
+                            "missing argument value of --replicaof \"<MASTER_HOST> <MASTER_PORT>\""
+                        );
                     };
 
-                    let Some(port) = args.next() else {
-                        bail!("missing port part of --replicaof <MASTER_HOST> <MASTER_PORT>");
-                    };
-
-                    let replica_of = format!("{host}:{port}")
+                    let replica_of = replica_of
+                        .replace(' ', ":")
                         .to_socket_addrs()
                         .context("failed to resolve socket address for --replicaof")?
                         .next()
