@@ -12,12 +12,12 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::xrange;
-use crate::data::{DataExt as _, DataType};
+use crate::cmd::{self, xrange, xread};
+use crate::data::{DataExt, DataType, Keys};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
 use crate::stream;
-use crate::{cmd, Command, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
+use crate::{Command, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
 
 pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
 
@@ -400,6 +400,36 @@ where
                 let count = xrange::Count::try_from(&args[3..]).context("XRANGE: parse COUNT")?;
 
                 Command::XRange(key, range, count)
+            }
+
+            b"XREAD" => {
+                let ops = cmd::xread::Options::try_from(args).context("XREAD: parse options")?;
+                let mut args = &args[ops.len()..];
+
+                match args.first().cloned() {
+                    Some(DataType::BulkString(s) | DataType::SimpleString(s))
+                        if s.matches(xread::STREAMS) =>
+                    {
+                        args = &args[1..]
+                    }
+                    arg => bail!("XREAD expects a STREAMS keyword, got {arg:?}"),
+                }
+
+                ensure!(
+                    !args.is_empty(),
+                    "ERR wrong number of arguments for 'xread' command"
+                );
+
+                ensure!(
+                    args.len() % 2 == 0,
+                    "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.",
+                );
+
+                let (keys, ids) = args.split_at(args.len() / 2);
+                let keys = Keys::try_from(keys).context("XREAD")?;
+                let ids = xread::Ids::try_from(ids).context("XREAD")?;
+
+                Command::XRead(ops, keys, ids)
             }
 
             b"XLEN" => match args.first().cloned() {

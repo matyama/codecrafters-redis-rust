@@ -6,12 +6,12 @@ use std::vec;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 
-use crate::data::DataType;
+use crate::data::{DataType, Keys};
 use crate::repl::ReplState;
 use crate::{rdb, stream};
 use crate::{
     Instance, Protocol, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, NONE, OK, PING, PONG,
-    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN, XRANGE,
+    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN, XRANGE, XREAD,
 };
 
 pub mod info;
@@ -19,6 +19,7 @@ pub mod replconf;
 pub mod set;
 pub mod xadd;
 pub mod xrange;
+pub mod xread;
 
 const NULL: DataType = match PROTOCOL {
     Protocol::RESP2 => DataType::NullBulkString,
@@ -37,6 +38,7 @@ pub enum Command {
     Set(rdb::String, rdb::Value, set::Options),
     XAdd(rdb::String, stream::EntryArg, xadd::Options),
     XRange(rdb::String, xrange::Range, xrange::Count),
+    XRead(xread::Options, Keys, xread::Ids),
     XLen(rdb::String),
     Replconf(replconf::Conf),
     PSync(ReplState),
@@ -139,6 +141,30 @@ impl Command {
                         DataType::array(es.into_iter().map(DataType::from))
                     })
                 }),
+
+            Self::XRead(ops, keys, ids) => {
+                instance
+                    .store
+                    .xread(keys, ids, ops)
+                    .await
+                    .map_or_else(DataType::err, |items| {
+                        items.map_or(NULL, |items| {
+                            let items = items.into_iter().map(|(key, entries)| {
+                                (
+                                    DataType::string(key),
+                                    DataType::array(entries.into_iter().map(DataType::from)),
+                                )
+                            });
+
+                            match PROTOCOL {
+                                Protocol::RESP2 => DataType::array(
+                                    items.map(|(key, entries)| DataType::array([key, entries])),
+                                ),
+                                Protocol::RESP3 => DataType::map(items),
+                            }
+                        })
+                    })
+            }
 
             Self::XLen(key) => instance
                 .store
@@ -288,6 +314,16 @@ impl From<Command> for DataType {
                 if let xrange::Count(Some(count)) = count {
                     items.push(DataType::string(count.to_string()));
                 }
+                items
+            }
+
+            Command::XRead(ops, keys, ids) => {
+                let mut items = Vec::with_capacity(1 + ops.len() + 1 + keys.len() + ids.len());
+                items.push(DataType::string(XREAD));
+                items.extend(ops.into_bytes().map(DataType::string));
+                items.push(DataType::string(xread::STREAMS));
+                items.extend(keys.iter().cloned().map(DataType::string));
+                items.extend(ids.iter_bytes().map(DataType::string));
                 items
             }
 

@@ -5,57 +5,39 @@ use bytes::Bytes;
 
 use crate::data::{DataExt, DataType};
 use crate::rdb;
-use crate::stream::StreamId;
+use crate::stream::{Id, StreamId};
 use crate::{MAX, MIN};
 
 #[derive(Clone, Debug)]
-pub enum RangeBound {
-    Ms(Bound<u64>),
-    Id(Bound<StreamId>),
-}
-
-#[derive(Clone, Debug)]
 pub enum Bounds {
-    Start(RangeBound),
-    End(RangeBound),
+    Start(Bound<Id>),
+    End(Bound<Id>),
 }
 
 impl std::fmt::Display for Bounds {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use {Bound::*, RangeBound::*};
-
-        let (bound, sym) = match self {
-            Self::Start(bound) => (bound, MIN),
-            Self::End(bound) => (bound, MAX),
-        };
-
-        match bound {
-            Ms(Unbounded) | Id(Unbounded) => {
-                // SAFETY: MIN/MAX is const and valid UTF-8
-                write!(f, "{}", unsafe { std::str::from_utf8_unchecked(&sym) })
-            }
-            Ms(Included(ms)) => write!(f, "{ms}"),
-            Ms(Excluded(ms)) => write!(f, "({ms}"),
-            Id(Included(id)) => write!(f, "{id}"),
-            Id(Excluded(id)) => write!(f, "({id}"),
+        use Bound::*;
+        match self {
+            // SAFETY: MIN/MAX is const and valid UTF-8
+            Self::Start(Unbounded) => f.write_str(unsafe { std::str::from_utf8_unchecked(&MIN) }),
+            Self::End(Unbounded) => f.write_str(unsafe { std::str::from_utf8_unchecked(&MAX) }),
+            Self::Start(Included(id)) | Self::End(Included(id)) => write!(f, "{id}"),
+            Self::Start(Excluded(id)) | Self::End(Excluded(id)) => write!(f, "({id}"),
         }
     }
 }
 
 impl From<Bounds> for Bound<StreamId> {
+    #[inline]
     fn from(b: Bounds) -> Self {
-        use {Bound::*, Bounds::*, RangeBound::*};
-
-        let (bound, seq) = match b {
-            Start(b) => (b, 0),
-            End(b) => (b, u64::MAX),
-        };
-
-        match bound {
-            Ms(Unbounded) => Unbounded,
-            Ms(Included(ms)) => Included(StreamId { ms, seq }),
-            Ms(Excluded(ms)) => Excluded(StreamId { ms, seq }),
-            Id(id) => id,
+        use {Bound::*, Bounds::*};
+        match b {
+            Start(Unbounded) | End(Unbounded) => Unbounded,
+            Start(Included(id)) => Included(id.or_first()),
+            Start(Excluded(id)) => Excluded(id.or_first()),
+            End(Included(id)) => Included(id.or_last()),
+            End(Excluded(id)) => Excluded(id.or_last()),
         }
     }
 }
@@ -68,46 +50,25 @@ impl From<Bounds> for rdb::String {
     }
 }
 
-impl TryFrom<rdb::String> for RangeBound {
+impl TryFrom<rdb::String> for Bound<Id> {
     type Error = anyhow::Error;
 
     fn try_from(s: rdb::String) -> Result<Self, Self::Error> {
         use {rdb::String::*, Bound::*};
         match s {
-            // unbounded
-            s if s.matches(MIN) || s.matches(MAX) => Ok(Self::Id(Unbounded)),
+            s if s.matches(MIN) || s.matches(MAX) => Ok(Unbounded),
 
-            // bound excluded
             Str(s) if s.starts_with(b"(") => {
                 let s = s.strip_prefix(b"(").unwrap();
-                match StreamId::try_from(s) {
-                    Ok(id) => Ok(Self::Id(Excluded(id))),
-                    _ => Ok(std::str::from_utf8(s)?
-                        .parse()
-                        .map(Excluded)
-                        .map(Self::Ms)?),
-                }
+                Id::try_from(s).map(Excluded).context("bound excluded")
             }
 
-            // bound included
-            s => match StreamId::try_from(&s) {
-                Ok(id) => Ok(Self::Id(Included(id))),
-                _ => match s {
-                    Str(s) => Ok(std::str::from_utf8(&s)?
-                        .parse()
-                        .map(Included)
-                        .map(Self::Ms)?),
-                    Int8(i) if i.is_positive() => Ok(Self::Ms(Included(i as u64))),
-                    Int16(i) if i.is_positive() => Ok(Self::Ms(Included(i as u64))),
-                    Int32(i) if i.is_positive() => Ok(Self::Ms(Included(i as u64))),
-                    _ => Ok(Self::Ms(Included(0))),
-                },
-            },
+            s => Id::try_from(s).map(Included).context("bound included"),
         }
     }
 }
 
-impl TryFrom<&rdb::String> for RangeBound {
+impl TryFrom<&rdb::String> for Bound<Id> {
     type Error = anyhow::Error;
 
     #[inline]
@@ -116,7 +77,7 @@ impl TryFrom<&rdb::String> for RangeBound {
     }
 }
 
-impl TryFrom<&DataType> for RangeBound {
+impl TryFrom<&DataType> for Bound<Id> {
     type Error = anyhow::Error;
 
     #[inline]
@@ -130,8 +91,18 @@ impl TryFrom<&DataType> for RangeBound {
 
 #[derive(Clone, Debug)]
 pub struct Range {
-    pub(crate) start: RangeBound,
-    pub(crate) end: RangeBound,
+    pub(crate) start: Bound<Id>,
+    pub(crate) end: Bound<Id>,
+}
+
+impl Range {
+    #[inline]
+    pub fn lopen(start: Id) -> Self {
+        Self {
+            start: Bound::Excluded(start),
+            end: Bound::Unbounded,
+        }
+    }
 }
 
 impl TryFrom<&[DataType]> for Range {
@@ -142,10 +113,10 @@ impl TryFrom<&[DataType]> for Range {
             bail!("range is composed of two arguments: <start> <end>, got: {args:?}");
         };
 
-        let start = RangeBound::try_from(start).context("range start")?;
-        let end = RangeBound::try_from(end).context("range end")?;
-
-        Ok(Self { start, end })
+        Ok(Self {
+            start: Bound::try_from(start).context("range start")?,
+            end: Bound::try_from(end).context("range end")?,
+        })
     }
 }
 

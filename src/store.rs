@@ -5,7 +5,8 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Result};
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::cmd::{set, xadd, xrange};
+use crate::cmd::{set, xadd, xrange, xread};
+use crate::data::Keys;
 use crate::{rdb, stream};
 
 impl From<ValueCell> for rdb::Value {
@@ -103,6 +104,9 @@ impl From<Error> for rdb::String {
         Self::from(error.to_string())
     }
 }
+
+/// Result alias for X (stream) operations
+pub type XResult<T> = Result<Option<T>, Error>;
 
 // NOTE: The store implementation could use some optimization:
 //  1. Using a `Mutex` creates a single contention point which is no good. Also, it's quite
@@ -242,7 +246,7 @@ impl Store {
         key: rdb::String,
         entry: stream::EntryArg,
         ops: xadd::Options,
-    ) -> Result<Option<stream::StreamId>, Error> {
+    ) -> XResult<stream::StreamId> {
         if ops.no_mkstream {
             return Ok(None);
         }
@@ -303,7 +307,7 @@ impl Store {
         key: rdb::String,
         range: xrange::Range,
         count: Option<usize>,
-    ) -> Result<Option<Vec<stream::Entry>>, Error> {
+    ) -> XResult<Vec<stream::Entry>> {
         let store = self.0.read().await;
         let guard = store.db().await;
 
@@ -336,6 +340,63 @@ impl Store {
             .collect();
 
         Ok(Some(entries))
+    }
+
+    pub async fn xread(
+        &self,
+        keys: Keys,
+        ids: xread::Ids,
+        ops: xread::Options,
+    ) -> XResult<Vec<(rdb::String, Vec<stream::Entry>)>> {
+        let n_streams = keys.len();
+
+        // TODO: double-check keys.len() == ids.len()
+
+        let (count, _block) = ops.into();
+
+        let store = self.0.read().await;
+        let guard = store.db().await;
+
+        let mut streams = Vec::with_capacity(n_streams);
+        // TODO: spawn these as tasks and pass self to a task (need to take an Arc<Self> for that)
+        // let mut tasks = JoinSet::new();
+
+        for (key, id) in keys.iter().zip(ids.iter()) {
+            // NOTE: non-existent keys (streams) are simply filtered out
+            let Some(ValueCell { data, .. }) = guard.db.get(key) else {
+                continue;
+            };
+
+            let rdb::Value::Stream(s) = data else {
+                return Err(Error::WrongType);
+            };
+
+            let s = s.lock().await;
+
+            let range = xrange::Range::lopen(id.unwrap_or(s.last_entry));
+
+            // NOTE: returns an error if start > end (i.e., trivially empty interval)
+            let Some(range): Option<xrange::IdRange> = range.into() else {
+                continue;
+            };
+
+            let entries = s
+                .entries
+                .range(range)
+                .take(count)
+                .map(|(_, entry)| entry.clone())
+                .collect::<Vec<_>>();
+
+            if !entries.is_empty() {
+                streams.push((key.clone(), entries));
+            }
+        }
+
+        Ok(if streams.is_empty() {
+            None
+        } else {
+            Some(streams)
+        })
     }
 
     pub async fn xlen(&self, key: rdb::String) -> Result<usize, Error> {

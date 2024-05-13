@@ -124,6 +124,51 @@ impl DataType {
     }
 }
 
+impl TryFrom<DataType> for u64 {
+    type Error = anyhow::Error;
+
+    fn try_from(data: DataType) -> Result<Self, Self::Error> {
+        use {rdb::String::*, DataType::*};
+        match data {
+            Integer(i) if i > 0 => Ok(i as u64),
+            SimpleString(Int8(i)) | BulkString(Int8(i)) if i >= 0 => Ok(i as u64),
+            SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
+            SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
+            SimpleString(Str(s)) | BulkString(Str(s)) => Ok(std::str::from_utf8(&s)?.parse()?),
+            ty => bail!("{ty:?} cannot be converted to u64"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[repr(transparent)]
+pub struct Keys(Arc<[rdb::String]>);
+
+impl std::ops::Deref for Keys {
+    type Target = [rdb::String];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TryFrom<&[DataType]> for Keys {
+    // TODO: custom Error (WRONGTYPE)
+    type Error = anyhow::Error;
+
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        args.iter()
+            .cloned()
+            .map(|arg| match arg {
+                DataType::BulkString(arg) | DataType::SimpleString(arg) => Ok(arg),
+                arg => bail!("WRONGTYPE keys must be strings, got {arg:?}"),
+            })
+            .collect::<Result<_>>()
+            .map(Self)
+    }
+}
+
 const CASE_SHIFT: u8 = b'a'.abs_diff(b'A');
 
 // TODO: extend to multi-target matcher, possibly with different comparators
@@ -165,6 +210,23 @@ pub trait DataExt {
     fn matches(&self, target: impl AsRef<[u8]>) -> bool;
 
     fn contains(&self, target: u8) -> bool;
+}
+
+impl<'a> DataExt for &'a [u8] {
+    #[inline]
+    fn to_uppercase(&self) -> Vec<u8> {
+        self.to_ascii_uppercase()
+    }
+
+    #[inline]
+    fn matches(&self, target: impl AsRef<[u8]>) -> bool {
+        matches(self, target)
+    }
+
+    #[inline]
+    fn contains(&self, target: u8) -> bool {
+        self.as_ref().contains(&target)
+    }
 }
 
 impl DataExt for Bytes {
