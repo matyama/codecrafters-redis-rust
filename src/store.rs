@@ -452,8 +452,9 @@ impl Store {
             return Err(Error::err(err));
         }
 
-        let block = ops.block.is_some();
-        let (count, timeout) = ops.into();
+        let count = ops.count.unwrap_or(usize::MAX);
+        let blocking = ops.block.is_some();
+        let timeout = ops.block.unwrap_or_default();
 
         // NOTE: IndexMap would be nice here
         let mut streams = vec![None; keys.len()];
@@ -467,7 +468,7 @@ impl Store {
             let unblock = Arc::clone(&unblock);
 
             tasks.spawn(async move {
-                let Some(stream) = store.lookup_stream(&key, block, &unblock).await? else {
+                let Some(stream) = store.lookup_stream(&key, blocking, &unblock).await? else {
                     // NOTE: non-existent keys (streams) are simply filtered out
                     return Ok((k, None));
                 };
@@ -500,9 +501,9 @@ impl Store {
 
                     tokio::select! {
                         // wait for additional XADD writes and re-try
-                        _ = write.notified(), if block => continue,
+                        _ = write.notified(), if blocking => continue,
                         // ignore BLOCK if some other stream yielded a result
-                        _ = unblock.notified(), if block => break Ok((k, None)),
+                        _ = unblock.notified(), if blocking => break Ok((k, None)),
                         // without BLOCK, return after single try
                         else => break Ok((k, None)),
                     }
@@ -510,12 +511,12 @@ impl Store {
             });
         }
 
-        let timeout = tokio::time::sleep(timeout);
-        tokio::pin!(timeout);
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
 
         loop {
             tokio::select! {
-                _ = &mut timeout, if block => break,
+                _ = &mut sleep, if !timeout.is_zero() => break,
                 result = tasks.join_next() => match result {
                     Some(Ok(Ok((k, result)))) => {
                         success |= result.is_some();

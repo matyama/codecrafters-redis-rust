@@ -200,13 +200,6 @@ impl Iterator for OptionsBytesIter {
     }
 }
 
-impl From<Options> for (usize, Duration) {
-    #[inline]
-    fn from(Options { count, block }: Options) -> Self {
-        (count.unwrap_or(usize::MAX), block.unwrap_or_default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
