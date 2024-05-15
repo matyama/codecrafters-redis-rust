@@ -1,13 +1,16 @@
 use std::collections::hash_map::{Entry, OccupiedEntry, VacantEntry};
 use std::collections::{BTreeMap, HashMap};
+use std::mem;
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{anyhow, bail, Result};
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use anyhow::{bail, Result};
+use tokio::sync::{Mutex, MutexGuard, Notify, RwLock};
+use tokio::task::JoinSet;
 
 use crate::cmd::{set, xadd, xrange, xread};
 use crate::data::Keys;
-use crate::{rdb, stream};
+use crate::{rdb, stream, Error};
 
 impl From<ValueCell> for rdb::Value {
     #[inline]
@@ -26,13 +29,38 @@ impl From<&ValueCell> for rdb::ValueType {
 #[derive(Debug)]
 pub struct ValueCell {
     data: rdb::Value,
+    write: Arc<Notify>,
     expiry: Option<SystemTime>,
+}
+
+impl ValueCell {
+    #[inline]
+    fn new(data: rdb::Value, expiry: Option<SystemTime>) -> Self {
+        Self {
+            data,
+            write: Arc::new(Notify::new()),
+            expiry,
+        }
+    }
+
+    /// Replace the content of this cell in-place and notify all write waiters.
+    ///
+    /// Returns the previous [`Value`](rdb::Value) stored in this cell.
+    fn write(&mut self, mut data: rdb::Value, expiry: Option<SystemTime>) -> rdb::Value {
+        mem::swap(&mut self.data, &mut data);
+        self.expiry = expiry;
+        self.write.notify_waiters();
+        data
+    }
 }
 
 #[derive(Debug)]
 pub struct Database {
     pub(crate) ix: usize,
     db: HashMap<rdb::String, ValueCell>,
+    // XXX: replace (also in cells) by single watch (issue: no wait_for requires tokio >= 1.37)
+    /// Notify subscribers about recently inserted keys
+    new: Arc<Notify>,
 }
 
 impl Database {
@@ -74,7 +102,7 @@ impl DatabaseBuilder {
                 // filter out keys that have already expired
                 Some(expiry) if expiry < SystemTime::now() => {}
                 expiry => {
-                    let _ = db.insert(key, ValueCell { data: val, expiry });
+                    let _ = db.insert(key, ValueCell::new(val, expiry));
                 }
             }
         }
@@ -83,30 +111,42 @@ impl DatabaseBuilder {
     #[inline]
     pub fn build(self) -> Result<Database> {
         match (self.ix, self.db) {
-            (Some(ix), Some(db)) => Ok(Database { ix, db }),
+            (Some(ix), Some(db)) => Ok(Database {
+                ix,
+                db,
+                new: Arc::new(Notify::new()),
+            }),
             (ix, _) => bail!("incomplete db={ix:?}"),
         }
     }
 }
 
-// XXX: probably move to lib
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
-    WrongType,
-    #[error("ERR {0}")]
-    Err(#[from] anyhow::Error),
-}
-
-impl From<Error> for rdb::String {
-    #[inline]
-    fn from(error: Error) -> Self {
-        Self::from(error.to_string())
-    }
-}
-
 /// Result alias for X (stream) operations
 pub type XResult<T> = Result<Option<T>, Error>;
+
+struct StreamHandle {
+    stream: stream::Stream,
+    write: Arc<Notify>,
+    new: bool,
+}
+
+impl StreamHandle {
+    /// Determine the lookup range for XREAD.
+    ///
+    /// If there was no stream before XREAD started, then this implicitly starts from 0-0
+    /// (exclusive). Also, it returns `None` if start > end (i.e., trivially empty interval).
+    async fn xread_range(&self, start: xread::Id) -> Option<xrange::IdRange> {
+        let last_entry = if self.new {
+            stream::StreamId::ZERO
+        } else {
+            self.stream.lock().await.last_entry
+        };
+
+        let start = start.unwrap_or(last_entry);
+
+        xrange::Range::lopen(start).into()
+    }
+}
 
 // NOTE: The store implementation could use some optimization:
 //  1. Using a `Mutex` creates a single contention point which is no good. Also, it's quite
@@ -134,6 +174,7 @@ impl Default for StoreInner {
         let db = Database {
             ix,
             db: HashMap::default(),
+            new: Arc::new(Notify::new()),
         };
 
         let mut dbs = HashMap::with_capacity(Store::DEFAULT_SIZE);
@@ -171,8 +212,10 @@ impl Store {
                 ValueCell {
                     data: _,
                     expiry: Some(expiry),
+                    ..
                 } if *expiry < SystemTime::now() => {
-                    e.remove();
+                    let old = e.remove();
+                    old.write.notify_waiters();
                     None
                 }
                 ValueCell { data, .. } => Some(data.clone()),
@@ -203,21 +246,21 @@ impl Store {
             None => None,
         };
 
-        let value = match guard.db.entry(key) {
+        let value = match guard.db.entry(key.clone()) {
             // Overwrite existing entry that has expired before this operation
             Entry::Occupied(mut e) if e.expired_before(now) && matches!(cond, Some(NX) | None) => {
+                let expired = e.expired_before(now);
                 let expiry = expiration(&e);
-                match e.insert(ValueCell { data: val, expiry }) {
-                    value if value.expired_before(now) => Ok(None),
-                    ValueCell { data, .. } => Ok(Some(data)),
-                }
+
+                let old = e.get_mut().write(val, expiry);
+
+                Ok(if expired { None } else { Some(old) })
             }
 
             // Overwrite existing entry that has not expired (or has no expiration set)
             Entry::Occupied(mut e) if matches!(cond, Some(XX) | None) => {
                 let expiry = expiration(&e);
-                let ValueCell { data, .. } = e.insert(ValueCell { data: val, expiry });
-                Ok(Some(data))
+                Ok(Some(e.get_mut().write(val, expiry)))
             }
 
             // Insert new value (note: we know this is a new entry, so could not be an old one)
@@ -229,7 +272,8 @@ impl Store {
                     None
                 };
 
-                e.insert(ValueCell { data: val, expiry });
+                e.insert(ValueCell::new(val, expiry));
+                guard.new.notify_waiters();
 
                 Ok(None)
             }
@@ -256,7 +300,7 @@ impl Store {
 
         match guard.db.entry(key) {
             Entry::Occupied(mut e) => {
-                let ValueCell { data, .. } = e.get_mut();
+                let ValueCell { data, write, .. } = e.get_mut();
 
                 let rdb::Value::Stream(s) = data else {
                     return Err(Error::WrongType);
@@ -267,14 +311,18 @@ impl Store {
                 let entry = entry.next(Some(s.last_entry));
 
                 if entry.id <= s.last_entry {
-                    let err = "The ID specified in XADD is equal or smaller than the target stream top item";
-                    return Err(Error::Err(anyhow!(err)));
+                    let err = "The ID specified in XADD is \
+                               equal or smaller than the target stream top item";
+                    return Err(Error::err(err));
                 }
 
                 s.last_entry = entry.id;
                 s.entries.insert(entry.id, entry);
                 s.length += 1;
                 // TODO: update cgroups?
+
+                // notify all waiting XREAD clients that a new entry has been added
+                write.notify_waiters();
 
                 Ok(Some(s.last_entry))
             }
@@ -292,10 +340,8 @@ impl Store {
 
                 let stream = stream::Stream::new(entries, 1, last_entry, cgroups);
 
-                e.insert(ValueCell {
-                    data: rdb::Value::Stream(stream),
-                    expiry: None,
-                });
+                e.insert(ValueCell::new(rdb::Value::Stream(stream), None));
+                guard.new.notify_waiters();
 
                 Ok(Some(id))
             }
@@ -342,60 +388,150 @@ impl Store {
         Ok(Some(entries))
     }
 
-    pub async fn xread(
+    async fn get_stream(
         &self,
+        key: &rdb::String,
+    ) -> Result<(Option<(stream::Stream, Arc<Notify>)>, Arc<Notify>), Error> {
+        let store = self.0.read().await;
+        let guard = store.db().await;
+        let new = Arc::clone(&guard.new);
+
+        let Some(ValueCell { data, write, .. }) = guard.db.get(key) else {
+            return Ok((None, new));
+        };
+
+        let rdb::Value::Stream(stream) = data else {
+            return Err(Error::WrongType);
+        };
+
+        let stream = stream.clone();
+        let write = Arc::clone(write);
+
+        Ok((Some((stream, write)), new))
+    }
+
+    async fn lookup_stream(
+        &self,
+        key: &rdb::String,
+        blocking: bool,
+        unblock: &Notify,
+    ) -> XResult<StreamHandle> {
+        let new = match self.get_stream(key).await? {
+            (Some((stream, write)), _) => {
+                return Ok(Some(StreamHandle {
+                    stream,
+                    write,
+                    new: false,
+                }))
+            }
+            (_, new) => new,
+        };
+
+        loop {
+            tokio::select! {
+                _ = new.notified(), if blocking => {
+                    if let (Some((stream, write)), _) = self.get_stream(key).await? {
+                        return Ok(Some(StreamHandle { stream, write, new: true }));
+                    }
+                },
+                _ = unblock.notified(), if blocking => break Ok(None),
+                else => break Ok(None),
+            }
+        }
+    }
+
+    pub async fn xread(
+        self: Arc<Self>,
         keys: Keys,
         ids: xread::Ids,
         ops: xread::Options,
     ) -> XResult<Vec<(rdb::String, Vec<stream::Entry>)>> {
-        let n_streams = keys.len();
+        if keys.len() != ids.len() {
+            let err = "Unbalanced 'xread' list of streams: \
+                       for each stream key an ID or '$' must be specified.";
+            return Err(Error::err(err));
+        }
 
-        // TODO: double-check keys.len() == ids.len()
+        let block = ops.block.is_some();
+        let (count, timeout) = ops.into();
 
-        let (count, _block) = ops.into();
+        // NOTE: IndexMap would be nice here
+        let mut streams = vec![None; keys.len()];
+        let mut success = false;
 
-        let store = self.0.read().await;
-        let guard = store.db().await;
+        let mut tasks = JoinSet::new();
+        let unblock = Arc::new(Notify::new());
 
-        let mut streams = Vec::with_capacity(n_streams);
-        // TODO: spawn these as tasks and pass self to a task (need to take an Arc<Self> for that)
-        // let mut tasks = JoinSet::new();
+        for (k, (key, id)) in keys.iter().cloned().zip(ids.iter().cloned()).enumerate() {
+            let store = Arc::clone(&self);
+            let unblock = Arc::clone(&unblock);
 
-        for (key, id) in keys.iter().zip(ids.iter()) {
-            // NOTE: non-existent keys (streams) are simply filtered out
-            let Some(ValueCell { data, .. }) = guard.db.get(key) else {
-                continue;
-            };
+            tasks.spawn(async move {
+                let Some(stream) = store.lookup_stream(&key, block, &unblock).await? else {
+                    // NOTE: non-existent keys (streams) are simply filtered out
+                    return Ok((k, None));
+                };
 
-            let rdb::Value::Stream(s) = data else {
-                return Err(Error::WrongType);
-            };
+                // determine the lookup range once ahead of time (important for ID=$)
+                let Some(range) = stream.xread_range(id).await else {
+                    return Ok((k, None));
+                };
 
-            let s = s.lock().await;
+                let StreamHandle { stream, write, .. } = stream;
 
-            let range = xrange::Range::lopen(id.unwrap_or(s.last_entry));
+                loop {
+                    // re-take the stream lock temporarily, so it won't block writes
+                    let entries: Vec<_> = {
+                        stream
+                            .lock()
+                            .await
+                            .entries
+                            .range(range.clone())
+                            .take(count)
+                            .map(|(_, entry)| entry.clone())
+                            .collect()
+                    };
 
-            // NOTE: returns an error if start > end (i.e., trivially empty interval)
-            let Some(range): Option<xrange::IdRange> = range.into() else {
-                continue;
-            };
+                    if !entries.is_empty() {
+                        // there are data to return, so execute the rest sync. (even with BLOCK)
+                        unblock.notify_waiters();
+                        break Ok((k, Some((key, entries))));
+                    }
 
-            let entries = s
-                .entries
-                .range(range)
-                .take(count)
-                .map(|(_, entry)| entry.clone())
-                .collect::<Vec<_>>();
+                    tokio::select! {
+                        // wait for additional XADD writes and re-try
+                        _ = write.notified(), if block => continue,
+                        // ignore BLOCK if some other stream yielded a result
+                        _ = unblock.notified(), if block => break Ok((k, None)),
+                        // without BLOCK, return after single try
+                        else => break Ok((k, None)),
+                    }
+                }
+            });
+        }
 
-            if !entries.is_empty() {
-                streams.push((key.clone(), entries));
+        let timeout = tokio::time::sleep(timeout);
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                _ = &mut timeout, if block => break,
+                result = tasks.join_next() => match result {
+                    Some(Ok(Ok((k, result)))) => {
+                        success |= result.is_some();
+                        streams[k] = result;
+                    },
+                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Err(e)) => eprintln!("XREAD failed with {e:?}"),
+                    None => break,
+                }
             }
         }
 
-        Ok(if streams.is_empty() {
-            None
+        Ok(if success {
+            Some(streams.into_iter().flatten().collect())
         } else {
-            Some(streams)
+            None
         })
     }
 

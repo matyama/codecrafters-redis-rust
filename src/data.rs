@@ -1,12 +1,11 @@
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{bail, Context as _, Result};
 use bytes::Bytes;
 
 use crate::cmd::{self, Command};
-use crate::rdb;
 use crate::writer::{DataSerializer, Serializer as _};
-use crate::ANY;
+use crate::{rdb, Error, ANY};
 
 // NOTE: immutable with cheap Clone impl
 #[derive(Debug, Clone)]
@@ -94,38 +93,24 @@ impl DataType {
         })
     }
 
-    pub(crate) fn parse_int(self) -> Result<Self> {
+    pub(crate) fn parse_int(self) -> Result<Self, Error> {
         use rdb::String::*;
         match self {
-            Self::Null => bail!("null cannot be converted to an integer"),
             Self::Boolean(b) => Ok(Self::Integer(b.into())),
             i @ Self::Integer(_) => Ok(i),
             Self::SimpleString(s) | Self::BulkString(s) => match s {
-                Str(s) => {
-                    let s = std::str::from_utf8(&s)
-                        .with_context(|| format!("{s:?} is not a UTF-8 string"))?;
-                    s.parse()
-                        .map(Self::Integer)
-                        .with_context(|| format!("'{s}' does not represent an integer"))
-                }
+                Str(s) => s.parse().map(Self::Integer),
                 Int8(i) => Ok(Self::Integer(i as i64)),
                 Int16(i) => Ok(Self::Integer(i as i64)),
                 Int32(i) => Ok(Self::Integer(i as i64)),
             },
-            Self::NullBulkString | Self::NullBulkError => {
-                bail!("null bulk string|erorr cannot be converted to an integer")
-            }
-            Self::SimpleError(_) | Self::BulkError(_) => {
-                bail!("error cannot be converted to an integer")
-            }
-            Self::Array(_) => bail!("array cannot be converted to an integer"),
-            Self::Map(_) => bail!("map cannot be converted to an integer"),
+            _ => Err(Error::VAL_NOT_INT),
         }
     }
 }
 
 impl TryFrom<DataType> for u64 {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(data: DataType) -> Result<Self, Self::Error> {
         use {rdb::String::*, DataType::*};
@@ -134,8 +119,8 @@ impl TryFrom<DataType> for u64 {
             SimpleString(Int8(i)) | BulkString(Int8(i)) if i >= 0 => Ok(i as u64),
             SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
             SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
-            SimpleString(Str(s)) | BulkString(Str(s)) => Ok(std::str::from_utf8(&s)?.parse()?),
-            ty => bail!("{ty:?} cannot be converted to u64"),
+            SimpleString(Str(s)) | BulkString(Str(s)) => s.parse(),
+            _ => Err(Error::VAL_NOT_INT),
         }
     }
 }
@@ -154,18 +139,38 @@ impl std::ops::Deref for Keys {
 }
 
 impl TryFrom<&[DataType]> for Keys {
-    // TODO: custom Error (WRONGTYPE)
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         args.iter()
             .cloned()
             .map(|arg| match arg {
                 DataType::BulkString(arg) | DataType::SimpleString(arg) => Ok(arg),
-                arg => bail!("WRONGTYPE keys must be strings, got {arg:?}"),
+                // TODO: custom error variant
+                arg => Err(Error::Err(format!("keys must be strings, got {arg:?}"))),
             })
-            .collect::<Result<_>>()
+            .collect::<Result<_, Self::Error>>()
             .map(Self)
+    }
+}
+
+pub(crate) trait ParseInt {
+    fn parse<T: FromStr>(self) -> Result<T, Error>;
+}
+
+impl ParseInt for &[u8] {
+    #[inline]
+    fn parse<T: FromStr>(self) -> Result<T, Error> {
+        std::str::from_utf8(self)
+            .map_err(|_| Error::VAL_NOT_INT)
+            .and_then(|s| s.parse::<T>().map_err(|_| Error::VAL_NOT_INT))
+    }
+}
+
+impl ParseInt for Bytes {
+    #[inline]
+    fn parse<T: FromStr>(self) -> Result<T, Error> {
+        self.as_ref().parse()
     }
 }
 

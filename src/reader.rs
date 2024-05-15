@@ -412,6 +412,7 @@ where
                     {
                         args = &args[1..]
                     }
+                    // TODO: ERR Syntax error
                     arg => bail!("XREAD expects a STREAMS keyword, got {arg:?}"),
                 }
 
@@ -422,7 +423,8 @@ where
 
                 ensure!(
                     args.len() % 2 == 0,
-                    "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.",
+                    "ERR Unbalanced 'xread' list of streams: \
+                    for each stream key an ID or '$' must be specified.",
                 );
 
                 let (keys, ids) = args.split_at(args.len() / 2);

@@ -79,6 +79,37 @@ pub enum Protocol {
     RESP3,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
+    WrongType,
+
+    #[error("ERR {0} is not an integer or out of range")]
+    NotInt(&'static str),
+
+    #[error("ERR {0}")]
+    Err(String),
+
+    #[error("ERR {0}")]
+    Any(#[from] anyhow::Error),
+}
+
+impl Error {
+    pub(crate) const VAL_NOT_INT: Error = Error::NotInt("value");
+
+    #[inline]
+    pub fn err(e: impl Into<String>) -> Self {
+        Self::Err(e.into())
+    }
+}
+
+impl From<Error> for rdb::String {
+    #[inline]
+    fn from(error: Error) -> Self {
+        Self::from(error.to_string())
+    }
+}
+
 #[derive(Debug)]
 pub enum Resp {
     Cmd(Command),
@@ -142,7 +173,7 @@ pub struct Instance {
     cfg: Config,
     role: Role,
     state: AtomicPtr<ReplState>,
-    store: Store,
+    store: Arc<Store>,
 }
 
 impl Instance {
@@ -174,7 +205,7 @@ impl Instance {
                 cfg,
                 role: Role::Leader(ReplicaSet::default()),
                 state,
-                store,
+                store: Arc::new(store),
             };
 
             return Ok((instance, ReplConnection::default()));
@@ -190,7 +221,7 @@ impl Instance {
             cfg,
             role: Role::Replica(Leader(leader)),
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
-            store,
+            store: Arc::new(store),
         };
 
         Ok((instance, subscriber))

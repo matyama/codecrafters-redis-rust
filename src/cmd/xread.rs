@@ -1,11 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
 
 use crate::data::{DataExt, DataType};
-use crate::{stream, FUTURE};
+use crate::{stream, Error, FUTURE};
 
 const BLOCK: Bytes = Bytes::from_static(b"BLOCK");
 const COUNT: Bytes = Bytes::from_static(b"COUNT");
@@ -51,7 +50,7 @@ impl std::ops::Deref for Ids {
 }
 
 impl TryFrom<&[DataType]> for Ids {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(ids: &[DataType]) -> Result<Self, Self::Error> {
         ids.iter()
@@ -60,7 +59,7 @@ impl TryFrom<&[DataType]> for Ids {
                     Ok(Id::Future)
                 } else {
                     id.try_into().map(Id::Explicit).map_err(|_| {
-                        anyhow!("ERR Invalid stream ID specified as stream command argument")
+                        Error::err("Invalid stream ID specified as stream command argument")
                     })
                 }
             })
@@ -90,7 +89,7 @@ impl Options {
 }
 
 impl TryFrom<&[DataType]> for Options {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         let mut ops = Options::default();
@@ -100,10 +99,10 @@ impl TryFrom<&[DataType]> for Options {
         while let Some(arg) = args.next() {
             if arg.matches(COUNT) {
                 let Some(cnt) = args.next() else {
-                    bail!("COUNT option is missing a value");
+                    return Err(Error::VAL_NOT_INT);
                 };
 
-                let DataType::Integer(cnt) = cnt.parse_int().context("COUNT")? else {
+                let DataType::Integer(cnt) = cnt.parse_int()? else {
                     unreachable!("DataType::parse_int returns only integers");
                 };
 
@@ -114,10 +113,10 @@ impl TryFrom<&[DataType]> for Options {
 
             if arg.matches(BLOCK) {
                 let Some(ms) = args.next() else {
-                    bail!("BLOCK option is missing a value");
+                    return Err(Error::NotInt("timeout"));
                 };
 
-                let ms = u64::try_from(ms).context("[BLOCK milliseconds]")?;
+                let ms = u64::try_from(ms).map_err(|_| Error::err("timeout is negative"))?;
                 ops.block.replace(Duration::from_millis(ms));
 
                 continue;
@@ -204,7 +203,7 @@ impl Iterator for OptionsBytesIter {
 impl From<Options> for (usize, Duration) {
     #[inline]
     fn from(Options { count, block }: Options) -> Self {
-        (count.unwrap_or(usize::MAX), block.unwrap_or(Duration::MAX))
+        (count.unwrap_or(usize::MAX), block.unwrap_or_default())
     }
 }
 

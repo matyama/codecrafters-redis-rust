@@ -142,29 +142,28 @@ impl Command {
                     })
                 }),
 
-            Self::XRead(ops, keys, ids) => {
-                instance
-                    .store
-                    .xread(keys, ids, ops)
-                    .await
-                    .map_or_else(DataType::err, |items| {
-                        items.map_or(NULL, |items| {
-                            let items = items.into_iter().map(|(key, entries)| {
-                                (
-                                    DataType::string(key),
-                                    DataType::array(entries.into_iter().map(DataType::from)),
-                                )
-                            });
+            Self::XRead(ops, keys, ids) => instance
+                .store
+                .clone()
+                .xread(keys, ids, ops)
+                .await
+                .map_or_else(DataType::err, |items| {
+                    items.map_or(NULL, |items| {
+                        let items = items.into_iter().map(|(key, entries)| {
+                            (
+                                DataType::string(key),
+                                DataType::array(entries.into_iter().map(DataType::from)),
+                            )
+                        });
 
-                            match PROTOCOL {
-                                Protocol::RESP2 => DataType::array(
-                                    items.map(|(key, entries)| DataType::array([key, entries])),
-                                ),
-                                Protocol::RESP3 => DataType::map(items),
-                            }
-                        })
+                        match PROTOCOL {
+                            Protocol::RESP2 => DataType::array(
+                                items.map(|(key, entries)| DataType::array([key, entries])),
+                            ),
+                            Protocol::RESP3 => DataType::map(items),
+                        }
                     })
-            }
+                }),
 
             Self::XLen(key) => instance
                 .store
