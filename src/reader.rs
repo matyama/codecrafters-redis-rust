@@ -389,18 +389,10 @@ where
                 Command::XAdd(key, entry, ops)
             }
 
-            b"XRANGE" => {
-                let key = match args.first().cloned() {
-                    Some(DataType::BulkString(key) | DataType::SimpleString(key)) => key,
-                    Some(arg) => bail!("XRANGE only accepts bulk strings as key, got {arg:?}"),
-                    None => bail!("XRANGE requires an argument, got none"),
-                };
-
-                let range = xrange::Range::try_from(&args[1..]).context("XRANGE: parse range")?;
-                let count = xrange::Count::try_from(&args[3..]).context("XRANGE: parse COUNT")?;
-
-                Command::XRange(key, range, count)
-            }
+            b"XRANGE" => match xrange::XRange::try_from(args) {
+                Ok(xrange) => Command::from(xrange),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
+            },
 
             b"XREAD" => match xread::XRead::try_from(args) {
                 Ok(xread) => Command::from(xread),

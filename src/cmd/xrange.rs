@@ -1,12 +1,12 @@
 use std::ops::Bound;
 
-use anyhow::{bail, Context};
 use bytes::Bytes;
 
 use crate::data::{DataExt, DataType};
-use crate::rdb;
-use crate::stream::{Id, StreamId};
-use crate::{MAX, MIN};
+use crate::stream::{Id, ParseIdError, StreamId};
+use crate::{rdb, Command, Error, MAX, MIN};
+
+const CMD: &str = "xrange";
 
 #[derive(Clone, Debug)]
 pub enum Bounds {
@@ -51,7 +51,7 @@ impl From<Bounds> for rdb::String {
 }
 
 impl TryFrom<rdb::String> for Bound<Id> {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(s: rdb::String) -> Result<Self, Self::Error> {
         use {rdb::String::*, Bound::*};
@@ -60,16 +60,20 @@ impl TryFrom<rdb::String> for Bound<Id> {
 
             Str(s) if s.starts_with(b"(") => {
                 let s = s.strip_prefix(b"(").unwrap();
-                Id::try_from(s).map(Excluded).context("bound excluded")
+                Id::try_from(s)
+                    .map(Excluded)
+                    .map_err(|_| Error::err(ParseIdError::Invalid))
             }
 
-            s => Id::try_from(s).map(Included).context("bound included"),
+            s => Id::try_from(s)
+                .map(Included)
+                .map_err(|_| Error::err(ParseIdError::Invalid)),
         }
     }
 }
 
 impl TryFrom<&rdb::String> for Bound<Id> {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     #[inline]
     fn try_from(s: &rdb::String) -> Result<Self, Self::Error> {
@@ -78,12 +82,12 @@ impl TryFrom<&rdb::String> for Bound<Id> {
 }
 
 impl TryFrom<&DataType> for Bound<Id> {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     #[inline]
     fn try_from(data: &DataType) -> Result<Self, Self::Error> {
         let (DataType::BulkString(s) | DataType::SimpleString(s)) = data else {
-            bail!("expected a string, got {data:?}");
+            return Err(Error::err("XRANGE range bound must be a string"));
         };
         Self::try_from(s)
     }
@@ -106,16 +110,16 @@ impl Range {
 }
 
 impl TryFrom<&[DataType]> for Range {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         let [start, end, ..] = args else {
-            bail!("range is composed of two arguments: <start> <end>, got: {args:?}");
+            return Err(Error::WrongNumArgs(CMD));
         };
 
         Ok(Self {
-            start: Bound::try_from(start).context("range start")?,
-            end: Bound::try_from(end).context("range end")?,
+            start: Bound::try_from(start)?,
+            end: Bound::try_from(end)?,
         })
     }
 }
@@ -178,7 +182,7 @@ impl From<Count> for Option<usize> {
 }
 
 impl TryFrom<&[DataType]> for Count {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         let mut count = None;
@@ -189,13 +193,13 @@ impl TryFrom<&[DataType]> for Count {
         while let Some(arg) = args.next() {
             if arg.matches(COUNT) {
                 let Some(cnt) = args.next() else {
-                    bail!("COUNT option is missing a value");
+                    return Err(Error::Syntax);
                 };
 
-                match cnt.parse_int().context("COUNT value is not an integer")? {
-                    DataType::Integer(c) if c.is_positive() => count.replace(c as usize),
-                    DataType::Integer(_) => count.replace(0),
-                    val => bail!("COUNT with an unexpected value: {val:?}"),
+                match usize::try_from(cnt) {
+                    Ok(c) => count.replace(c),
+                    Err(Error::NegInt(_)) => count.replace(0),
+                    Err(e) => return Err(e),
                 };
 
                 // NOTE: there are no options other than COUNT
@@ -204,5 +208,35 @@ impl TryFrom<&[DataType]> for Count {
         }
 
         Ok(Count(count))
+    }
+}
+
+#[derive(Debug)]
+pub struct XRange(rdb::String, Range, Count);
+
+impl TryFrom<&[DataType]> for XRange {
+    type Error = Error;
+
+    /// XRANGE key start end [COUNT count]
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        let Some((key, args)) = args.split_first() else {
+            return Err(Error::WrongNumArgs(CMD));
+        };
+
+        let (DataType::BulkString(key) | DataType::SimpleString(key)) = key else {
+            return Err(Error::err("XRANGE key must be a string"));
+        };
+
+        let range = Range::try_from(args)?;
+        let count = Count::try_from(&args[2..])?;
+
+        Ok(XRange(key.clone(), range, count))
+    }
+}
+
+impl From<XRange> for Command {
+    #[inline]
+    fn from(XRange(key, range, count): XRange) -> Self {
+        Self::XRange(key, range, count)
     }
 }

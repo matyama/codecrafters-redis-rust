@@ -107,8 +107,8 @@ impl Error {
     pub(crate) const VAL_NEG_INT: Error = Error::NegInt("value");
 
     #[inline]
-    pub fn err(e: impl Into<String>) -> Self {
-        Self::Err(e.into())
+    pub fn err(e: impl ToString) -> Self {
+        Self::Err(e.to_string())
     }
 }
 

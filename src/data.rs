@@ -117,28 +117,37 @@ impl DataType {
     }
 }
 
-impl TryFrom<DataType> for u64 {
-    type Error = Error;
+macro_rules! impl_try_from_data {
+    ( $($int:ty),+ ) => {
+        $(
+            impl TryFrom<DataType> for $int {
+                type Error = Error;
 
-    fn try_from(data: DataType) -> Result<Self, Self::Error> {
-        use {rdb::String::*, DataType::*};
-        match data {
-            Integer(i) if i > 0 => Ok(i as u64),
-            Integer(_) => Err(Error::VAL_NEG_INT),
-            SimpleString(Int8(i)) | BulkString(Int8(i)) if i >= 0 => Ok(i as u64),
-            SimpleString(Int8(_)) | BulkString(Int8(_)) => Err(Error::VAL_NEG_INT),
-            SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
-            SimpleString(Int16(_)) | BulkString(Int16(_)) => Err(Error::VAL_NEG_INT),
-            SimpleString(Int32(i)) | BulkString(Int32(i)) if i >= 0 => Ok(i as u64),
-            SimpleString(Int32(_)) | BulkString(Int32(_)) => Err(Error::VAL_NEG_INT),
-            SimpleString(Str(s)) | BulkString(Str(s)) if s.starts_with(NEG) => {
-                Err(Error::VAL_NEG_INT)
+                fn try_from(data: DataType) -> Result<Self, Self::Error> {
+                    use {rdb::String::*, DataType::*};
+                    match data {
+                        Integer(i) if i > 0 => Ok(i as $int),
+                        Integer(_) => Err(Error::VAL_NEG_INT),
+                        SimpleString(Int8(i)) | BulkString(Int8(i)) if i >= 0 => Ok(i as $int),
+                        SimpleString(Int8(_)) | BulkString(Int8(_)) => Err(Error::VAL_NEG_INT),
+                        SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as $int),
+                        SimpleString(Int16(_)) | BulkString(Int16(_)) => Err(Error::VAL_NEG_INT),
+                        SimpleString(Int32(i)) | BulkString(Int32(i)) if i >= 0 => Ok(i as $int),
+                        SimpleString(Int32(_)) | BulkString(Int32(_)) => Err(Error::VAL_NEG_INT),
+                        SimpleString(Str(s)) | BulkString(Str(s))
+                            if s.starts_with(NEG) && s != NEG => {
+                                Err(Error::VAL_NEG_INT)
+                            }
+                        SimpleString(Str(s)) | BulkString(Str(s)) => s.parse(),
+                        _ => Err(Error::VAL_NOT_INT),
+                    }
+                }
             }
-            SimpleString(Str(s)) | BulkString(Str(s)) => s.parse(),
-            _ => Err(Error::VAL_NOT_INT),
-        }
-    }
+        )+
+    };
 }
+
+impl_try_from_data!(u64, usize);
 
 #[derive(Clone, Debug)]
 #[repr(transparent)]
