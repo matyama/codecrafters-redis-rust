@@ -31,7 +31,6 @@ pub(crate) mod store;
 pub(crate) mod stream;
 pub(crate) mod writer;
 
-// pub(crate) const EOF: u8 = b'\xFF'; // 0xFF (e.g., RDB EOF op code)
 pub(crate) const LF: u8 = b'\n'; // 10
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 pub(crate) const NULL: &[u8] = b"_\r\n";
@@ -84,8 +83,17 @@ pub enum Error {
     #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
     WrongType,
 
+    #[error("ERR wrong number of arguments for '{0}' command")]
+    WrongNumArgs(&'static str),
+
     #[error("ERR {0} is not an integer or out of range")]
     NotInt(&'static str),
+
+    #[error("ERR {0} is negative")]
+    NegInt(&'static str),
+
+    #[error("ERR syntax error")]
+    Syntax,
 
     #[error("ERR {0}")]
     Err(String),
@@ -96,6 +104,7 @@ pub enum Error {
 
 impl Error {
     pub(crate) const VAL_NOT_INT: Error = Error::NotInt("value");
+    pub(crate) const VAL_NEG_INT: Error = Error::NegInt("value");
 
     #[inline]
     pub fn err(e: impl Into<String>) -> Self {
@@ -331,7 +340,7 @@ impl Instance {
                     writer.flush().await?;
 
                     if let Role::Leader(replicas) = &self.role {
-                        if resp.is_ok() {
+                        if resp.is_replicable() {
                             let (old_state, new_offset) = self.shift_offset(bytes_read);
                             println!("master offset: {} -> {new_offset}", old_state.repl_offset);
                             replicas.forward(repl_cmd).await;
@@ -346,6 +355,11 @@ impl Instance {
                     writer.write(&resp).await?;
                     writer.flush().await?;
                     println!("non-write command handled: {resp:?}");
+                }
+                // XXX: || resp.is_null()
+                Resp::Data(resp) if resp.is_err() => {
+                    writer.write(&resp).await?;
+                    writer.flush().await?;
                 }
                 Resp::Data(resp) => {
                     bail!("protocol violation: expected a command, got {resp:?} instead")

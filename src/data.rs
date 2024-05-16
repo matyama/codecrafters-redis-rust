@@ -7,6 +7,8 @@ use crate::cmd::{self, Command};
 use crate::writer::{DataSerializer, Serializer as _};
 use crate::{rdb, Error, ANY};
 
+const NEG: &[u8] = b"-";
+
 // NOTE: immutable with cheap Clone impl
 #[derive(Debug, Clone)]
 pub enum DataType {
@@ -25,14 +27,20 @@ pub enum DataType {
 
 impl DataType {
     #[inline]
-    pub(crate) fn is_ok(&self) -> bool {
-        !matches!(
+    pub(crate) fn is_replicable(&self) -> bool {
+        !self.is_err() && !self.is_null()
+    }
+
+    #[inline]
+    pub(crate) fn is_err(&self) -> bool {
+        matches!(self, Self::SimpleError(_) | Self::BulkError(_))
+    }
+
+    #[inline]
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(
             self,
-            Self::Null
-                | Self::NullBulkString
-                | Self::NullBulkError
-                | Self::SimpleError(_)
-                | Self::BulkError(_)
+            Self::Null | Self::NullBulkString | Self::NullBulkError
         )
     }
 
@@ -116,9 +124,16 @@ impl TryFrom<DataType> for u64 {
         use {rdb::String::*, DataType::*};
         match data {
             Integer(i) if i > 0 => Ok(i as u64),
+            Integer(_) => Err(Error::VAL_NEG_INT),
             SimpleString(Int8(i)) | BulkString(Int8(i)) if i >= 0 => Ok(i as u64),
+            SimpleString(Int8(_)) | BulkString(Int8(_)) => Err(Error::VAL_NEG_INT),
             SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
-            SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as u64),
+            SimpleString(Int16(_)) | BulkString(Int16(_)) => Err(Error::VAL_NEG_INT),
+            SimpleString(Int32(i)) | BulkString(Int32(i)) if i >= 0 => Ok(i as u64),
+            SimpleString(Int32(_)) | BulkString(Int32(_)) => Err(Error::VAL_NEG_INT),
+            SimpleString(Str(s)) | BulkString(Str(s)) if s.starts_with(NEG) => {
+                Err(Error::VAL_NEG_INT)
+            }
             SimpleString(Str(s)) | BulkString(Str(s)) => s.parse(),
             _ => Err(Error::VAL_NOT_INT),
         }

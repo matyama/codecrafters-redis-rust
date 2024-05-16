@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::data::{DataExt, DataType};
-use crate::{stream, Error, FUTURE};
+use crate::data::{DataExt, DataType, Keys};
+use crate::{stream, Command, Error, FUTURE};
 
+const CMD: &str = "xread";
 const BLOCK: Bytes = Bytes::from_static(b"BLOCK");
 const COUNT: Bytes = Bytes::from_static(b"COUNT");
 
@@ -116,7 +117,12 @@ impl TryFrom<&[DataType]> for Options {
                     return Err(Error::NotInt("timeout"));
                 };
 
-                let ms = u64::try_from(ms).map_err(|_| Error::err("timeout is negative"))?;
+                let ms = u64::try_from(ms).map_err(|err| match err {
+                    Error::NotInt(_) => Error::err("timeout is not an integer or out of range"),
+                    Error::NegInt(_) => Error::err("timeout is negative"),
+                    err => unreachable!("u64::try_from(ms) returned unexpected {err:?}"),
+                })?;
+
                 ops.block.replace(Duration::from_millis(ms));
 
                 continue;
@@ -197,6 +203,59 @@ impl Iterator for OptionsBytesIter {
         }
 
         None
+    }
+}
+
+#[derive(Debug)]
+pub struct XRead(pub Options, pub Keys, pub Ids);
+
+impl TryFrom<&[DataType]> for XRead {
+    type Error = Error;
+
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        // min command: XREAD STREAMS <key> <id>
+        if args.len() < 3 {
+            return Err(Error::WrongNumArgs(CMD));
+        }
+
+        let ops = Options::try_from(args)?;
+
+        // check for the STREAMS keyword
+        match args.get(ops.len()) {
+            None => return Err(Error::WrongNumArgs(CMD)),
+            Some(arg) if !arg.matches(STREAMS) => return Err(Error::Syntax),
+            _ => {}
+        }
+
+        // skip over options (including STREAMS)
+        let args = &args[ops.len() + 1..];
+
+        match args.len() {
+            0 => return Err(Error::Syntax),
+            1 => return Err(Error::WrongNumArgs(CMD)),
+            n if n % 2 != 0 => {
+                // XXX: potentially generalizable to an Error variant
+                let err = format!(
+                    "Unbalanced '{CMD}' list of streams: \
+                    for each stream key an ID or '$' must be specified."
+                );
+                return Err(Error::err(err));
+            }
+            _ => {}
+        }
+
+        let (keys, ids) = args.split_at(args.len() / 2);
+        let keys = Keys::try_from(keys)?;
+        let ids = Ids::try_from(ids)?;
+
+        Ok(XRead(ops, keys, ids))
+    }
+}
+
+impl From<XRead> for Command {
+    #[inline]
+    fn from(XRead(ops, keys, ids): XRead) -> Self {
+        Self::XRead(ops, keys, ids)
     }
 }
 

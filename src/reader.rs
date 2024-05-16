@@ -13,7 +13,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::cmd::{self, xrange, xread};
-use crate::data::{DataExt, DataType, Keys};
+use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
 use crate::stream;
@@ -292,6 +292,7 @@ where
             _ => return Ok(Some((data.into(), bytes_read))),
         };
 
+        // TODO: decompose
         let cmd = match cmd.as_slice() {
             b"OK" => return Ok(Some((DataType::str(OK).into(), bytes_read))),
 
@@ -402,37 +403,10 @@ where
                 Command::XRange(key, range, count)
             }
 
-            b"XREAD" => {
-                let ops = cmd::xread::Options::try_from(args).context("XREAD: parse options")?;
-                let mut args = &args[ops.len()..];
-
-                match args.first().cloned() {
-                    Some(DataType::BulkString(s) | DataType::SimpleString(s))
-                        if s.matches(xread::STREAMS) =>
-                    {
-                        args = &args[1..]
-                    }
-                    // TODO: ERR Syntax error
-                    arg => bail!("XREAD expects a STREAMS keyword, got {arg:?}"),
-                }
-
-                ensure!(
-                    !args.is_empty(),
-                    "ERR wrong number of arguments for 'xread' command"
-                );
-
-                ensure!(
-                    args.len() % 2 == 0,
-                    "ERR Unbalanced 'xread' list of streams: \
-                    for each stream key an ID or '$' must be specified.",
-                );
-
-                let (keys, ids) = args.split_at(args.len() / 2);
-                let keys = Keys::try_from(keys).context("XREAD")?;
-                let ids = xread::Ids::try_from(ids).context("XREAD")?;
-
-                Command::XRead(ops, keys, ids)
-            }
+            b"XREAD" => match xread::XRead::try_from(args) {
+                Ok(xread) => Command::from(xread),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
+            },
 
             b"XLEN" => match args.first().cloned() {
                 Some(DataType::BulkString(len) | DataType::SimpleString(len)) => Command::XLen(len),
