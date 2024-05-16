@@ -16,8 +16,7 @@ use crate::cmd::{self, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
-use crate::stream;
-use crate::{Command, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
+use crate::{stream, Command, Error, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
 
 pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
 
@@ -410,8 +409,11 @@ where
 
             b"XLEN" => match args.first().cloned() {
                 Some(DataType::BulkString(len) | DataType::SimpleString(len)) => Command::XLen(len),
-                Some(arg) => bail!("XLEN only accepts bulk strings as key, got {arg:?}"),
-                None => bail!("XLEN requires an argument, got none"),
+                Some(arg) => bail!("XLEN key must be a string, got {arg:?}"),
+                None => {
+                    let err = Error::WrongNumArgs("xlen");
+                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
+                }
             },
 
             b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
