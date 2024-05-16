@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use reader::RDBFileReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -15,8 +14,8 @@ use repl::{ReplConnection, Replication};
 
 pub(crate) use cmd::Command;
 pub(crate) use config::Config;
-pub(crate) use data::DataType;
-pub(crate) use reader::DataReader;
+pub(crate) use data::{Args, DataType};
+pub(crate) use reader::{DataReader, RDBFileReader};
 pub(crate) use repl::{ReplId, ReplState, ReplicaSet, UNKNOWN_REPL_STATE};
 pub(crate) use store::Store;
 pub(crate) use writer::DataWriter;
@@ -83,6 +82,9 @@ pub enum Error {
     #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
     WrongType,
 
+    #[error("ERR unknown command '{cmd}', with args beginning with: {args}")]
+    UnknownCommand { cmd: String, args: String },
+
     #[error("ERR wrong number of arguments for '{0}' command")]
     WrongNumArgs(&'static str),
 
@@ -109,6 +111,14 @@ impl Error {
     #[inline]
     pub fn err(e: impl ToString) -> Self {
         Self::Err(e.to_string())
+    }
+
+    #[inline]
+    pub fn unkown_cmd(cmd: &DataType, args: &[DataType]) -> Self {
+        Self::UnknownCommand {
+            cmd: cmd.to_string(),
+            args: Args(args).to_string(),
+        }
     }
 }
 

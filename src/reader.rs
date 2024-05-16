@@ -281,18 +281,13 @@ where
         // println!("read {bytes_read}B of data: {data:?}");
 
         let (cmd, args): (_, &[DataType]) = match &data {
-            s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => (s.to_uppercase(), &[]),
-            DataType::Array(args) => {
-                let Some(arg) = args.first() else {
-                    bail!("protocol violation: no command found");
-                };
-                (arg.to_uppercase(), &args[1..])
-            }
+            s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => (s, &[]),
+            DataType::Array(args) => args.split_first().expect("cannot read an empty array"),
             _ => return Ok(Some((data.into(), bytes_read))),
         };
 
         // TODO: decompose
-        let cmd = match cmd.as_slice() {
+        let cmd = match cmd.to_uppercase().as_slice() {
             b"OK" => return Ok(Some((DataType::str(OK).into(), bytes_read))),
 
             b"PING" => match args.first().cloned() {
@@ -457,10 +452,10 @@ where
                 Command::FullResync(state)
             }
 
-            cmd => bail!(
-                "protocol violation: unsupported command '{}'",
-                String::from_utf8_lossy(cmd)
-            ),
+            _ => {
+                let err = DataType::err(Error::unkown_cmd(cmd, args));
+                return Ok(Some((Resp::from(err), bytes_read)));
+            }
         };
 
         Ok(Some((cmd.into(), bytes_read)))

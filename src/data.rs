@@ -117,6 +117,26 @@ impl DataType {
     }
 }
 
+impl std::fmt::Display for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null | Self::NullBulkString | Self::NullBulkError => Ok(()),
+            Self::Boolean(b) => write!(f, "{b}"),
+            Self::Integer(i) => write!(f, "{i}"),
+            Self::SimpleString(s) | Self::BulkString(s) => write!(f, "{s}"),
+            Self::SimpleError(s) | Self::BulkError(s) => write!(f, "{s}"),
+            Self::Array(items) => write!(f, "{}", Args(items)),
+            Self::Map(items) => {
+                let len = items.len();
+                for (i, (key, val)) in items.iter().enumerate() {
+                    write!(f, "'{key}:{val}'{}", if i < len { " " } else { "" })?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 macro_rules! impl_try_from_data {
     ( $($int:ty),+ ) => {
         $(
@@ -148,6 +168,29 @@ macro_rules! impl_try_from_data {
 }
 
 impl_try_from_data!(u64, usize);
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Args<'a>(pub(crate) &'a [DataType]);
+
+impl std::ops::Deref for Args<'_> {
+    type Target = [DataType];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Args<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.len();
+        for (i, item) in self.iter().map(DataType::to_string).enumerate() {
+            write!(f, "'{item}'{}", if i < len { " " } else { "" })?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 #[repr(transparent)]

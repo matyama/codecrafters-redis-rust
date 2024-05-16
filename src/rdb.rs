@@ -111,6 +111,17 @@ impl From<Bytes> for String {
     }
 }
 
+impl std::fmt::Display for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Str(s) => write!(f, "{}", std::string::String::from_utf8_lossy(s)),
+            Self::Int8(i) => write!(f, "{i}"),
+            Self::Int16(i) => write!(f, "{i}"),
+            Self::Int32(i) => write!(f, "{i}"),
+        }
+    }
+}
+
 pub async fn read_string<R>(reader: &mut R, buf: &mut BytesMut) -> io::Result<(String, usize)>
 where
     R: AsyncReadExt + Unpin,
