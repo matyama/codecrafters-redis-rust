@@ -85,6 +85,9 @@ pub enum Error {
     #[error("ERR unknown command '{cmd}', with args beginning with: {args}")]
     UnknownCommand { cmd: String, args: String },
 
+    #[error("ERR unknown subcommand '{cmd}'. Try {help}.")]
+    UnknownSubCommand { cmd: String, help: &'static str },
+
     #[error("ERR wrong number of arguments for '{0}' command")]
     WrongNumArgs(&'static str),
 
@@ -118,6 +121,14 @@ impl Error {
         Self::UnknownCommand {
             cmd: cmd.to_string(),
             args: Args(args).to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn unkown_subcmd(cmd: &DataType, help: &'static str) -> Self {
+        Self::UnknownSubCommand {
+            cmd: cmd.to_string(),
+            help,
         }
     }
 }

@@ -12,11 +12,11 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, xadd, xrange, xread};
+use crate::cmd::{self, config, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
-use crate::{Command, Error, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
+use crate::{Command, Error, RDBData, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
 
 pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
 
@@ -304,26 +304,10 @@ where
                 None => bail!("ECHO requires an argument, got none"),
             },
 
-            b"CONFIG" => {
-                let Some(arg) = args.first() else {
-                    bail!("protocol violation: CONFIG without arguments");
-                };
-
-                if !arg.matches(GET) {
-                    bail!("protocol violation: expected 'CONFIG GET ...', got {arg:?}");
-                };
-
-                let params = args
-                    .iter()
-                    .skip(1)
-                    .filter_map(|arg| match arg {
-                        DataType::BulkString(s) | DataType::SimpleString(s) => s.bytes(),
-                        _ => None,
-                    })
-                    .collect();
-
-                Command::Config(params)
-            }
+            b"CONFIG" => match config::ConfigGet::try_from(args) {
+                Ok(get) => Command::from(get),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
+            },
 
             b"INFO" => {
                 let sections = args

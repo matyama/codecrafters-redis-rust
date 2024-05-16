@@ -14,6 +14,7 @@ use crate::{
     PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN, XRANGE, XREAD,
 };
 
+pub mod config;
 pub mod info;
 pub mod replconf;
 pub mod set;
@@ -53,10 +54,6 @@ impl Command {
             Self::Ping(msg) => msg.map_or(DataType::str(PONG), DataType::BulkString),
 
             Self::Echo(msg) => DataType::string(msg),
-
-            Self::Config(params) if params.is_empty() => {
-                DataType::err("ERR wrong number of arguments for 'config|get' command")
-            }
 
             Self::Config(params) => {
                 let items = params.iter().filter_map(|param| {
