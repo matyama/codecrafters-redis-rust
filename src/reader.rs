@@ -288,6 +288,7 @@ where
 
         // TODO: decompose
         let cmd = match cmd.to_uppercase().as_slice() {
+            // TODO: move to "other" (i.e., internal)
             b"OK" => return Ok(Some((DataType::str(OK).into(), bytes_read))),
 
             b"PING" => match args.first().cloned() {
@@ -296,12 +297,16 @@ where
                 Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
             },
 
+            // TODO: move to "other" (i.e., internal)
             b"PONG" => return Ok(Some((DataType::str(PONG).into(), bytes_read))),
 
             b"ECHO" => match args.first().cloned() {
                 Some(DataType::BulkString(msg)) => Command::Echo(msg),
                 Some(arg) => bail!("ECHO only accepts bulk strings as argument, got {arg:?}"),
-                None => bail!("ECHO requires an argument, got none"),
+                None => {
+                    let err = Error::WrongNumArgs("echo");
+                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
+                }
             },
 
             b"CONFIG" => match config::ConfigGet::try_from(args) {
@@ -324,19 +329,28 @@ where
             b"TYPE" => match args.first().cloned() {
                 Some(DataType::BulkString(key) | DataType::SimpleString(key)) => Command::Type(key),
                 Some(arg) => bail!("TYPE only accepts strings as argument, got {arg:?}"),
-                None => bail!("TYPE requires an argument, got none"),
+                None => {
+                    let err = Error::WrongNumArgs("type");
+                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
+                }
             },
 
             b"KEYS" => match args.first().cloned() {
                 Some(DataType::BulkString(pattern)) => Command::Keys(pattern),
                 Some(arg) => bail!("KEYS only accepts bulk strings as argument, got {arg:?}"),
-                None => bail!("KEYS requires an argument, got none"),
+                None => {
+                    let err = Error::WrongNumArgs("keys");
+                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
+                }
             },
 
             b"GET" => match args.first().cloned() {
                 Some(DataType::BulkString(key)) => Command::Get(key),
                 Some(arg) => bail!("GET only accepts bulk strings as argument, got {arg:?}"),
-                None => bail!("GET requires an argument, got none"),
+                None => {
+                    let err = Error::WrongNumArgs("get");
+                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
+                }
             },
 
             b"SET" => match (args.first().cloned(), args.get(1).cloned()) {
