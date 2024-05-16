@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, config, xadd, xrange, xread};
+use crate::cmd::{self, config, set, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -353,16 +353,9 @@ where
                 }
             },
 
-            b"SET" => match (args.first().cloned(), args.get(1).cloned()) {
-                (Some(DataType::BulkString(key)), Some(DataType::BulkString(val))) => {
-                    let ops = cmd::set::Options::try_from(&args[2..])
-                        .with_context(|| format!("SET {key:?} {val:?} [options]"))?;
-                    Command::Set(key, rdb::Value::String(val), ops)
-                }
-                (Some(key), None) => bail!("SET {key:?} _ is missing a value argument"),
-                (None, Some(val)) => bail!("SET _ {val:?} is missing a key argument"),
-                (None, None) => bail!("SET requires two arguments, got none"),
-                args => bail!("protocol violation: SET with invalid argument types {args:?}"),
+            b"SET" => match set::Set::try_from(args) {
+                Ok(set) => Command::from(set),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
             },
 
             b"XADD" => match xadd::XAdd::try_from(args) {

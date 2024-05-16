@@ -1,9 +1,10 @@
-use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 use tokio::time::Duration;
 
 use crate::data::{DataExt as _, DataType};
-use crate::{EMPTY, GET};
+use crate::{rdb, Command, Error, EMPTY, GET};
+
+const CMD: &str = "set";
 
 const EX: Bytes = Bytes::from_static(b"EX");
 const PX: Bytes = Bytes::from_static(b"PX");
@@ -88,6 +89,21 @@ impl Iterator for ExpiryBytesIter {
     }
 }
 
+trait IsExpiry {
+    fn is_expiry(&self) -> bool;
+}
+
+impl IsExpiry for DataType {
+    #[inline]
+    fn is_expiry(&self) -> bool {
+        self.matches(KEEPTTL)
+            || self.matches(EX)
+            || self.matches(PX)
+            || self.matches(EXAT)
+            || self.matches(PXAT)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Condition {
     /// Only set the key if it does not already exist
@@ -135,36 +151,46 @@ pub struct Options {
 
 impl Options {
     #[inline]
-    pub fn with_ex(&mut self, ex: u64) -> Result<()> {
-        ensure!(self.exp.is_none(), "conflicting option {:?}", self.exp);
+    pub fn with_ex(&mut self, ex: u64) -> Result<(), Error> {
+        if self.exp.is_some() {
+            return Err(Error::Syntax);
+        }
         self.exp = Some(Expiry::EX(Duration::from_secs(ex)));
         Ok(())
     }
 
     #[inline]
-    pub fn with_px(&mut self, px: u64) -> Result<()> {
-        ensure!(self.exp.is_none(), "conflicting option {:?}", self.exp);
+    pub fn with_px(&mut self, px: u64) -> Result<(), Error> {
+        if self.exp.is_some() {
+            return Err(Error::Syntax);
+        }
         self.exp = Some(Expiry::PX(Duration::from_millis(px)));
         Ok(())
     }
 
     #[inline]
-    pub fn with_keep_ttl(&mut self) -> Result<()> {
-        ensure!(self.exp.is_none(), "conflicting option {:?}", self.exp);
+    pub fn with_keep_ttl(&mut self) -> Result<(), Error> {
+        if self.exp.is_some() {
+            return Err(Error::Syntax);
+        }
         self.exp = Some(Expiry::KeepTTL);
         Ok(())
     }
 
     #[inline]
-    pub fn with_nx(&mut self) -> Result<()> {
-        ensure!(self.cond.is_none(), "conflicting option {:?}", self.cond);
+    pub fn with_nx(&mut self) -> Result<(), Error> {
+        if self.cond.is_some() {
+            return Err(Error::Syntax);
+        }
         self.cond = Some(Condition::NX);
         Ok(())
     }
 
     #[inline]
-    pub fn with_xx(&mut self) -> Result<()> {
-        ensure!(self.cond.is_none(), "conflicting option {:?}", self.exp);
+    pub fn with_xx(&mut self) -> Result<(), Error> {
+        if self.cond.is_some() {
+            return Err(Error::Syntax);
+        }
         self.cond = Some(Condition::XX);
         Ok(())
     }
@@ -184,46 +210,63 @@ impl Options {
 }
 
 impl TryFrom<&[DataType]> for Options {
-    type Error = anyhow::Error;
+    type Error = Error;
 
-    fn try_from(args: &[DataType]) -> Result<Self> {
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         let mut ops = Options::default();
 
         let mut args = args.iter().cloned();
 
         while let Some(arg) = args.next() {
-            // TODO: match individually and deprecate `to_uppercase`
-            match arg.to_uppercase().as_slice() {
-                b"NX" => ops.with_nx()?,
-                b"XX" => ops.with_xx()?,
-                b"GET" => ops.with_get(),
-                o @ b"EX" | o @ b"PX" | o @ b"EXAT" | o @ b"PXAT" => {
-                    let Some(arg) = args.next() else {
-                        bail!(
-                            "syntax error: {} _ is missing an argument",
-                            std::str::from_utf8(o).unwrap_or_default()
-                        )
-                    };
-
-                    // NOTE: this is a rather defensive parsing
-                    match arg.parse_int()? {
-                        DataType::Integer(int) if int.is_positive() => match o {
-                            b"EX" => ops.with_ex(int as u64)?,
-                            b"PX" => ops.with_px(int as u64)?,
-                            b"EXAT" => bail!("option EXAT isn't currently supported"),
-                            b"PXAT" => bail!("option PXAT isn't currently supported"),
-                            _ => unreachable!("checked above"),
-                        },
-
-                        arg => bail!(
-                            "syntax error: {} {arg:?} is invalid",
-                            std::str::from_utf8(o).unwrap_or_default()
-                        ),
-                    }
-                }
-                b"KEEPTTL" => ops.with_keep_ttl()?,
-                _ => bail!("syntax error: {arg:?} is invalid"),
+            if arg.matches(NX) {
+                ops.with_nx()?;
+                continue;
             }
+
+            if arg.matches(XX) {
+                ops.with_xx()?;
+                continue;
+            }
+
+            if arg.matches(GET) {
+                ops.with_get();
+                continue;
+            }
+
+            if ops.exp.is_some() {
+                return Err(Error::Syntax);
+            }
+
+            if arg.matches(KEEPTTL) {
+                ops.with_keep_ttl()?;
+                continue;
+            }
+
+            let Some(val) = args.next() else {
+                return Err(Error::Syntax);
+            };
+
+            let val = u64::try_from(val).map_err(|e| match e {
+                Error::NotInt(_) if args.any(|a| a.is_expiry()) => Error::Syntax,
+                Error::NegInt(_) => Error::err("invalid expire time in 'set' command"),
+                e => e,
+            })?;
+
+            if arg.matches(EX) {
+                ops.with_ex(val)?;
+                continue;
+            }
+
+            if arg.matches(PX) {
+                ops.with_px(val)?;
+                continue;
+            }
+
+            if arg.matches(EXAT) || arg.matches(PXAT) {
+                unimplemented!("option EXAT/PXAT isn't currently supported");
+            }
+
+            return Err(Error::Syntax);
         }
 
         Ok(ops)
@@ -259,6 +302,38 @@ impl Iterator for OptionsBytesIter {
         }
 
         get.take()
+    }
+}
+
+#[derive(Debug)]
+pub struct Set(rdb::String, rdb::Value, Options);
+
+impl TryFrom<&[DataType]> for Set {
+    type Error = Error;
+
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        let [key, val, ..] = args else {
+            return Err(Error::WrongNumArgs(CMD));
+        };
+
+        let (DataType::BulkString(key) | DataType::SimpleString(key)) = key.clone() else {
+            return Err(Error::err("SET key must be a string"));
+        };
+
+        let (DataType::BulkString(val) | DataType::SimpleString(val)) = val.clone() else {
+            return Err(Error::err("SET value must be a string"));
+        };
+
+        let ops = Options::try_from(&args[2..])?;
+
+        Ok(Set(key, rdb::Value::String(val), ops))
+    }
+}
+
+impl From<Set> for Command {
+    #[inline]
+    fn from(Set(key, val, ops): Set) -> Self {
+        Self::Set(key, val, ops)
     }
 }
 
