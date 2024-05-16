@@ -1,10 +1,13 @@
 use bytes::Bytes;
 
 use crate::data::{DataExt, DataType};
-use crate::ANY;
+use crate::stream::{Entry, EntryArg};
+use crate::{rdb, Command, Error, ANY};
 
+const CMD: &str = "xadd";
 const NOMKSTREAM: Bytes = Bytes::from_static(b"NOMKSTREAM");
 
+// TODO: support other XADD options: MAXLEN/MINID, LIMIT
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub(crate) no_mkstream: bool,
@@ -27,7 +30,7 @@ impl Options {
 }
 
 impl TryFrom<&[DataType]> for Options {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         let mut ops = Options::default();
@@ -60,5 +63,36 @@ impl Iterator for OptionsBytesIter {
         let Self(no_mkstream) = self;
 
         no_mkstream.take()
+    }
+}
+
+#[derive(Debug)]
+pub struct XAdd(rdb::String, EntryArg, Options);
+
+impl TryFrom<&[DataType]> for XAdd {
+    type Error = Error;
+
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        let Some((key, args)) = args.split_first() else {
+            return Err(Error::WrongNumArgs(CMD));
+        };
+
+        let (DataType::BulkString(key) | DataType::SimpleString(key)) = key else {
+            return Err(Error::err("XADD stream key must be a string"));
+        };
+
+        let ops = Options::try_from(args)?;
+
+        debug_assert_eq!(EntryArg::DEFAULT_CMD, CMD);
+        let entry = Entry::try_from(&args[ops.len()..])?;
+
+        Ok(Self(key.clone(), entry, ops))
+    }
+}
+
+impl From<XAdd> for Command {
+    #[inline]
+    fn from(XAdd(key, entry, ops): XAdd) -> Self {
+        Self::XAdd(key, entry, ops)
     }
 }

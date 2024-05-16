@@ -291,8 +291,10 @@ impl Store {
         entry: stream::EntryArg,
         ops: xadd::Options,
     ) -> XResult<stream::StreamId> {
-        if ops.no_mkstream {
-            return Ok(None);
+        if entry.id.is_zero() {
+            return Err(Error::err(
+                "The ID specified in XADD must be greater than 0-0",
+            ));
         }
 
         let store = self.0.read().await;
@@ -305,6 +307,10 @@ impl Store {
                 let rdb::Value::Stream(s) = data else {
                     return Err(Error::WrongType);
                 };
+
+                if ops.no_mkstream {
+                    return Ok(None);
+                }
 
                 let mut s = s.lock().await;
 
@@ -326,6 +332,8 @@ impl Store {
 
                 Ok(Some(s.last_entry))
             }
+
+            Entry::Vacant(_) if ops.no_mkstream => Ok(None),
 
             Entry::Vacant(e) => {
                 let entry = entry.next(None);

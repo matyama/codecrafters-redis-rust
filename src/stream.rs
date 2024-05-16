@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, fmt::Write};
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
-use crate::{rdb, DataType};
+use crate::{rdb, DataType, Error};
 
 fn timestamp_ms() -> u64 {
     SystemTime::now()
@@ -48,11 +48,6 @@ pub struct AutoId {
 }
 
 impl AutoId {
-    pub const ZERO: AutoId = AutoId {
-        ms: Some(0),
-        seq: Seq::Some(0),
-    };
-
     #[inline]
     pub const fn at(ms: u64) -> Self {
         Self {
@@ -63,7 +58,13 @@ impl AutoId {
 
     #[inline]
     pub fn is_zero(&self) -> bool {
-        *self == Self::ZERO
+        matches!(
+            self,
+            Self {
+                ms: Some(0),
+                seq: Seq::Some(0) | Seq::None
+            }
+        )
     }
 
     pub(crate) fn next(self, last: Option<StreamId>) -> StreamId {
@@ -405,6 +406,8 @@ pub struct Entry<Id = StreamId> {
 pub type EntryArg = Entry<AutoId>;
 
 impl Entry<AutoId> {
+    pub(crate) const DEFAULT_CMD: &'static str = "xadd";
+
     #[inline]
     pub(crate) fn next(self, last: Option<StreamId>) -> Entry {
         Entry {
@@ -415,33 +418,34 @@ impl Entry<AutoId> {
 }
 
 impl TryFrom<&[DataType]> for Entry<AutoId> {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
         let num_fields = (args.len() - 1) / 2;
-        let mut args = args.iter().cloned();
 
-        let id = match args.next() {
-            Some(arg) => AutoId::try_from(arg)?,
-            None => bail!("XADD requires an <* | id> argument, got none"),
+        let Some((arg, args)) = args.split_first() else {
+            return Err(Error::WrongNumArgs(Self::DEFAULT_CMD));
         };
+
+        let id = AutoId::try_from(arg).map_err(|_| Error::err(ParseIdError::Invalid))?;
 
         // NOTE: keys can only be `rdb::String`s which are immutable (just ref counted)
         #[allow(clippy::mutable_key_type)]
         let mut fields = HashMap::with_capacity(num_fields);
 
+        let mut args = args.iter().cloned();
+
         while let Some(key) = args.next() {
             let (DataType::BulkString(key) | DataType::SimpleString(key)) = key else {
-                bail!("field key must be a string, got {key:?}");
+                return Err(Error::err("field key must be a string"));
             };
 
             let Some(val) = args.next() else {
-                bail!("encountered field {key:?} without a pairing value");
+                return Err(Error::WrongNumArgs(Self::DEFAULT_CMD));
             };
 
-            // TODO: relax this restriction
             let (DataType::BulkString(val) | DataType::SimpleString(val)) = val else {
-                bail!("field value must be a string, got {val:?}");
+                return Err(Error::err("field value be a string"));
             };
 
             let val = rdb::Value::String(val);

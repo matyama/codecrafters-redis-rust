@@ -12,11 +12,11 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, xrange, xread};
+use crate::cmd::{self, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
-use crate::{stream, Command, Error, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
+use crate::{Command, Error, RDBData, Resp, CRLF, FULLRESYNC, GET, LF, OK, PONG};
 
 pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
 
@@ -372,22 +372,10 @@ where
                 args => bail!("protocol violation: SET with invalid argument types {args:?}"),
             },
 
-            // TODO: support options
-            b"XADD" => {
-                let key = match args.first().cloned() {
-                    Some(DataType::BulkString(key) | DataType::SimpleString(key)) => key,
-                    Some(arg) => bail!("XADD only accepts bulk strings as key, got {arg:?}"),
-                    None => bail!("XADD requires an argument, got none"),
-                };
-
-                let ops =
-                    cmd::xadd::Options::try_from(&args[1..]).context("XADD: parse options")?;
-
-                let entry =
-                    stream::Entry::try_from(&args[1 + ops.len()..]).context("XADD: parse entry")?;
-
-                Command::XAdd(key, entry, ops)
-            }
+            b"XADD" => match xadd::XAdd::try_from(args) {
+                Ok(xadd) => Command::from(xadd),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
+            },
 
             b"XRANGE" => match xrange::XRange::try_from(args) {
                 Ok(xrange) => Command::from(xrange),
