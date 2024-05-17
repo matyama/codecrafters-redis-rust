@@ -140,27 +140,36 @@ impl std::fmt::Display for DataType {
 macro_rules! impl_try_from_data {
     ( $($int:ty),+ ) => {
         $(
-            impl TryFrom<DataType> for $int {
+            impl TryFrom<&DataType> for $int {
                 type Error = Error;
 
-                fn try_from(data: DataType) -> Result<Self, Self::Error> {
+                fn try_from(data: &DataType) -> Result<Self, Self::Error> {
                     use {rdb::String::*, DataType::*};
                     match data {
-                        Integer(i) if i > 0 => Ok(i as $int),
+                        Integer(i) if *i > 0 => Ok(*i as $int),
                         Integer(_) => Err(Error::VAL_NEG_INT),
-                        SimpleString(Int8(i)) | BulkString(Int8(i)) if i >= 0 => Ok(i as $int),
+                        SimpleString(Int8(i)) | BulkString(Int8(i)) if *i >= 0 => Ok(*i as $int),
                         SimpleString(Int8(_)) | BulkString(Int8(_)) => Err(Error::VAL_NEG_INT),
-                        SimpleString(Int16(i)) | BulkString(Int16(i)) if i >= 0 => Ok(i as $int),
+                        SimpleString(Int16(i)) | BulkString(Int16(i)) if *i >= 0 => Ok(*i as $int),
                         SimpleString(Int16(_)) | BulkString(Int16(_)) => Err(Error::VAL_NEG_INT),
-                        SimpleString(Int32(i)) | BulkString(Int32(i)) if i >= 0 => Ok(i as $int),
+                        SimpleString(Int32(i)) | BulkString(Int32(i)) if *i >= 0 => Ok(*i as $int),
                         SimpleString(Int32(_)) | BulkString(Int32(_)) => Err(Error::VAL_NEG_INT),
                         SimpleString(Str(s)) | BulkString(Str(s))
                             if s.starts_with(NEG) && s != NEG => {
                                 Err(Error::VAL_NEG_INT)
                             }
-                        SimpleString(Str(s)) | BulkString(Str(s)) => s.parse(),
+                        SimpleString(Str(s)) | BulkString(Str(s)) => s.as_ref().parse(),
                         _ => Err(Error::VAL_NOT_INT),
                     }
+                }
+            }
+
+            impl TryFrom<DataType> for $int {
+                type Error = Error;
+
+                #[inline]
+                fn try_from(data: DataType) -> Result<Self, Self::Error> {
+                    (&data).try_into()
                 }
             }
         )+

@@ -18,6 +18,7 @@ pub mod config;
 pub mod info;
 pub mod replconf;
 pub mod set;
+pub mod wait;
 pub mod xadd;
 pub mod xrange;
 pub mod xread;

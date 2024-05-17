@@ -4,7 +4,6 @@ use std::io::ErrorKind;
 use std::num::{NonZeroU32, ParseIntError};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::time::Duration;
 use std::{fmt::Debug, path::Path};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -12,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, config, set, xadd, xrange, xread};
+use crate::cmd::{self, config, set, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -397,25 +396,9 @@ where
                 args => bail!("protocol violation: PSYNC with invalid argument types {args:?}"),
             },
 
-            b"WAIT" => match (args.first().cloned(), args.get(1).cloned()) {
-                (Some(num_replicas), Some(timeout)) => {
-                    let Ok(DataType::Integer(num_replicas)) = num_replicas.parse_int() else {
-                        bail!("protocol violation: WAIT with invalid numreplicas type");
-                    };
-
-                    ensure!(num_replicas >= 0, "WAIT: numreplicas must be non-negative");
-
-                    let Ok(DataType::Integer(timeout)) = timeout.parse_int() else {
-                        bail!("protocol violation: WAIT with invalid timeout type");
-                    };
-
-                    ensure!(timeout >= 0, "WAIT: timeout must be non-negative");
-
-                    Command::Wait(num_replicas as usize, Duration::from_millis(timeout as u64))
-                }
-                (Some(num_replicas), None) => bail!("WAIT {num_replicas:?} _ is missing timeout"),
-                (None, Some(timeout)) => bail!("WAIT _ {timeout:?} is missing numreplicas"),
-                (None, None) => bail!("PSYNC requires two arguments, got none"),
+            b"WAIT" => match wait::Wait::try_from(args) {
+                Ok(wait) => Command::from(wait),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
             },
 
             // FULLRESYNC <REPL_ID> <REPL_OFFSET>
