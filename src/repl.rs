@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -14,9 +15,9 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
 use crate::cmd::replconf;
-use crate::data::{DataExt as _, DataType};
+use crate::data::{DataExt as _, DataType, ParseInt};
 use crate::rdb;
-use crate::{Command, DataReader, DataWriter, RDBData, Resp, TIMEOUT, UNKNOWN};
+use crate::{Command, DataReader, DataWriter, Error, RDBData, Resp, TIMEOUT, UNKNOWN};
 
 pub(crate) const UNKNOWN_REPL_STATE: ReplState = ReplState {
     repl_id: None,
@@ -28,12 +29,12 @@ pub(crate) const UNKNOWN_REPL_STATE: ReplState = ReplState {
 pub struct ReplId(Bytes);
 
 impl ReplId {
+    // NOTE: Redis does not seem to actually validate UTF-8 (alphanumeric) and the 40-character len
     #[inline]
-    pub fn new(repl_id: Bytes) -> Result<Option<ReplId>> {
+    pub fn new(repl_id: Bytes) -> Option<ReplId> {
         match repl_id.as_ref() {
-            b"?" => Ok(None),
-            id if id.is_ascii() && id.len() == 40 => Ok(Some(Self(repl_id))),
-            id => bail!("invalid REPL_ID: {id:?}"),
+            b"?" => None,
+            _ => Some(Self(repl_id)),
         }
     }
 }
@@ -60,11 +61,12 @@ impl Default for ReplId {
 }
 
 impl std::fmt::Display for ReplId {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Ok(repl_id) = std::str::from_utf8(&self.0) else {
-            unreachable!("REPL_ID is valid UTF-8 by construction");
-        };
-        f.write_str(repl_id)
+        match String::from_utf8_lossy(&self.0) {
+            Cow::Borrowed(repl_id) => f.write_str(repl_id),
+            Cow::Owned(repl_id) => write!(f, "{repl_id}"),
+        }
     }
 }
 
@@ -78,37 +80,26 @@ pub struct ReplState {
 
 impl<B> TryFrom<(Bytes, B)> for ReplState
 where
-    B: std::ops::Deref<Target = [u8]> + std::fmt::Debug,
+    B: ParseInt + std::fmt::Debug,
 {
-    type Error = anyhow::Error;
+    type Error = Error;
 
-    fn try_from((repl_id, repl_offset): (Bytes, B)) -> Result<Self> {
-        let repl_id = ReplId::new(repl_id)?;
-
-        let Ok(repl_offset) = std::str::from_utf8(&repl_offset) else {
-            bail!("non-UTF-8 REPL_OFFSET: {repl_offset:?}");
-        };
-
-        let Ok(repl_offset) = repl_offset.parse() else {
-            bail!("non-int REPL_OFFSET: {repl_offset}");
-        };
-
+    #[inline]
+    fn try_from((repl_id, repl_offset): (Bytes, B)) -> Result<Self, Self::Error> {
         Ok(ReplState {
-            repl_id,
-            repl_offset,
+            repl_id: ReplId::new(repl_id),
+            repl_offset: repl_offset.parse()?,
         })
     }
 }
 
 impl TryFrom<(rdb::String, rdb::String)> for ReplState {
-    type Error = anyhow::Error;
+    type Error = Error;
 
-    fn try_from((repl_id, repl_offset): (rdb::String, rdb::String)) -> Result<Self> {
+    fn try_from((repl_id, repl_offset): (rdb::String, rdb::String)) -> Result<Self, Self::Error> {
         use rdb::String::*;
 
-        let Some(repl_id) = repl_id.bytes() else {
-            bail!("invalid REPL_ID: {repl_id:?}");
-        };
+        let repl_id = repl_id.bytes().context("invalid REPL_ID")?;
 
         let repl_offset = match repl_offset {
             Str(repl_offset) => return (repl_id, repl_offset).try_into(),
@@ -118,7 +109,7 @@ impl TryFrom<(rdb::String, rdb::String)> for ReplState {
         };
 
         Ok(ReplState {
-            repl_id: ReplId::new(repl_id)?,
+            repl_id: ReplId::new(repl_id),
             repl_offset,
         })
     }

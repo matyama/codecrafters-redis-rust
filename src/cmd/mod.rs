@@ -16,6 +16,7 @@ use crate::{
 
 pub mod config;
 pub mod info;
+pub mod psync;
 pub mod replconf;
 pub mod set;
 pub mod wait;

@@ -226,8 +226,7 @@ impl Instance {
             let state = AtomicPtr::new(Box::into_raw(Box::new(ReplState {
                 repl_id: ReplId::new(Bytes::from_static(
                     b"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-                ))
-                .expect("valid REPL_ID"),
+                )),
                 repl_offset: 0,
             })));
 

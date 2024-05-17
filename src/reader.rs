@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, config, set, wait, xadd, xrange, xread};
+use crate::cmd::{self, config, psync, set, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -383,17 +383,9 @@ where
 
             b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
 
-            b"PSYNC" => match (args.first().cloned(), args.get(1).cloned()) {
-                (Some(DataType::BulkString(repl_id)), Some(DataType::BulkString(repl_offset))) => {
-                    let state = (repl_id.clone(), repl_offset.clone())
-                        .try_into()
-                        .with_context(|| format!("PSYNC {repl_id:?} {repl_offset:?}"))?;
-                    Command::PSync(state)
-                }
-                (Some(id), None) => bail!("PSYNC {id:?} _ is missing offset"),
-                (None, Some(offset)) => bail!("PSYNC _ {offset:?} is missing ID"),
-                (None, None) => bail!("PSYNC requires two arguments, got none"),
-                args => bail!("protocol violation: PSYNC with invalid argument types {args:?}"),
+            b"PSYNC" => match psync::PSync::try_from(args) {
+                Ok(psync) => Command::from(psync),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
             },
 
             b"WAIT" => match wait::Wait::try_from(args) {
