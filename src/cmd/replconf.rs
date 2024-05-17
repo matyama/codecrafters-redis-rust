@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 
 use crate::data::{DataExt as _, DataType};
-use crate::{rdb, ACK, GETACK};
+use crate::{rdb, Error, ACK, GETACK};
 
 #[derive(Clone, Debug)]
 pub enum Conf {
@@ -15,47 +14,44 @@ pub enum Conf {
 }
 
 impl TryFrom<&[DataType]> for Conf {
-    type Error = anyhow::Error;
+    type Error = Error;
 
-    fn try_from(args: &[DataType]) -> Result<Self> {
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        use {rdb::String::*, DataType::*};
+
         let mut capabilities = Vec::with_capacity(2);
 
         let mut args = args.iter().cloned();
 
         while let Some(key) = args.next() {
-            let (DataType::BulkString(key) | DataType::SimpleString(key)) = key else {
+            let (BulkString(key) | SimpleString(key)) = key else {
                 continue;
             };
 
             if key.matches(GETACK) {
-                match args.next() {
-                    Some(DataType::BulkString(dummy) | DataType::SimpleString(dummy)) => {
-                        let Some(dummy) = dummy.bytes() else {
-                            bail!("protocol violation: REPLCONF GETACK {dummy:?}");
-                        };
-                        return Ok(Self::GetAck(dummy));
-                    }
-                    other => bail!("protocol violation: REPLCONF GETACK {other:?}"),
-                }
+                return args
+                    .next()
+                    .and_then(|arg| match arg {
+                        BulkString(dummy) | SimpleString(dummy) => dummy.bytes(),
+                        _ => None,
+                    })
+                    .map(Self::GetAck)
+                    .ok_or(Error::Syntax);
             }
 
             if key.matches(ACK) {
                 let Some(offset) = args.next() else {
-                    bail!("protocol violation: REPLCONF ACK _ is missing an offset argument");
+                    return Err(Error::Syntax);
                 };
 
-                let offset = offset
-                    .parse_int()
-                    .context("protocol violation: REPLCONF ACK _ with an invalid offset")?;
-
-                let DataType::Integer(offset) = offset else {
+                let Integer(offset) = offset.parse_int()? else {
                     unreachable!("if parse_int succeeds, then only with integers");
                 };
 
                 return Ok(Self::Ack(offset as isize));
             }
 
-            let rdb::String::Str(key) = key else {
+            let Str(key) = key else {
                 continue;
             };
 
@@ -63,25 +59,24 @@ impl TryFrom<&[DataType]> for Conf {
             match key.as_ref() {
                 b"listening-port" => {
                     let Some(port) = args.next() else {
-                        bail!("protocol violation: REPLCONF {key:?} _ is missing an argument");
+                        return Err(Error::Syntax);
                     };
 
-                    match port.parse_int()? {
-                        DataType::Integer(port) if 0 <= port && port < (u16::MAX as i64) => {
-                            return Ok(Self::ListeningPort(port as u16));
-                        }
-                        other => bail!("protocol violation: REPLCONF {key:?} {other:?}"),
-                    }
+                    return match u64::try_from(port) {
+                        Ok(port) if port <= u16::MAX as u64 => Ok(Self::ListeningPort(port as u16)),
+                        Err(Error::NegInt(_)) => Ok(Self::ListeningPort(0)),
+                        _ => Err(Error::VAL_NOT_INT),
+                    };
                 }
 
                 b"capa" | b"capabilities" => match args.next() {
-                    Some(DataType::BulkString(capa) | DataType::SimpleString(capa)) => {
-                        let Some(capa) = capa.bytes() else {
-                            bail!("protocol violation: REPLCONF {key:?} {capa:?}");
-                        };
-                        capabilities.push(capa);
+                    Some(BulkString(capa) | SimpleString(capa)) => {
+                        if let Some(capa) = capa.bytes() {
+                            capabilities.push(capa);
+                        }
                     }
-                    other => bail!("protocol violation: REPLCONF {key:?} {other:?}"),
+                    Some(_) => continue,
+                    None => return Err(Error::Syntax),
                 },
 
                 _ => continue,
@@ -89,11 +84,10 @@ impl TryFrom<&[DataType]> for Conf {
         }
 
         // NOTE: in case of listening-port we return immediately
-        ensure!(
-            !capabilities.is_empty(),
-            "protocol violation: REPLCONF with unknown/unsupported arguments"
-        );
-
-        Ok(Self::Capabilities(capabilities.into()))
+        if capabilities.is_empty() {
+            Err(Error::Syntax)
+        } else {
+            Ok(Self::Capabilities(capabilities.into()))
+        }
     }
 }

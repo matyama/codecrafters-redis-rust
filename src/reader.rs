@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, config, set, sync, wait, xadd, xrange, xread};
+use crate::cmd::{config, replconf, set, sync, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -375,7 +375,10 @@ where
                 }
             },
 
-            b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
+            b"REPLCONF" => match replconf::Conf::try_from(args) {
+                Ok(conf) => Command::Replconf(conf),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
+            },
 
             b"PSYNC" => match sync::PSync::try_from(args) {
                 Ok(psync) => Command::from(psync),
