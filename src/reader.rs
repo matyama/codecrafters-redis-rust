@@ -282,22 +282,16 @@ where
         let (cmd, args): (_, &[DataType]) = match &data {
             s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => (s, &[]),
             DataType::Array(args) => args.split_first().expect("cannot read an empty array"),
-            _ => return Ok(Some((data.into(), bytes_read))),
+            _ => return Ok(Some((Resp::from(data), bytes_read))),
         };
 
         // TODO: decompose
         let cmd = match cmd.to_uppercase().as_slice() {
-            // TODO: move to "other" (i.e., internal)
-            b"OK" => return Ok(Some((DataType::str(OK).into(), bytes_read))),
-
             b"PING" => match args.first().cloned() {
                 None => Command::Ping(None),
                 Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
                 Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
             },
-
-            // TODO: move to "other" (i.e., internal)
-            b"PONG" => return Ok(Some((DataType::str(PONG).into(), bytes_read))),
 
             b"ECHO" => match args.first().cloned() {
                 Some(DataType::BulkString(msg)) => Command::Echo(msg),
@@ -393,19 +387,34 @@ where
                 Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
             },
 
-            // FULLRESYNC <REPL_ID> <REPL_OFFSET>
-            other if other.starts_with(&FULLRESYNC) => match sync::FullResync::try_from(cmd) {
-                Ok(resync) => Command::from(resync),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
             _ => {
-                let err = DataType::err(Error::unkown_cmd(cmd, args));
-                return Ok(Some((Resp::from(err), bytes_read)));
+                let resp = match Self::parse_internal(cmd, args) {
+                    Ok(resp) => resp,
+                    Err(err) => Resp::from(DataType::err(err)),
+                };
+                return Ok(Some((resp, bytes_read)));
             }
         };
 
-        Ok(Some((cmd.into(), bytes_read)))
+        Ok(Some((Resp::from(cmd), bytes_read)))
+    }
+
+    fn parse_internal(cmd: &DataType, args: &[DataType]) -> Result<Resp, Error> {
+        if cmd.matches(OK) {
+            return Ok(Resp::from(DataType::str(OK)));
+        }
+
+        if cmd.matches(PONG) {
+            return Ok(Resp::from(DataType::str(PONG)));
+        }
+
+        if cmd.prefixed(FULLRESYNC) {
+            return sync::FullResync::try_from(cmd)
+                .map(Command::from)
+                .map(Resp::from);
+        }
+
+        Err(Error::unkown_cmd(cmd, args))
     }
 
     async fn read_data(&mut self) -> Result<Option<(DataType, usize)>> {

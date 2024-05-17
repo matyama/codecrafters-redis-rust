@@ -290,6 +290,8 @@ pub trait DataExt {
 
     fn matches(&self, target: impl AsRef<[u8]>) -> bool;
 
+    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool;
+
     fn contains(&self, target: u8) -> bool;
 }
 
@@ -302,6 +304,11 @@ impl<'a> DataExt for &'a [u8] {
     #[inline]
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         matches(self, target)
+    }
+
+    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
+        let prefix = prefix.as_ref();
+        self.len() >= prefix.len() && matches(&self[..prefix.len()], prefix)
     }
 
     #[inline]
@@ -319,6 +326,11 @@ impl DataExt for Bytes {
     #[inline]
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         matches(self, target)
+    }
+
+    #[inline]
+    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
+        self.as_ref().prefixed(prefix)
     }
 
     #[inline]
@@ -350,6 +362,14 @@ impl DataExt for rdb::String {
     }
 
     #[inline]
+    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
+        match self {
+            Self::Str(s) => s.prefixed(prefix),
+            _ => false,
+        }
+    }
+
+    #[inline]
     fn contains(&self, target: u8) -> bool {
         match self {
             Self::Str(s) => s.contains(target),
@@ -376,6 +396,14 @@ impl DataExt for DataType {
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         match self {
             Self::BulkString(s) | Self::SimpleString(s) => s.matches(target),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
+        match self {
+            Self::BulkString(s) | Self::SimpleString(s) => s.prefixed(prefix),
             _ => false,
         }
     }
