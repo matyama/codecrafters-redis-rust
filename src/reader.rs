@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{self, config, psync, set, wait, xadd, xrange, xread};
+use crate::cmd::{self, config, set, sync, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -383,7 +383,7 @@ where
 
             b"REPLCONF" => cmd::replconf::Conf::try_from(args).map(Command::Replconf)?,
 
-            b"PSYNC" => match psync::PSync::try_from(args) {
+            b"PSYNC" => match sync::PSync::try_from(args) {
                 Ok(psync) => Command::from(psync),
                 Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
             },
@@ -394,29 +394,10 @@ where
             },
 
             // FULLRESYNC <REPL_ID> <REPL_OFFSET>
-            cmd if cmd.starts_with(&FULLRESYNC) => {
-                let args = cmd
-                    .strip_prefix(FULLRESYNC.as_ref())
-                    .expect("prefix checked above")
-                    .split(|b| b.is_ascii_whitespace())
-                    .collect::<Vec<_>>();
-
-                // NOTE: first split item is the residuum from stripping FULLRESYNC prefix
-                let [_, repl_id, repl_offset] = args[..] else {
-                    bail!(
-                        "protocol violation: FULLRESYNC requires two arguments, got {}",
-                        String::from_utf8_lossy(cmd)
-                    );
-                };
-
-                let repl_id = BytesMut::from(repl_id).freeze();
-
-                let state = (repl_id, repl_offset)
-                    .try_into()
-                    .with_context(|| format!("{}", String::from_utf8_lossy(cmd)))?;
-
-                Command::FullResync(state)
-            }
+            other if other.starts_with(&FULLRESYNC) => match sync::FullResync::try_from(cmd) {
+                Ok(resync) => Command::from(resync),
+                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
+            },
 
             _ => {
                 let err = DataType::err(Error::unkown_cmd(cmd, args));

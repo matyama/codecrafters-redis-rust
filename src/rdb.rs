@@ -83,6 +83,13 @@ impl From<std::string::String> for String {
     }
 }
 
+impl From<std::borrow::Cow<'_, str>> for String {
+    #[inline]
+    fn from(s: std::borrow::Cow<'_, str>) -> Self {
+        Self::from(s.to_string())
+    }
+}
+
 impl From<&'static str> for String {
     #[inline]
     fn from(s: &'static str) -> Self {
