@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{config, replconf, set, sync, wait, xadd, xrange, xread};
+use crate::cmd::{config, info, ping, replconf, set, sync, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
@@ -31,6 +31,28 @@ impl ReadError for std::io::Error {
             ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
         )
     }
+}
+
+macro_rules! cmd_try_from {
+    ($args:expr => $cmd:path as $name:expr) => {
+        match $args.first() {
+            Some(DataType::BulkString(arg) | DataType::SimpleString(arg)) => {
+                Resp::Cmd($cmd(arg.clone()))
+            }
+            Some(arg) => Resp::Data(DataType::err(Error::err(format!(
+                "{} argument must be a string, got {arg:?}",
+                $name
+            )))),
+            None => Resp::Data(DataType::err(Error::WrongNumArgs($name))),
+        }
+    };
+
+    ($args:expr => $cmd:ty) => {
+        <$cmd>::try_from($args)
+            .map(Command::from)
+            .map_err(DataType::err)
+            .map_or_else(Resp::Data, Resp::Cmd)
+    };
 }
 
 pub struct DataReader<R> {
@@ -277,129 +299,34 @@ where
             return Ok(None);
         };
 
-        // println!("read {bytes_read}B of data: {data:?}");
-
         let (cmd, args): (_, &[DataType]) = match &data {
             s @ DataType::SimpleString(_) | s @ DataType::BulkString(_) => (s, &[]),
             DataType::Array(args) => args.split_first().expect("cannot read an empty array"),
             _ => return Ok(Some((Resp::from(data), bytes_read))),
         };
 
-        // TODO: decompose
-        let cmd = match cmd.to_uppercase().as_slice() {
-            b"PING" => match args.first().cloned() {
-                None => Command::Ping(None),
-                Some(DataType::BulkString(msg)) => Command::Ping(Some(msg)),
-                Some(arg) => bail!("PING only accepts bulk strings as argument, got {arg:?}"),
-            },
-
-            b"ECHO" => match args.first().cloned() {
-                Some(DataType::BulkString(msg)) => Command::Echo(msg),
-                Some(arg) => bail!("ECHO only accepts bulk strings as argument, got {arg:?}"),
-                None => {
-                    let err = Error::WrongNumArgs("echo");
-                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
-                }
-            },
-
-            b"CONFIG" => match config::ConfigGet::try_from(args) {
-                Ok(get) => Command::from(get),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"INFO" => {
-                let sections = args
-                    .iter()
-                    .filter_map(|arg| match arg {
-                        DataType::BulkString(s) | DataType::SimpleString(s) => s.bytes(),
-                        _ => None,
-                    })
-                    .collect();
-
-                Command::Info(sections)
-            }
-
-            b"TYPE" => match args.first().cloned() {
-                Some(DataType::BulkString(key) | DataType::SimpleString(key)) => Command::Type(key),
-                Some(arg) => bail!("TYPE only accepts strings as argument, got {arg:?}"),
-                None => {
-                    let err = Error::WrongNumArgs("type");
-                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
-                }
-            },
-
-            b"KEYS" => match args.first().cloned() {
-                Some(DataType::BulkString(pattern)) => Command::Keys(pattern),
-                Some(arg) => bail!("KEYS only accepts bulk strings as argument, got {arg:?}"),
-                None => {
-                    let err = Error::WrongNumArgs("keys");
-                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
-                }
-            },
-
-            b"GET" => match args.first().cloned() {
-                Some(DataType::BulkString(key)) => Command::Get(key),
-                Some(arg) => bail!("GET only accepts bulk strings as argument, got {arg:?}"),
-                None => {
-                    let err = Error::WrongNumArgs("get");
-                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
-                }
-            },
-
-            b"SET" => match set::Set::try_from(args) {
-                Ok(set) => Command::from(set),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"XADD" => match xadd::XAdd::try_from(args) {
-                Ok(xadd) => Command::from(xadd),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"XRANGE" => match xrange::XRange::try_from(args) {
-                Ok(xrange) => Command::from(xrange),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"XREAD" => match xread::XRead::try_from(args) {
-                Ok(xread) => Command::from(xread),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"XLEN" => match args.first().cloned() {
-                Some(DataType::BulkString(len) | DataType::SimpleString(len)) => Command::XLen(len),
-                Some(arg) => bail!("XLEN key must be a string, got {arg:?}"),
-                None => {
-                    let err = Error::WrongNumArgs("xlen");
-                    return Ok(Some((Resp::from(DataType::err(err)), bytes_read)));
-                }
-            },
-
-            b"REPLCONF" => match replconf::Conf::try_from(args) {
-                Ok(conf) => Command::Replconf(conf),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"PSYNC" => match sync::PSync::try_from(args) {
-                Ok(psync) => Command::from(psync),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            b"WAIT" => match wait::Wait::try_from(args) {
-                Ok(wait) => Command::from(wait),
-                Err(err) => return Ok(Some((Resp::from(DataType::err(err)), bytes_read))),
-            },
-
-            _ => {
-                let resp = match Self::parse_internal(cmd, args) {
-                    Ok(resp) => resp,
-                    Err(err) => Resp::from(DataType::err(err)),
-                };
-                return Ok(Some((resp, bytes_read)));
-            }
+        let resp = match cmd.to_uppercase().as_slice() {
+            b"PING" => cmd_try_from!(args => ping::Ping),
+            b"ECHO" => cmd_try_from!(args => Command::Echo as "echo"),
+            b"CONFIG" => cmd_try_from!(args => config::ConfigGet),
+            b"INFO" => cmd_try_from!(args => info::InfoSections),
+            b"TYPE" => cmd_try_from!(args => Command::Type as "type"),
+            b"KEYS" => cmd_try_from!(args => Command::Keys as "keys"),
+            b"GET" => cmd_try_from!(args => Command::Get as "get"),
+            b"SET" => cmd_try_from!(args => set::Set),
+            b"XADD" => cmd_try_from!(args => xadd::XAdd),
+            b"XRANGE" => cmd_try_from!(args => xrange::XRange),
+            b"XREAD" => cmd_try_from!(args => xread::XRead),
+            b"XLEN" => cmd_try_from!(args => Command::XLen as "xlen"),
+            b"REPLCONF" => cmd_try_from!(args => replconf::Conf),
+            b"PSYNC" => cmd_try_from!(args => sync::PSync),
+            b"WAIT" => cmd_try_from!(args => wait::Wait),
+            _ => Self::parse_internal(cmd, args)
+                .map_err(DataType::err)
+                .unwrap_or_else(Resp::from),
         };
 
-        Ok(Some((Resp::from(cmd), bytes_read)))
+        Ok(Some((resp, bytes_read)))
     }
 
     fn parse_internal(cmd: &DataType, args: &[DataType]) -> Result<Resp, Error> {

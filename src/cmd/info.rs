@@ -1,4 +1,8 @@
-use crate::{Instance, ReplId, ReplState};
+use std::sync::Arc;
+
+use bytes::Bytes;
+
+use crate::{Command, DataType, Error, Instance, ReplId, ReplState};
 
 #[derive(Debug)]
 pub enum Role {
@@ -160,5 +164,32 @@ impl std::fmt::Display for Info {
             write!(f, "{}", replication)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct InfoSections(Arc<[Bytes]>);
+
+impl TryFrom<&[DataType]> for InfoSections {
+    type Error = Error;
+
+    fn try_from(args: &[DataType]) -> Result<Self, Self::Error> {
+        let sections = args
+            .iter()
+            .filter_map(|arg| match arg {
+                DataType::BulkString(s) | DataType::SimpleString(s) => s.bytes(),
+                _ => None,
+            })
+            .collect();
+
+        Ok(Self(sections))
+    }
+}
+
+impl From<InfoSections> for Command {
+    #[inline]
+    fn from(InfoSections(sections): InfoSections) -> Self {
+        Self::Info(sections)
     }
 }

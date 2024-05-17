@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::data::{DataExt as _, DataType};
-use crate::{rdb, Error, ACK, GETACK};
+use crate::{rdb, Command, Error, ACK, GETACK};
 
 #[derive(Clone, Debug)]
 pub enum Conf {
@@ -89,5 +89,12 @@ impl TryFrom<&[DataType]> for Conf {
         } else {
             Ok(Self::Capabilities(capabilities.into()))
         }
+    }
+}
+
+impl From<Conf> for Command {
+    #[inline]
+    fn from(conf: Conf) -> Self {
+        Self::Replconf(conf)
     }
 }
