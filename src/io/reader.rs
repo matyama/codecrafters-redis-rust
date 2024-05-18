@@ -13,9 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::cmd::{config, info, ping, replconf, set, sync, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
+use crate::io::CRLF;
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
-use crate::{resp::*, Command, Error, RDBData, Resp, CRLF};
+use crate::{resp::*, Command, Error, RDBData, Resp};
 
 const LF: u8 = b'\n'; // 10
 const MAGIC: &[u8] = b"REDIS";

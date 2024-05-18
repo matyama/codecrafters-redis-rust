@@ -15,23 +15,20 @@ use repl::{ReplConnection, Replication};
 pub(crate) use cmd::Command;
 pub(crate) use config::Config;
 pub(crate) use data::{Args, DataType};
-pub(crate) use reader::{DataReader, RDBFileReader};
+pub(crate) use io::{DataReader, DataWriter, RDBFileReader};
 pub(crate) use repl::{ReplId, ReplState, ReplicaSet, UNKNOWN_REPL_STATE};
 pub(crate) use store::Store;
-pub(crate) use writer::DataWriter;
 
 pub(crate) mod cmd;
 pub(crate) mod config;
 pub(crate) mod data;
+pub(crate) mod io;
 pub(crate) mod rdb;
-pub(crate) mod reader;
 pub(crate) mod repl;
 pub(crate) mod store;
 pub(crate) mod stream;
-pub(crate) mod writer;
 
 // TODO: introduce new mod io with reader and writer
-pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 
 pub(crate) mod resp {
     pub const PING: &[u8] = b"PING";

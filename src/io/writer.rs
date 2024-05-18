@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::{rdb, DataType, RDBData, CRLF};
+use crate::io::CRLF;
+use crate::{rdb, DataType, RDBData};
 
 const NULL: &[u8] = b"_\r\n";
 

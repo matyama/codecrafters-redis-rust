@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use bytes::Bytes;
 
 use crate::cmd::{self, Command};
-use crate::writer::{DataSerializer, Serializer as _};
+use crate::io::writer::{DataSerializer, Serializer as _};
 use crate::{rdb, Error};
 
 const NEG: &[u8] = b"-";
