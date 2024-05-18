@@ -65,6 +65,18 @@ where
                     self.buf.len()
                 }
 
+                // double: `,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n`
+                DataType::Double(double) => {
+                    self.buf.clear();
+                    if double.is_nan() {
+                        write!(self.buf, ",nan\r\n")?;
+                    } else {
+                        write!(self.buf, ",{double}\r\n")?;
+                    }
+                    self.writer.write_all(self.buf.as_bytes()).await?;
+                    self.buf.len()
+                }
+
                 // simple strings: `+<data>\r\n`
                 DataType::SimpleString(data) => self.write_simple(b'+', data).await?,
 
@@ -262,6 +274,10 @@ impl Serializer for DataSerializer {
             // integer: `:[<+|->]<value>\r\n`
             DataType::Integer(int) => write!(self.buf, ":{int}\r\n")?,
 
+            // double: `,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n`
+            DataType::Double(double) if double.is_nan() => write!(self.buf, ",nan\r\n")?,
+            DataType::Double(double) => write!(self.buf, ",{double}\r\n")?,
+
             // simple strings: `+<data>\r\n`
             DataType::SimpleString(data) => self.serialize_simple('+', data)?,
 
@@ -380,6 +396,19 @@ mod tests {
             DataType::Integer(-42) => b":-42\r\n",
             DataType::Integer(0) => b":0\r\n",
             DataType::Integer(42) => b":42\r\n"
+        }
+    }
+
+    #[test]
+    fn serialize_double() {
+        test_serialize! {
+            DataType::Double(-42.0) => b",-42\r\n",
+            DataType::Double(0.0) => b",0\r\n",
+            DataType::Double(42.0) => b",42\r\n",
+            DataType::Double(42.04E+1) => b",420.4\r\n",
+            DataType::Double(f64::INFINITY) => b",inf\r\n",
+            DataType::Double(f64::NEG_INFINITY) => b",-inf\r\n",
+            DataType::Double(f64::NAN) => b",nan\r\n"
         }
     }
 

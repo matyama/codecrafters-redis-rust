@@ -17,6 +17,7 @@ pub enum DataType {
     NullBulkError,
     Boolean(bool),
     Integer(i64),
+    Double(f64),
     SimpleString(rdb::String),
     SimpleError(rdb::String),
     BulkString(rdb::String),
@@ -125,6 +126,7 @@ impl std::fmt::Display for DataType {
             Self::Null | Self::NullBulkString | Self::NullBulkError => Ok(()),
             Self::Boolean(b) => write!(f, "{b}"),
             Self::Integer(i) => write!(f, "{i}"),
+            Self::Double(d) => write!(f, "{d}"),
             Self::SimpleString(s) | Self::BulkString(s) => write!(f, "{s}"),
             Self::SimpleError(s) | Self::BulkError(s) => write!(f, "{s}"),
             Self::Array(items) => write!(f, "{}", Args(items)),
@@ -150,6 +152,7 @@ macro_rules! impl_try_from_data {
                     match data {
                         Integer(i) if *i > 0 => Ok(*i as $int),
                         Integer(_) => Err(Error::VAL_NEG_INT),
+                        Double(_) => Err(Error::VAL_NOT_INT),
                         SimpleString(Int8(i)) | BulkString(Int8(i)) if *i >= 0 => Ok(*i as $int),
                         SimpleString(Int8(_)) | BulkString(Int8(_)) => Err(Error::VAL_NEG_INT),
                         SimpleString(Int16(i)) | BulkString(Int16(i)) if *i >= 0 => Ok(*i as $int),

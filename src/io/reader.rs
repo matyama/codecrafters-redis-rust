@@ -91,7 +91,7 @@ where
 
         println!("reading RDB file length");
 
-        let (Length::Some(len), _) = self.read_int().await.context("RDB file length")? else {
+        let (Length::Some(len), _) = self.read_num().await.context("RDB file length")? else {
             bail!("cannot read RDB file without content");
         };
 
@@ -341,9 +341,14 @@ where
             Ok(b'_') => self.read_null().await.map(|(x, n)| (x, n + 1)).map(Some),
             Ok(b'#') => self.read_bool().await.map(|(b, n)| (b, n + 1)).map(Some),
             Ok(b':') => self
-                .read_int()
+                .read_num()
                 .await
                 .map(|(i, n)| (DataType::Integer(i), n + 1))
+                .map(Some),
+            Ok(b',') => self
+                .read_num()
+                .await
+                .map(|(d, n)| (DataType::Double(d), n + 1))
                 .map(Some),
             Ok(b'+') => self
                 .read_simple()
@@ -433,8 +438,10 @@ where
         }
     }
 
-    /// Read an integer of the form `[:][<+|->]<value>\r\n`
-    async fn read_int<T>(&mut self) -> Result<(T, usize)>
+    /// Read a number of one of the following forms
+    ///  - Integer: `[:][<+|->]<value>\r\n`
+    ///  - Double: `,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n`
+    async fn read_num<T>(&mut self) -> Result<(T, usize)>
     where
         T: FromStr,
         <T as FromStr>::Err: Debug,
@@ -446,7 +453,7 @@ where
         };
 
         match slice.parse() {
-            Ok(int) => Ok((int, n_read)),
+            Ok(num) => Ok((num, n_read)),
             Err(e) => Err(anyhow!("{e:?}: expected number, got: {slice}")),
         }
     }
@@ -460,7 +467,7 @@ where
 
     /// Read a bulk strings|errors of the form `<$|!><length>\r\n<data>\r\n`
     async fn read_bulk(&mut self) -> Result<(Option<rdb::String>, usize)> {
-        let (len, bytes_read) = self.read_int().await?;
+        let (len, bytes_read) = self.read_num().await?;
 
         let Length::Some(len) = len else {
             return Ok((None, bytes_read));
@@ -488,7 +495,7 @@ where
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn read_array(&mut self) -> Pin<Box<ReadRecFut<'_>>> {
         Box::pin(async move {
-            let (len, mut n_total) = self.read_int().await?;
+            let (len, mut n_total) = self.read_num().await?;
 
             let mut items = Vec::with_capacity(len);
 
@@ -514,7 +521,7 @@ where
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn read_map(&mut self) -> Pin<Box<ReadRecFut<'_>>> {
         Box::pin(async move {
-            let (len, mut n_total) = self.read_int().await?;
+            let (len, mut n_total) = self.read_num().await?;
 
             let mut items = Vec::with_capacity(len);
 
