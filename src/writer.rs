@@ -406,7 +406,7 @@ mod tests {
     fn serialize_map() {
         let keys = [DataType::Integer(1), DataType::Integer(2)];
         let vals = [DataType::string(DATA), DataType::string(DATA)];
-        let items = keys.into_iter().zip(vals.into_iter());
+        let items = keys.into_iter().zip(vals);
         let expected = b"%2\r\n:1\r\n$12\r\nsome message\r\n:2\r\n$12\r\nsome message\r\n";
         test_serialize! {
             DataType::map([]) => b"%0\r\n",
