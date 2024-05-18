@@ -237,12 +237,10 @@ impl TryFrom<&[DataType]> for XRead {
             0 => return Err(Error::Syntax),
             1 => return Err(Error::WrongNumArgs(CMD)),
             n if n % 2 != 0 => {
-                // XXX: potentially generalizable to an Error variant
-                let err = format!(
-                    "Unbalanced '{CMD}' list of streams: \
-                    for each stream key an ID or '$' must be specified."
-                );
-                return Err(Error::err(err));
+                return Err(Error::UnbalancedStreams {
+                    cmd: CMD,
+                    msg: "for each stream key an ID or '$' must be specified",
+                });
             }
             _ => {}
         }

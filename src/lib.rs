@@ -28,8 +28,6 @@ pub(crate) mod repl;
 pub(crate) mod store;
 pub(crate) mod stream;
 
-// TODO: introduce new mod io with reader and writer
-
 pub(crate) mod resp {
     pub const PING: &[u8] = b"PING";
     pub const ECHO: &[u8] = b"ECHO";
@@ -75,6 +73,12 @@ pub enum Error {
 
     #[error("ERR unknown subcommand '{cmd}'. Try {help}.")]
     UnknownSubCommand { cmd: String, help: &'static str },
+
+    #[error("ERR Unbalanced '{cmd}' list of streams: {msg}.")]
+    UnbalancedStreams {
+        cmd: &'static str,
+        msg: &'static str,
+    },
 
     #[error("ERR wrong number of arguments for '{0}' command")]
     WrongNumArgs(&'static str),

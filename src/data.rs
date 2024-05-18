@@ -227,7 +227,6 @@ impl TryFrom<&[DataType]> for Keys {
             .cloned()
             .map(|arg| match arg {
                 DataType::BulkString(arg) | DataType::SimpleString(arg) => Ok(arg),
-                // TODO: custom error variant
                 arg => Err(Error::Err(format!("keys must be strings, got {arg:?}"))),
             })
             .collect::<Result<_, Self::Error>>()
@@ -257,7 +256,6 @@ impl ParseInt for Bytes {
 
 const CASE_SHIFT: u8 = b'a'.abs_diff(b'A');
 
-// TODO: extend to multi-target matcher, possibly with different comparators
 pub(crate) fn compare<F, D, T>(cmp: F, data: D, target: T) -> bool
 where
     F: Fn(u8, u8) -> bool,

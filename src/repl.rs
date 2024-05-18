@@ -76,7 +76,7 @@ impl std::fmt::Display for ReplId {
 pub struct ReplState {
     /// Pseudo random alphanumeric string of 40 characters
     pub repl_id: Option<ReplId>,
-    // TODO: this should probably be an i128
+    // TODO: this should probably be an i128 (blocked by AtomicUsize/AtomicI128)
     pub repl_offset: isize,
 }
 
@@ -517,7 +517,6 @@ impl Replication {
     }
 
     async fn conf(mut self) -> Result<Self> {
-        // TODO: replace with an optimized Matcher<'_> that uses Cow internally and is_lowercase
         let replconf = Command::Replconf(replconf::Conf::ListeningPort(self.repl.port()));
         let replconf = DataType::from(replconf);
 
