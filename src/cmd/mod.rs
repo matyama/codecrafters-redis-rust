@@ -8,11 +8,10 @@ use bytes::{Bytes, BytesMut};
 
 use crate::data::{DataType, Keys};
 use crate::repl::ReplState;
-use crate::{rdb, stream};
-use crate::{
-    Instance, Protocol, Role, ACK, CONFIG, ECHO, GET, GETACK, INFO, KEYS, NONE, OK, PING, PONG,
-    PROTOCOL, PSYNC, REPLCONF, SET, TYPE, WAIT, XADD, XLEN, XRANGE, XREAD,
-};
+use crate::{rdb, resp, stream};
+use crate::{Instance, Protocol, Role, PROTOCOL};
+
+use replconf::{ACK, GETACK};
 
 pub mod config;
 pub mod info;
@@ -29,6 +28,27 @@ const NULL: DataType = match PROTOCOL {
     Protocol::RESP2 => DataType::NullBulkString,
     Protocol::RESP3 => DataType::Null,
 };
+
+pub(crate) const PING: Bytes = Bytes::from_static(resp::PING);
+pub(crate) const ECHO: Bytes = Bytes::from_static(resp::ECHO);
+pub(crate) const CONFIG: Bytes = Bytes::from_static(resp::CONFIG);
+pub(crate) const KEYS: Bytes = Bytes::from_static(resp::KEYS);
+pub(crate) const TYPE: Bytes = Bytes::from_static(resp::TYPE);
+pub(crate) const GET: Bytes = Bytes::from_static(resp::GET);
+pub(crate) const SET: Bytes = Bytes::from_static(resp::SET);
+pub(crate) const XADD: Bytes = Bytes::from_static(resp::XADD);
+pub(crate) const XRANGE: Bytes = Bytes::from_static(resp::XRANGE);
+pub(crate) const XREAD: Bytes = Bytes::from_static(resp::XREAD);
+pub(crate) const XLEN: Bytes = Bytes::from_static(resp::XLEN);
+pub(crate) const INFO: Bytes = Bytes::from_static(resp::INFO);
+pub(crate) const REPLCONF: Bytes = Bytes::from_static(resp::REPLCONF);
+pub(crate) const PSYNC: Bytes = Bytes::from_static(resp::PSYNC);
+pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(resp::FULLRESYNC);
+pub(crate) const WAIT: Bytes = Bytes::from_static(resp::WAIT);
+
+pub(crate) const OK: Bytes = Bytes::from_static(resp::OK);
+pub(crate) const PONG: Bytes = Bytes::from_static(resp::PONG);
+pub(crate) const NONE: Bytes = Bytes::from_static(b"none");
 
 #[derive(Clone, Debug)]
 pub enum Command {

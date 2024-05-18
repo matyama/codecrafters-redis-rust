@@ -17,7 +17,9 @@ use tokio::task::JoinSet;
 use crate::cmd::replconf;
 use crate::data::{DataExt as _, DataType, ParseInt};
 use crate::rdb;
-use crate::{Command, DataReader, DataWriter, Error, RDBData, Resp, TIMEOUT, UNKNOWN};
+use crate::{Command, DataReader, DataWriter, Error, RDBData, Resp, TIMEOUT};
+
+const UNKNOWN: Bytes = Bytes::from_static(b"?");
 
 pub(crate) const UNKNOWN_REPL_STATE: ReplState = ReplState {
     repl_id: None,

@@ -2,7 +2,7 @@ use bytes::Bytes;
 use tokio::time::Duration;
 
 use crate::data::{DataExt as _, DataType};
-use crate::{rdb, Command, Error, EMPTY, GET};
+use crate::{rdb, Command, Error};
 
 const CMD: &str = "set";
 
@@ -14,6 +14,10 @@ const KEEPTTL: Bytes = Bytes::from_static(b"KEEPTTL");
 
 const NX: Bytes = Bytes::from_static(b"NX");
 const XX: Bytes = Bytes::from_static(b"XX");
+
+const GET: Bytes = Bytes::from_static(b"GET");
+
+const EMPTY: Bytes = Bytes::from_static(b"");
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug)]

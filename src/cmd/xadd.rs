@@ -2,9 +2,10 @@ use bytes::Bytes;
 
 use crate::data::{DataExt, DataType};
 use crate::stream::{Entry, EntryArg};
-use crate::{rdb, Command, Error, ANY};
+use crate::{rdb, Command, Error};
 
 const CMD: &str = "xadd";
+
 const NOMKSTREAM: Bytes = Bytes::from_static(b"NOMKSTREAM");
 
 // TODO: support other XADD options: MAXLEN/MINID, LIMIT
@@ -45,7 +46,7 @@ impl TryFrom<&[DataType]> for Options {
             }
 
             // all options are between the key and id (i.e., before <* | id>)
-            if arg.matches(ANY) || arg.contains(b'-') {
+            if arg.matches(b"*") || arg.contains(b'-') {
                 break;
             }
         }

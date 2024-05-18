@@ -30,39 +30,30 @@ pub(crate) mod store;
 pub(crate) mod stream;
 pub(crate) mod writer;
 
-pub(crate) const LF: u8 = b'\n'; // 10
+// TODO: introduce new mod io with reader and writer
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
-pub(crate) const NULL: &[u8] = b"_\r\n";
 
-pub(crate) const EMPTY: Bytes = Bytes::from_static(b"");
-pub(crate) const ANY: Bytes = Bytes::from_static(b"*");
-pub(crate) const UNKNOWN: Bytes = Bytes::from_static(b"?");
-pub(crate) const FUTURE: Bytes = Bytes::from_static(b"$");
-pub(crate) const MIN: Bytes = Bytes::from_static(b"-");
-pub(crate) const MAX: Bytes = Bytes::from_static(b"+");
-pub(crate) const NONE: Bytes = Bytes::from_static(b"none");
+pub(crate) mod resp {
+    pub const PING: &[u8] = b"PING";
+    pub const ECHO: &[u8] = b"ECHO";
+    pub const CONFIG: &[u8] = b"CONFIG";
+    pub const KEYS: &[u8] = b"KEYS";
+    pub const TYPE: &[u8] = b"TYPE";
+    pub const GET: &[u8] = b"GET";
+    pub const SET: &[u8] = b"SET";
+    pub const XADD: &[u8] = b"XADD";
+    pub const XRANGE: &[u8] = b"XRANGE";
+    pub const XREAD: &[u8] = b"XREAD";
+    pub const XLEN: &[u8] = b"XLEN";
+    pub const INFO: &[u8] = b"INFO";
+    pub const REPLCONF: &[u8] = b"REPLCONF";
+    pub const PSYNC: &[u8] = b"PSYNC";
+    pub const FULLRESYNC: &[u8] = b"FULLRESYNC";
+    pub const WAIT: &[u8] = b"WAIT";
 
-pub(crate) const PING: Bytes = Bytes::from_static(b"PING");
-pub(crate) const PONG: Bytes = Bytes::from_static(b"PONG");
-pub(crate) const ECHO: Bytes = Bytes::from_static(b"ECHO");
-pub(crate) const CONFIG: Bytes = Bytes::from_static(b"CONFIG");
-pub(crate) const KEYS: Bytes = Bytes::from_static(b"KEYS");
-pub(crate) const TYPE: Bytes = Bytes::from_static(b"TYPE");
-pub(crate) const GET: Bytes = Bytes::from_static(b"GET");
-pub(crate) const SET: Bytes = Bytes::from_static(b"SET");
-pub(crate) const XADD: Bytes = Bytes::from_static(b"XADD");
-pub(crate) const XRANGE: Bytes = Bytes::from_static(b"XRANGE");
-pub(crate) const XREAD: Bytes = Bytes::from_static(b"XREAD");
-pub(crate) const XLEN: Bytes = Bytes::from_static(b"XLEN");
-pub(crate) const INFO: Bytes = Bytes::from_static(b"INFO");
-pub(crate) const REPLCONF: Bytes = Bytes::from_static(b"REPLCONF");
-pub(crate) const PSYNC: Bytes = Bytes::from_static(b"PSYNC");
-pub(crate) const FULLRESYNC: Bytes = Bytes::from_static(b"FULLRESYNC");
-pub(crate) const WAIT: Bytes = Bytes::from_static(b"WAIT");
-
-pub(crate) const OK: Bytes = Bytes::from_static(b"OK");
-pub(crate) const GETACK: Bytes = Bytes::from_static(b"GETACK");
-pub(crate) const ACK: Bytes = Bytes::from_static(b"ACK");
+    pub const OK: &[u8] = b"OK";
+    pub const PONG: &[u8] = b"PONG";
+}
 
 // TODO: generalize to non-unix systems via cfg target_os
 const EMPTY_RDB: Bytes = Bytes::from_static(include_bytes!("../data/empty_rdb.dat"));

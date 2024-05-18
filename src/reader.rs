@@ -15,9 +15,10 @@ use crate::cmd::{config, info, ping, replconf, set, sync, wait, xadd, xrange, xr
 use crate::data::{DataExt, DataType};
 use crate::rdb::{self, RDB};
 use crate::store::{Database, DatabaseBuilder};
-use crate::{Command, Error, RDBData, Resp, CRLF, FULLRESYNC, LF, OK, PONG};
+use crate::{resp::*, Command, Error, RDBData, Resp, CRLF};
 
-pub(crate) const MAGIC: Bytes = Bytes::from_static(b"REDIS");
+const LF: u8 = b'\n'; // 10
+const MAGIC: &[u8] = b"REDIS";
 
 trait ReadError {
     fn terminates_read(&self) -> bool;
@@ -305,22 +306,23 @@ where
             _ => return Ok(Some((Resp::from(data), bytes_read))),
         };
 
+        // TODO: use canonical form written into self.buf
         let resp = match cmd.to_uppercase().as_slice() {
-            b"PING" => cmd_try_from!(args => ping::Ping),
-            b"ECHO" => cmd_try_from!(args => Command::Echo as "echo"),
-            b"CONFIG" => cmd_try_from!(args => config::ConfigGet),
-            b"INFO" => cmd_try_from!(args => info::InfoSections),
-            b"TYPE" => cmd_try_from!(args => Command::Type as "type"),
-            b"KEYS" => cmd_try_from!(args => Command::Keys as "keys"),
-            b"GET" => cmd_try_from!(args => Command::Get as "get"),
-            b"SET" => cmd_try_from!(args => set::Set),
-            b"XADD" => cmd_try_from!(args => xadd::XAdd),
-            b"XRANGE" => cmd_try_from!(args => xrange::XRange),
-            b"XREAD" => cmd_try_from!(args => xread::XRead),
-            b"XLEN" => cmd_try_from!(args => Command::XLen as "xlen"),
-            b"REPLCONF" => cmd_try_from!(args => replconf::Conf),
-            b"PSYNC" => cmd_try_from!(args => sync::PSync),
-            b"WAIT" => cmd_try_from!(args => wait::Wait),
+            PING => cmd_try_from!(args => ping::Ping),
+            ECHO => cmd_try_from!(args => Command::Echo as "echo"),
+            CONFIG => cmd_try_from!(args => config::ConfigGet),
+            INFO => cmd_try_from!(args => info::InfoSections),
+            TYPE => cmd_try_from!(args => Command::Type as "type"),
+            KEYS => cmd_try_from!(args => Command::Keys as "keys"),
+            GET => cmd_try_from!(args => Command::Get as "get"),
+            SET => cmd_try_from!(args => set::Set),
+            XADD => cmd_try_from!(args => xadd::XAdd),
+            XRANGE => cmd_try_from!(args => xrange::XRange),
+            XREAD => cmd_try_from!(args => xread::XRead),
+            XLEN => cmd_try_from!(args => Command::XLen as "xlen"),
+            REPLCONF => cmd_try_from!(args => replconf::Conf),
+            PSYNC => cmd_try_from!(args => sync::PSync),
+            WAIT => cmd_try_from!(args => wait::Wait),
             _ => Self::parse_internal(cmd, args)
                 .map_err(DataType::err)
                 .unwrap_or_else(Resp::from),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::data::{DataExt as _, DataType};
-use crate::{Command, Error, GET};
+use crate::{Command, Error};
 
 #[derive(Debug)]
 pub struct ConfigGet(Arc<[Bytes]>);
@@ -16,7 +16,7 @@ impl TryFrom<&[DataType]> for ConfigGet {
             return Err(Error::WrongNumArgs("config"));
         };
 
-        if !arg.matches(GET) {
+        if !arg.matches(b"get") {
             return Err(Error::unkown_subcmd(arg, "CONFIG HELP"));
         };
 

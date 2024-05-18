@@ -4,11 +4,14 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::data::{DataExt, DataType, Keys};
-use crate::{stream, Command, Error, FUTURE};
+use crate::{stream, Command, Error};
 
 const CMD: &str = "xread";
+
 const BLOCK: Bytes = Bytes::from_static(b"BLOCK");
 const COUNT: Bytes = Bytes::from_static(b"COUNT");
+
+const FUTURE: Bytes = Bytes::from_static(b"$");
 
 pub(crate) const STREAMS: Bytes = Bytes::from_static(b"STREAMS");
 

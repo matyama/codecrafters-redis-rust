@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::{rdb, DataType, RDBData, CRLF, NULL};
+use crate::{rdb, DataType, RDBData, CRLF};
+
+const NULL: &[u8] = b"_\r\n";
 
 pub struct DataWriter<W> {
     writer: BufWriter<W>,

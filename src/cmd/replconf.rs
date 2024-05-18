@@ -3,7 +3,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::data::{DataExt as _, DataType};
-use crate::{rdb, Command, Error, ACK, GETACK};
+use crate::{rdb, Command, Error};
+
+pub(crate) const GETACK: Bytes = Bytes::from_static(b"GETACK");
+pub(crate) const ACK: Bytes = Bytes::from_static(b"ACK");
 
 #[derive(Clone, Debug)]
 pub enum Conf {

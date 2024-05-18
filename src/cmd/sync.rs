@@ -1,6 +1,7 @@
 use bytes::BytesMut;
 
-use crate::{rdb, Command, DataType, Error, ReplState, FULLRESYNC};
+use crate::cmd::{Command, FULLRESYNC};
+use crate::{rdb, DataType, Error, ReplState};
 
 #[derive(Debug)]
 pub struct PSync(ReplState);

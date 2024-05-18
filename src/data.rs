@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 use crate::cmd::{self, Command};
 use crate::writer::{DataSerializer, Serializer as _};
-use crate::{rdb, Error, ANY};
+use crate::{rdb, Error};
 
 const NEG: &[u8] = b"-";
 
@@ -93,7 +93,9 @@ impl DataType {
     pub(crate) fn replconf_getack() -> &'static (Self, usize) {
         static REPLCONF_GETACK: OnceLock<(DataType, usize)> = OnceLock::new();
         REPLCONF_GETACK.get_or_init(|| {
-            let data = Self::from(Command::Replconf(cmd::replconf::Conf::GetAck(ANY)));
+            let data = Self::from(Command::Replconf(cmd::replconf::Conf::GetAck(
+                Bytes::from_static(b"*"),
+            )));
             let size = DataSerializer::serialized_size(&data)
                 .expect("'REPLCONF GETACK *' should be serializable");
             debug_assert!(size > 0, "'{data:?}' got serialized to 0B");
@@ -421,7 +423,7 @@ impl DataExt for DataType {
 mod tests {
     use bytes::Bytes;
 
-    use crate::{CONFIG, ECHO, PING};
+    use crate::resp::{CONFIG, ECHO, PING};
 
     use super::*;
 

@@ -4,9 +4,12 @@ use bytes::Bytes;
 
 use crate::data::{DataExt, DataType};
 use crate::stream::{Id, ParseIdError, StreamId};
-use crate::{rdb, Command, Error, MAX, MIN};
+use crate::{rdb, Command, Error};
 
 const CMD: &str = "xrange";
+
+const MIN: &str = "-";
+const MAX: &str = "+";
 
 #[derive(Clone, Debug)]
 pub enum Bounds {
@@ -19,9 +22,8 @@ impl std::fmt::Display for Bounds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use Bound::*;
         match self {
-            // SAFETY: MIN/MAX is const and valid UTF-8
-            Self::Start(Unbounded) => f.write_str(unsafe { std::str::from_utf8_unchecked(&MIN) }),
-            Self::End(Unbounded) => f.write_str(unsafe { std::str::from_utf8_unchecked(&MAX) }),
+            Self::Start(Unbounded) => f.write_str(MIN),
+            Self::End(Unbounded) => f.write_str(MAX),
             Self::Start(Included(id)) | Self::End(Included(id)) => write!(f, "{id}"),
             Self::Start(Excluded(id)) | Self::End(Excluded(id)) => write!(f, "({id}"),
         }
