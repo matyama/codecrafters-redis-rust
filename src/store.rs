@@ -204,6 +204,12 @@ impl Store {
         guard.db.get(&key).map(rdb::ValueType::from)
     }
 
+    pub async fn contains(&self, key: &rdb::String) -> bool {
+        let store = self.0.read().await;
+        let guard = store.db().await;
+        guard.db.contains_key(key)
+    }
+
     pub async fn get(&self, key: rdb::String) -> Option<rdb::Value> {
         let store = self.0.read().await;
         let mut guard = store.db().await;

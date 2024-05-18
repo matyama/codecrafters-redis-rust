@@ -109,9 +109,11 @@ impl Command {
                 .map_or(DataType::str(NONE), DataType::str),
 
             Self::Keys(pattern @ (Int8(_) | Int16(_) | Int32(_))) => {
-                // TODO: impl as `store.contains(pattern)`
-                eprintln!("KEYS {pattern:?} is not supported");
-                DataType::array([])
+                if instance.store.contains(&pattern).await {
+                    DataType::array([DataType::string(pattern)])
+                } else {
+                    DataType::array([])
+                }
             }
 
             Self::Keys(Str(pattern)) => match pattern.as_ref() {
@@ -125,9 +127,14 @@ impl Command {
 
                     DataType::array(keys)
                 }
-                pattern => {
-                    eprintln!("KEYS {pattern:?} is not supported");
-                    DataType::array([])
+                _ => {
+                    // TODO: support glob-style patterns
+                    let key = Str(pattern);
+                    if instance.store.contains(&key).await {
+                        DataType::array([DataType::string(key)])
+                    } else {
+                        DataType::array([])
+                    }
                 }
             },
 
