@@ -66,7 +66,6 @@ impl<R> DataReader<R>
 where
     R: AsyncReadExt + Send + Unpin,
 {
-    // TODO: it's unfortunate that ad-hoc uses of this always allocate `buf`, make it reusable
     #[inline]
     pub fn new(reader: R) -> Self {
         Self {
@@ -307,8 +306,12 @@ where
             _ => return Ok(Some((Resp::from(data), bytes_read))),
         };
 
-        // TODO: use canonical form written into self.buf
-        let resp = match cmd.to_uppercase().as_slice() {
+        // create a canonical (uppercase) command name
+        self.buf.clear();
+        cmd.write_into(&mut self.buf)?;
+        self.buf.make_ascii_uppercase();
+
+        let resp = match self.buf.as_slice() {
             PING => cmd_try_from!(args => ping::Ping),
             ECHO => cmd_try_from!(args => Command::Echo as "echo"),
             CONFIG => cmd_try_from!(args => config::ConfigGet),
@@ -324,30 +327,13 @@ where
             REPLCONF => cmd_try_from!(args => replconf::Conf),
             PSYNC => cmd_try_from!(args => sync::PSync),
             WAIT => cmd_try_from!(args => wait::Wait),
-            _ => Self::parse_internal(cmd, args)
-                .map_err(DataType::err)
-                .unwrap_or_else(Resp::from),
+            s if s.starts_with(FULLRESYNC) => cmd_try_from!(cmd => sync::FullResync),
+            OK => Resp::from(DataType::str(OK)),
+            PONG => Resp::Data(DataType::str(PONG)),
+            _ => Resp::Data(DataType::err(Error::unkown_cmd(cmd, args))),
         };
 
         Ok(Some((resp, bytes_read)))
-    }
-
-    fn parse_internal(cmd: &DataType, args: &[DataType]) -> Result<Resp, Error> {
-        if cmd.matches(OK) {
-            return Ok(Resp::from(DataType::str(OK)));
-        }
-
-        if cmd.matches(PONG) {
-            return Ok(Resp::from(DataType::str(PONG)));
-        }
-
-        if cmd.prefixed(FULLRESYNC) {
-            return sync::FullResync::try_from(cmd)
-                .map(Command::from)
-                .map(Resp::from);
-        }
-
-        Err(Error::unkown_cmd(cmd, args))
     }
 
     async fn read_data(&mut self) -> Result<Option<(DataType, usize)>> {

@@ -21,7 +21,6 @@ impl<W> DataWriter<W>
 where
     W: AsyncWriteExt + Send + Unpin,
 {
-    // TODO: it's unfortunate that ad-hoc uses of this always allocate `buf`, make it reusable
     #[inline]
     pub fn new(writer: W) -> Self {
         Self {

@@ -286,31 +286,22 @@ where
 }
 
 pub trait DataExt {
-    // TODO: deprecate in favor of matches
-    // NOTE: this could probably benefit from small vec optimization
-    fn to_uppercase(&self) -> Vec<u8>;
+    fn write_into(&self, writer: impl std::io::Write) -> std::io::Result<()>;
 
     fn matches(&self, target: impl AsRef<[u8]>) -> bool;
-
-    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool;
 
     fn contains(&self, target: u8) -> bool;
 }
 
 impl<'a> DataExt for &'a [u8] {
     #[inline]
-    fn to_uppercase(&self) -> Vec<u8> {
-        self.to_ascii_uppercase()
+    fn write_into(&self, mut writer: impl std::io::Write) -> std::io::Result<()> {
+        writer.write_all(self)
     }
 
     #[inline]
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         matches(self, target)
-    }
-
-    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
-        let prefix = prefix.as_ref();
-        self.len() >= prefix.len() && matches(&self[..prefix.len()], prefix)
     }
 
     #[inline]
@@ -321,18 +312,13 @@ impl<'a> DataExt for &'a [u8] {
 
 impl DataExt for Bytes {
     #[inline]
-    fn to_uppercase(&self) -> Vec<u8> {
-        self.to_ascii_uppercase()
+    fn write_into(&self, mut writer: impl std::io::Write) -> std::io::Result<()> {
+        writer.write_all(self)
     }
 
     #[inline]
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         matches(self, target)
-    }
-
-    #[inline]
-    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
-        self.as_ref().prefixed(prefix)
     }
 
     #[inline]
@@ -342,16 +328,15 @@ impl DataExt for Bytes {
 }
 
 impl DataExt for rdb::String {
-    fn to_uppercase(&self) -> Vec<u8> {
+    #[inline]
+    fn write_into(&self, mut writer: impl std::io::Write) -> std::io::Result<()> {
         use rdb::String::*;
-        let mut s = match self {
-            Str(s) => return s.to_uppercase(),
-            Int8(i) => i.to_string(),
-            Int16(i) => i.to_string(),
-            Int32(i) => i.to_string(),
-        };
-        s.make_ascii_uppercase();
-        s.into()
+        match self {
+            Str(s) => s.write_into(writer),
+            Int8(i) => write!(writer, "{i}"),
+            Int16(i) => write!(writer, "{i}"),
+            Int32(i) => write!(writer, "{i}"),
+        }
     }
 
     /// Returns `true` iff this string matches `other` assuming it's in uppercase
@@ -359,14 +344,6 @@ impl DataExt for rdb::String {
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         match self {
             Self::Str(s) => matches(s, target),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
-        match self {
-            Self::Str(s) => s.prefixed(prefix),
             _ => false,
         }
     }
@@ -381,16 +358,16 @@ impl DataExt for rdb::String {
 }
 
 impl DataExt for DataType {
-    fn to_uppercase(&self) -> Vec<u8> {
+    #[inline]
+    fn write_into(&self, mut writer: impl std::io::Write) -> std::io::Result<()> {
         match self {
-            Self::NullBulkString => vec![],
-            Self::SimpleString(s) => s.to_uppercase(),
-            Self::BulkString(s) => s.to_uppercase(),
-            other => {
-                let mut other = format!("{other:?}");
-                other.make_ascii_uppercase();
-                other.into()
-            }
+            Self::Null | Self::NullBulkString | Self::NullBulkError => Ok(()),
+            Self::Boolean(b) => write!(writer, "{b}"),
+            Self::Integer(i) => write!(writer, "{i}"),
+            Self::SimpleString(s) | Self::BulkString(s) => s.write_into(writer),
+            Self::SimpleError(s) | Self::BulkError(s) => s.write_into(writer),
+            // TODO: more reasonable serialization (perhaps deprecate Args)
+            other => write!(writer, "{other:?}"),
         }
     }
 
@@ -398,14 +375,6 @@ impl DataExt for DataType {
     fn matches(&self, target: impl AsRef<[u8]>) -> bool {
         match self {
             Self::BulkString(s) | Self::SimpleString(s) => s.matches(target),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn prefixed(&self, prefix: impl AsRef<[u8]>) -> bool {
-        match self {
-            Self::BulkString(s) | Self::SimpleString(s) => s.prefixed(prefix),
             _ => false,
         }
     }
