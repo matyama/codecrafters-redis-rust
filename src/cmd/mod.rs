@@ -77,8 +77,8 @@ impl Command {
         use rdb::String::*;
         match self {
             Self::DBSize => {
-                let (db_size, expire_size) = instance.store.dbsize().await;
-                DataType::Integer((db_size + expire_size) as i64)
+                let (persist_size, expire_size) = instance.store.dbsize().await;
+                DataType::Integer((persist_size + expire_size) as i64)
             }
 
             Self::Ping(msg) => msg.map_or(DataType::str(PONG), DataType::BulkString),

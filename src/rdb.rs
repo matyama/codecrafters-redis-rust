@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::io::{self, Error, ErrorKind};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::data::ParseInt;
 use crate::store::Database;
 use crate::stream::Stream;
+use crate::write_fmt;
 
 pub(crate) const MAGIC: &[u8] = b"REDIS";
 pub(crate) const DEFAULT_DB: usize = Database::DEFAULT;
@@ -218,7 +218,7 @@ where
 }
 
 impl String {
-    pub async fn write_into<W>(self, writer: &mut W, buf: &mut BytesMut) -> io::Result<usize>
+    pub async fn write_into<W>(self, writer: &mut W) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
     {
@@ -236,24 +236,20 @@ impl String {
                 Self::write_str(bytes, writer).await
             }
             String::Str(bytes) => Self::write_str(bytes, writer).await,
-            String::Int8(i) => Self::write_int(i as i64, writer, buf).await,
-            String::Int16(i) => Self::write_int(i as i64, writer, buf).await,
-            String::Int32(i) => Self::write_int(i as i64, writer, buf).await,
+            String::Int8(i) => Self::write_int(i as i64, writer).await,
+            String::Int16(i) => Self::write_int(i as i64, writer).await,
+            String::Int32(i) => Self::write_int(i as i64, writer).await,
         }
     }
 
-    async fn write_int<W>(value: i64, writer: &mut W, buf: &mut BytesMut) -> io::Result<usize>
+    async fn write_int<W>(value: i64, writer: &mut W) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
     {
-        // TODO: inline the buffer
         // buffer with enough capacity for encoding of an i64
-        //let mut buf = [0; 32];
+        let mut buf = [0; 32];
 
-        buf.clear();
-        buf.resize(32, 0);
-
-        let n = encode_integer(value, buf);
+        let n = encode_integer(value, &mut buf);
 
         if n > 0 {
             writer.write_all(&buf[..n]).await?;
@@ -261,10 +257,9 @@ impl String {
         }
 
         // encode as string
-        buf.write_fmt(format_args!("{value}"))
-            .map_err(Error::other)?;
+        let n = write_fmt!(buf, "{value}")?;
 
-        Self::write_str(buf, writer).await
+        Self::write_str(&buf[..n], writer).await
     }
 
     async fn write_str<B, W>(bytes: B, writer: &mut W) -> io::Result<usize>
@@ -412,12 +407,12 @@ impl Value {
         }
     }
 
-    pub async fn write_into<W>(self, writer: &mut W, buf: &mut BytesMut) -> io::Result<usize>
+    pub async fn write_into<W>(self, writer: &mut W) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
     {
         match self {
-            Self::String(s) => s.write_into(writer, buf).await,
+            Self::String(s) => s.write_into(writer).await,
             Self::Stream(_) => unimplemented!("RDB: writing streams is not supported"),
         }
     }

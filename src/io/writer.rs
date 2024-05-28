@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -12,6 +12,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use crate::data::DataType;
 use crate::io::CRLF;
 use crate::rdb::{self, aux, DEFAULT_DB, MAGIC, RDB};
+use crate::write_fmt;
 
 const NULL: &[u8] = b"_\r\n";
 
@@ -62,11 +63,11 @@ macro_rules! rdb_write {
         $written += 1;
     };
 
-    ([$writer:expr, $buf:expr, $written:ident]; $($key:ident: $val:expr),+) => {
+    ([$writer:expr, $written:ident]; $($key:ident: $val:expr),+) => {
         $(
             if let Some(val) = $val {
                 rdb_write! {
-                    [$writer, $buf, $written, "AUX entry {}"];
+                    [$writer, $written, "AUX entry {}"];
                     rdb::String::Str($key) => rdb::String { val } as AUX
                 }
             }
@@ -74,16 +75,16 @@ macro_rules! rdb_write {
     };
 
     (
-        [$writer:expr, $buf:expr, $written:ident, $cx:expr];
+        [$writer:expr, $written:ident, $cx:expr];
         $key:expr => $vt:ty { $val:expr } as $ty:expr
     ) => {
         rdb_write! { [$writer, $written, $cx]; $ty }
 
-        $written += $key.write_into(&mut $writer, &mut $buf)
+        $written += $key.write_into(&mut $writer)
             .await
             .with_context(|| format!($cx, "key"))?;
 
-        $written += <$vt>::write_into($val, &mut $writer, &mut $buf)
+        $written += <$vt>::write_into($val, &mut $writer)
             .await
             .with_context(|| format!($cx, "value"))?;
     };
@@ -301,8 +302,6 @@ where
             "RDB is missing the default DB: {DEFAULT_DB}"
         );
 
-        // TODO: ideally reuse `self.buf` (but that one's currently a String)
-        let mut buf = BytesMut::with_capacity(256);
         let mut bytes_written = 0;
 
         // header (magic + version)
@@ -311,16 +310,15 @@ where
             bytes_written += MAGIC.len();
 
             // NOTE: must be exactly 4B
-            buf.write_fmt(format_args!("{:04}", rdb.version))?;
+            let mut buf = [0; 4];
+            write_fmt!(buf, "{:04}", rdb.version)?;
             self.writer.write_all(&buf).await.context("version")?;
             bytes_written += buf.len();
-
-            buf.clear();
         }
 
         // auxiliary fields
         rdb_write! {
-            [self.writer, buf, bytes_written];
+            [self.writer, bytes_written];
             REDIS_VER: rdb.aux.redis_ver,
             REDIS_BITS: rdb.aux.redis_bits,
             CTIME: rdb.aux.ctime,
@@ -360,7 +358,7 @@ where
                 let ty = rdb::ValueType::from(&val) as u8;
 
                 rdb_write! {
-                    [self.writer, buf, bytes_written, "entry {}"];
+                    [self.writer, bytes_written, "entry {}"];
                     key => rdb::Value { val } as ty
                 }
             }

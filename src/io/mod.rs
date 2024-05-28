@@ -6,6 +6,21 @@ pub(crate) mod writer;
 
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 
+#[macro_export]
+macro_rules! write_fmt {
+    ($buf:ident, $fmt:literal) => {{
+        use std::io::{self, Write as _};
+        let mut w = io::Cursor::new(&mut $buf[..]);
+        write!(w, $fmt).map(move |_| w.position() as usize)
+    }};
+
+    ($buf:ident, $fmt:literal, $($arg:expr),*) => {{
+        use std::io::{self, Write as _};
+        let mut w = io::Cursor::new(&mut $buf[..]);
+        write!(w, $fmt, $($arg),*).map(move |_| w.position() as usize)
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};

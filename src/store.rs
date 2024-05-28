@@ -66,7 +66,7 @@ impl ValueCell {
 pub struct Database {
     pub(crate) ix: usize,
     db: HashMap<rdb::String, ValueCell>,
-    size: usize,
+    persist_size: usize,
     expire_size: usize,
     // XXX: replace (also in cells) by single watch (issue: no wait_for requires tokio >= 1.37)
     /// Notify subscribers about recently inserted keys
@@ -84,7 +84,7 @@ impl Database {
     /// Returns a pair of the number of keys with and without expiration
     #[inline]
     pub(crate) fn size(&self) -> (usize, usize) {
-        (self.size, self.expire_size)
+        (self.persist_size, self.expire_size)
     }
 
     #[cfg(test)]
@@ -95,7 +95,7 @@ impl Database {
 
     #[inline]
     pub(crate) fn into_inner(self) -> (usize, HashMap<rdb::String, ValueCell>, usize, usize) {
-        (self.ix, self.db, self.size, self.expire_size)
+        (self.ix, self.db, self.persist_size, self.expire_size)
     }
 
     #[cfg(test)]
@@ -104,7 +104,7 @@ impl Database {
             if expiry.is_some() {
                 self.expire_size -= 1;
             } else {
-                self.size -= 1;
+                self.persist_size -= 1;
             }
             write.notify_waiters();
         }
@@ -170,7 +170,7 @@ impl DatabaseBuilder {
             (Some(ix), Some(db)) => Ok(Database {
                 ix,
                 db,
-                size: self.size,
+                persist_size: self.size,
                 expire_size: self.expire_size,
                 new: Arc::new(Notify::new()),
             }),
@@ -260,7 +260,7 @@ impl Default for StoreInner {
             ix,
             db: HashMap::default(),
             new: Arc::new(Notify::new()),
-            size: 0,
+            persist_size: 0,
             expire_size: 0,
         };
 
@@ -411,12 +411,12 @@ impl Store {
                 let old = e.get_mut().write(val, expiry);
 
                 if had_expiry && !has_expiry {
-                    guard.size += 1;
+                    guard.persist_size += 1;
                     guard.expire_size -= 1;
                 }
 
                 if !had_expiry && has_expiry {
-                    guard.size -= 1;
+                    guard.persist_size -= 1;
                     guard.expire_size += 1;
                 }
 
@@ -433,12 +433,12 @@ impl Store {
                 let value = Some(e.get_mut().write(val, expiry));
 
                 if had_expiry && !has_expiry {
-                    guard.size += 1;
+                    guard.persist_size += 1;
                     guard.expire_size -= 1;
                 }
 
                 if !had_expiry && has_expiry {
-                    guard.size -= 1;
+                    guard.persist_size -= 1;
                     guard.expire_size += 1;
                 }
 
@@ -453,7 +453,7 @@ impl Store {
                     guard.expire_size += 1;
                 } else {
                     e.insert(ValueCell::new(val, None));
-                    guard.size += 1;
+                    guard.persist_size += 1;
                 }
 
                 guard.new.notify_waiters();
@@ -530,7 +530,7 @@ impl Store {
                 let stream = stream::Stream::new(entries, 1, last_entry, cgroups);
 
                 e.insert(ValueCell::new(rdb::Value::Stream(stream), None));
-                guard.size += 1;
+                guard.persist_size += 1;
                 guard.new.notify_waiters();
 
                 Ok(Some(id))
