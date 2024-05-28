@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicPtr, Ordering::*};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
+use rdb::RDB;
 use repl::{ReplConnection, Replication};
 
 pub(crate) use cmd::Command;
@@ -50,9 +52,6 @@ pub(crate) mod resp {
     pub const PONG: &[u8] = b"PONG";
 }
 
-// TODO: generalize to non-unix systems via cfg target_os
-const EMPTY_RDB: Bytes = Bytes::from_static(include_bytes!("../data/empty_rdb.dat"));
-
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(5);
 
 // NOTE: this is based on the codecrafters examples
@@ -62,6 +61,11 @@ pub enum Protocol {
     RESP2,
     RESP3,
 }
+
+// SAFETY: version is clearly non-zero
+pub const VERSION: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(11) };
+pub const REDIS_VER: Bytes = Bytes::from_static(b"7.2.0");
+//pub const REDIS_VER: Bytes = Bytes::from_static(b"7.2.4");
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -152,24 +156,6 @@ impl From<DataType> for Resp {
     }
 }
 
-// TODO: deprecate in favor of RDB
-#[derive(Debug, Clone)]
-#[repr(transparent)]
-pub struct RDBData(pub(crate) Bytes);
-
-impl RDBData {
-    #[inline]
-    pub fn empty() -> Self {
-        Self(EMPTY_RDB)
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct Leader(SocketAddr);
@@ -232,11 +218,12 @@ impl Instance {
             return Ok((instance, ReplConnection::default()));
         };
 
-        let (state, _rdb, subscriber) = Replication::handshake(leader, cfg.addr)
+        let (state, rdb, subscriber) = Replication::handshake(leader, cfg.addr)
             .await
             .with_context(|| format!("handshake with leader at {leader}"))?;
 
-        // TODO: apply initial RDB
+        // TODO: persist the initial RDB (i.e., override local dump file)
+        let store = Store::from_rdb(rdb).await.context("apply initial RDB")?;
 
         let instance = Self {
             cfg,
@@ -317,6 +304,11 @@ impl Instance {
             .with_context(|| format!("{self}: failed to bind a TCP listener"))
     }
 
+    // TODO: implement actual process fork to background save (BGSAVE) and serve the resulting RDB
+    async fn fork(&self) -> Result<RDB> {
+        Ok(self.store.snapshot(|| self.state()).await)
+    }
+
     pub async fn handle_connection(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
         let (reader, writer) = conn.split();
 
@@ -335,7 +327,7 @@ impl Instance {
 
                     writer.write(&resp).await?;
 
-                    let rdb = RDBData::empty();
+                    let rdb = self.fork().await?;
                     writer.write_rdb(rdb).await?;
                     writer.flush().await?;
 

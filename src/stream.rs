@@ -474,8 +474,19 @@ impl From<Entry<StreamId>> for DataType {
     }
 }
 
+#[cfg(test)]
+impl<Id: PartialEq> PartialEq for Entry<Id> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.fields == other.fields
+    }
+}
+
+#[cfg(test)]
+impl<Id: Eq> Eq for Entry<Id> {}
+
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingEntry {
     pub(crate) id: StreamId,
     pub(crate) delivery_time: SystemTime,
@@ -483,7 +494,7 @@ pub struct PendingEntry {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CData {
     pub(crate) name: rdb::String,
     pub(crate) seen_time: SystemTime,
@@ -507,7 +518,7 @@ impl CData {
 
 /// Consumer group metadata
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CGroup {
     pub(crate) name: rdb::String,
     pub(crate) last_entry: StreamId,
@@ -537,6 +548,7 @@ impl CGroup {
 //  - also to deletes use tombstones (probably to support different views from cgroups)
 #[allow(dead_code)]
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct StreamInner {
     pub(crate) entries: BTreeMap<StreamId, Entry>,
     pub(crate) length: usize,
@@ -573,6 +585,18 @@ impl Deref for Stream {
         &self.0
     }
 }
+
+/// Note that this impl is blocking and as such should be used carefully (e.g., in tests)
+#[cfg(test)]
+impl PartialEq for Stream {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.blocking_lock().eq(&other.blocking_lock())
+    }
+}
+
+#[cfg(test)]
+impl Eq for Stream {}
 
 #[cfg(test)]
 mod tests {

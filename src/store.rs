@@ -1,16 +1,18 @@
 use std::collections::hash_map::{Entry, OccupiedEntry, VacantEntry};
 use std::collections::{BTreeMap, HashMap};
-use std::mem;
 use std::sync::Arc;
 use std::time::SystemTime;
+use std::{mem, usize};
 
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use tokio::sync::{Mutex, MutexGuard, Notify, RwLock};
 use tokio::task::JoinSet;
 
 use crate::cmd::{set, xadd, xrange, xread};
 use crate::data::Keys;
-use crate::{rdb, stream, Error};
+use crate::rdb::{self, RDBData, RDB};
+use crate::{stream, DataReader, Error, ReplState, REDIS_VER, VERSION};
 
 impl From<ValueCell> for rdb::Value {
     #[inline]
@@ -26,7 +28,7 @@ impl From<&ValueCell> for rdb::ValueType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ValueCell {
     data: rdb::Value,
     write: Arc<Notify>,
@@ -43,6 +45,12 @@ impl ValueCell {
         }
     }
 
+    // XXX: or take &self and clone both components so we don't have to drop the notify
+    #[inline]
+    pub(crate) fn into_inner(self) -> (rdb::Value, Option<SystemTime>) {
+        (self.data, self.expiry)
+    }
+
     /// Replace the content of this cell in-place and notify all write waiters.
     ///
     /// Returns the previous [`Value`](rdb::Value) stored in this cell.
@@ -54,10 +62,12 @@ impl ValueCell {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Database {
     pub(crate) ix: usize,
     db: HashMap<rdb::String, ValueCell>,
+    size: usize,
+    expire_size: usize,
     // XXX: replace (also in cells) by single watch (issue: no wait_for requires tokio >= 1.37)
     /// Notify subscribers about recently inserted keys
     new: Arc<Notify>,
@@ -70,15 +80,57 @@ impl Database {
     pub fn builder() -> DatabaseBuilder {
         DatabaseBuilder::default()
     }
+
+    /// Returns a pair of the number of keys with and without expiration
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn size(&self) -> (usize, usize) {
+        (self.size, self.expire_size)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&rdb::String, &ValueCell)> {
+        self.db.iter()
+    }
+
+    #[inline]
+    pub(crate) fn into_inner(self) -> (usize, HashMap<rdb::String, ValueCell>, usize, usize) {
+        (self.ix, self.db, self.size, self.expire_size)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, key: &rdb::String) {
+        if let Some(ValueCell { write, expiry, .. }) = self.db.remove(key) {
+            if expiry.is_some() {
+                self.expire_size -= 1;
+            } else {
+                self.size -= 1;
+            }
+            write.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct DatabaseBuilder {
     ix: Option<usize>,
     db: Option<HashMap<rdb::String, ValueCell>>,
+    size: usize,
+    expire_size: usize,
 }
 
 impl DatabaseBuilder {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            ix: Some(Database::DEFAULT),
+            db: Some(HashMap::default()),
+            size: 0,
+            expire_size: 0,
+        }
+    }
+
     #[inline]
     pub fn with_index(&mut self, ix: usize) {
         self.ix = Some(ix);
@@ -103,6 +155,11 @@ impl DatabaseBuilder {
                 Some(expiry) if expiry < SystemTime::now() => {}
                 expiry => {
                     let _ = db.insert(key, ValueCell::new(val, expiry));
+                    if expiry.is_some() {
+                        self.expire_size += 1;
+                    } else {
+                        self.size += 1;
+                    }
                 }
             }
         }
@@ -114,6 +171,8 @@ impl DatabaseBuilder {
             (Some(ix), Some(db)) => Ok(Database {
                 ix,
                 db,
+                size: self.size,
+                expire_size: self.expire_size,
                 new: Arc::new(Notify::new()),
             }),
             (ix, _) => bail!("incomplete db={ix:?}"),
@@ -157,11 +216,38 @@ impl StreamHandle {
 //  3. Lock-free implementations might turn out to perform better as well.
 #[derive(Debug)]
 struct StoreInner {
+    // FIXME: This is not how Redis handles namespaces (databases).
+    //
+    // The `SELECT ix` command applies to that particular connection - i.e., the `ix` is a property
+    // of the connection and not the whole server. Also, it's defined to be 0-indexed, so a Vec
+    // might be more appropriate than a HashMap. Note that currently it's not a big deal as we
+    // don't actually support SELECT, so the only database in use is the default one.
+    //
+    // Where SELECT might get tricky is its atomicity. From the point of view of one client, it
+    // should be atomic to swap the selected namespace. So any ongoing operations must see this
+    // change immediately. Currently this should be fine, because no write operation re-takes the
+    // store lock and commands within the same connection are sequential.
+    //
+    // XXX: Implementation of this could be that the instance registers a handle for each conn.
+    // This handle stores an atomic ptr to the currently selected database and all the store
+    // operations go through that handle. The instance than owns the store, which might no longer
+    // need a RwLock. Alternatively, the handle could store just the database index.
     ix: usize,
     dbs: HashMap<usize, Mutex<Database>>,
 }
 
 impl StoreInner {
+    #[inline]
+    fn new(dbs: HashMap<usize, Database>) -> Self {
+        Self {
+            ix: Database::DEFAULT,
+            dbs: dbs
+                .into_iter()
+                .map(|(ix, db)| (ix, Mutex::new(db)))
+                .collect(),
+        }
+    }
+
     async fn db(&self) -> MutexGuard<Database> {
         self.dbs[&self.ix].lock().await
     }
@@ -175,6 +261,8 @@ impl Default for StoreInner {
             ix,
             db: HashMap::default(),
             new: Arc::new(Notify::new()),
+            size: 0,
+            expire_size: 0,
         };
 
         let mut dbs = HashMap::with_capacity(Store::DEFAULT_SIZE);
@@ -191,6 +279,65 @@ impl Store {
     /// Default number of databases this store starts with
     pub(crate) const DEFAULT_SIZE: usize = 16;
 
+    pub(crate) async fn from_rdb(RDBData(data): RDBData) -> Result<Self> {
+        let mut reader = DataReader::new(std::io::Cursor::new(data));
+        let (rdb, _) = reader.read_rdb_file().await?;
+        Ok(Self(RwLock::new(StoreInner::new(rdb.dbs))))
+    }
+
+    /// Clones all the contained databases and creates a [`RDB`]
+    pub(crate) async fn snapshot<S>(&self, state: S) -> RDB
+    where
+        S: FnOnce() -> ReplState,
+    {
+        use rdb::{Aux, String::*};
+
+        // NOTE: intentionally hold an exclusive lock here to create a consistent snapshot
+        let store = self.0.write().await;
+        let state = state();
+
+        let mut dbs = HashMap::with_capacity(store.dbs.len());
+
+        for db in store.dbs.values() {
+            let db = db
+                .try_lock()
+                .expect("hold an exclusive lock to the whole store");
+            dbs.insert(db.ix, db.clone());
+        }
+
+        let checksum = Bytes::from_static(b"\xf0n;\xfe\xc0\xffZ\xa2");
+
+        // TODO: set ctime, used_mem and aof_base, and compute checksum
+        RDB {
+            version: VERSION,
+            aux: Aux {
+                redis_ver: Some(Str(REDIS_VER)),
+                #[cfg(target_pointer_width = "64")]
+                redis_bits: Some(Int8(64)),
+                #[cfg(target_pointer_width = "32")]
+                redis_bits: Some(Int8(32)),
+                ctime: None,
+                used_mem: None,
+                repl_stream_db: Some(Int8(Database::DEFAULT as i8)),
+                repl_id: state.repl_id.map(rdb::String::from),
+                repl_offset: Some(rdb::String::from(state.repl_offset)),
+                aof_base: Some(Int8(0)),
+            },
+            dbs,
+            checksum: Some(checksum),
+        }
+    }
+
+    // TODO: expose as command
+    // FIXME: keys expire
+    #[cfg(test)]
+    pub async fn dbsize(&self) -> (usize, usize) {
+        let store = self.0.read().await;
+        let guard = store.db().await;
+        guard.size()
+    }
+
+    // FIXME: keys expire
     // TODO: support patters other than *
     pub async fn keys(&self) -> Vec<rdb::String> {
         let store = self.0.read().await;
@@ -198,12 +345,14 @@ impl Store {
         guard.db.keys().cloned().collect()
     }
 
+    // FIXME: keys expire (use get)
     pub async fn ty(&self, key: rdb::String) -> Option<rdb::ValueType> {
         let store = self.0.read().await;
         let guard = store.db().await;
         guard.db.get(&key).map(rdb::ValueType::from)
     }
 
+    // FIXME: keys expire (use get)
     pub async fn contains(&self, key: &rdb::String) -> bool {
         let store = self.0.read().await;
         let guard = store.db().await;
@@ -221,6 +370,7 @@ impl Store {
                     ..
                 } if *expiry < SystemTime::now() => {
                     let old = e.remove();
+                    guard.expire_size -= 1;
                     old.write.notify_waiters();
                     None
                 }
@@ -252,13 +402,26 @@ impl Store {
             None => None,
         };
 
-        let value = match guard.db.entry(key.clone()) {
+        match guard.db.entry(key) {
             // Overwrite existing entry that has expired before this operation
             Entry::Occupied(mut e) if e.expired_before(now) && matches!(cond, Some(NX) | None) => {
                 let expired = e.expired_before(now);
                 let expiry = expiration(&e);
 
+                let had_expiry = e.get().expiry.is_some();
+                let has_expiry = expiry.is_some();
+
                 let old = e.get_mut().write(val, expiry);
+
+                if had_expiry && !has_expiry {
+                    guard.size += 1;
+                    guard.expire_size -= 1;
+                }
+
+                if !had_expiry && has_expiry {
+                    guard.size -= 1;
+                    guard.expire_size += 1;
+                }
 
                 Ok(if expired { None } else { Some(old) })
             }
@@ -266,19 +429,36 @@ impl Store {
             // Overwrite existing entry that has not expired (or has no expiration set)
             Entry::Occupied(mut e) if matches!(cond, Some(XX) | None) => {
                 let expiry = expiration(&e);
-                Ok(Some(e.get_mut().write(val, expiry)))
+
+                let had_expiry = e.get().expiry.is_some();
+                let has_expiry = expiry.is_some();
+
+                let value = Some(e.get_mut().write(val, expiry));
+
+                if had_expiry && !has_expiry {
+                    guard.size += 1;
+                    guard.expire_size -= 1;
+                }
+
+                if !had_expiry && has_expiry {
+                    guard.size -= 1;
+                    guard.expire_size += 1;
+                }
+
+                Ok(value)
             }
 
             // Insert new value (note: we know this is a new entry, so could not be an old one)
             Entry::Vacant(e) if matches!(cond, Some(NX) | None) => {
                 // TODO: implement EXAT and PXAT
-                let expiry = if let Some(EX(ttl) | PX(ttl)) = exp {
-                    Some(now + ttl)
+                if let Some(EX(ttl) | PX(ttl)) = exp {
+                    e.insert(ValueCell::new(val, Some(now + ttl)));
+                    guard.expire_size += 1;
                 } else {
-                    None
-                };
+                    e.insert(ValueCell::new(val, None));
+                    guard.size += 1;
+                }
 
-                e.insert(ValueCell::new(val, expiry));
                 guard.new.notify_waiters();
 
                 Ok(None)
@@ -286,9 +466,7 @@ impl Store {
 
             // Other cases which don't meet given conditions (NX | XX)
             _ => Err(()),
-        };
-
-        value
+        }
     }
 
     pub async fn xadd(
@@ -355,6 +533,7 @@ impl Store {
                 let stream = stream::Stream::new(entries, 1, last_entry, cgroups);
 
                 e.insert(ValueCell::new(rdb::Value::Stream(stream), None));
+                guard.size += 1;
                 guard.new.notify_waiters();
 
                 Ok(Some(id))
@@ -608,5 +787,153 @@ impl Expired for VacantEntry<'_, rdb::String, ValueCell> {
     #[inline]
     fn expired_before(&self, _: SystemTime) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::time::Duration;
+
+    use super::*;
+
+    use bytes::Bytes;
+
+    use rdb::{String::*, Value};
+
+    const FOO: Bytes = Bytes::from_static(b"foo");
+    const BAR: Bytes = Bytes::from_static(b"bar");
+    const BAZ: Bytes = Bytes::from_static(b"baz");
+
+    #[tokio::test]
+    async fn simple_set_get() {
+        let store = Store::default();
+
+        let value = store.get(Str(FOO)).await;
+        assert!(value.is_none(), "cannot get a value from an empty store");
+
+        let value = Value::String(Str(BAR));
+        let expected = Some(value.clone());
+
+        let old = store
+            .set(Str(FOO), value, set::StoreOptions::default())
+            .await
+            .expect("new value was set");
+
+        assert!(old.is_none(), "the should be no previous value");
+
+        let acutal = store.get(Str(FOO)).await;
+        assert_eq!(expected, acutal);
+
+        assert_eq!((1, 0), store.dbsize().await);
+    }
+
+    // TODO: add test for KEEPTTL
+    #[tokio::test]
+    async fn set_get_with_options() {
+        let store = Store::default();
+
+        let value = store.get(Str(FOO)).await;
+        assert!(value.is_none(), "cannot get a value from an empty store");
+
+        let value = Value::String(Str(BAR));
+        let expected = Some(value.clone());
+
+        let ops = set::StoreOptions {
+            exp: Some(set::Expiry::EX(Duration::from_secs(10))),
+            cond: Some(set::Condition::NX),
+        };
+
+        let old = store
+            .set(Str(FOO), value, ops)
+            .await
+            .expect("new value was set");
+
+        assert!(old.is_none(), "the should be no previous value");
+
+        let acutal = store.get(Str(FOO)).await;
+        assert_eq!(expected, acutal);
+
+        let value = Value::String(Str(BAZ));
+        let expected = Some(value.clone());
+
+        let ops = set::StoreOptions {
+            exp: Some(set::Expiry::PX(Duration::from_millis(200))),
+            cond: Some(set::Condition::NX),
+        };
+
+        let old = store
+            .set(Str(BAR), value, ops)
+            .await
+            .expect("new value was set");
+
+        assert!(old.is_none(), "the should be no previous value");
+
+        let acutal = store.get(Str(BAR)).await;
+        assert_eq!(expected, acutal);
+
+        assert_eq!((0, 2), store.dbsize().await);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let value = store.get(Str(FOO)).await;
+        assert!(value.is_some(), "foo has not expired yet");
+
+        // FIXME: before GET bar, its key is still accounted for the expire size
+        // assert_eq!((0, 1), store.dbsize().await);
+
+        let value = store.get(Str(BAR)).await;
+        assert!(value.is_none(), "bar has expired");
+
+        assert_eq!((0, 1), store.dbsize().await);
+
+        // set bar again on an already expired key - should fail with XX and succeed with NX
+        let value = Value::String(Str(BAZ));
+        let expected = value.clone();
+
+        let ops = set::StoreOptions {
+            exp: None,
+            cond: Some(set::Condition::XX),
+        };
+
+        store
+            .set(Str(BAR), value.clone(), ops)
+            .await
+            .expect_err("SET with XX should not succeed on an already expired key");
+
+        let ops = set::StoreOptions {
+            exp: Some(set::Expiry::PX(Duration::from_millis(200))),
+            cond: Some(set::Condition::NX),
+        };
+
+        let old = store
+            .set(Str(BAR), value.clone(), ops)
+            .await
+            .expect("new value was set");
+
+        assert!(old.is_none(), "store should not expose expired values");
+
+        let actual = store
+            .get(Str(BAR))
+            .await
+            .expect("SET with NX should succeed on an already expired key");
+
+        assert_eq!(expected, actual);
+
+        assert_eq!((0, 2), store.dbsize().await);
+
+        let ops = set::StoreOptions {
+            exp: Some(set::Expiry::KeepTTL),
+            cond: Some(set::Condition::XX),
+        };
+
+        let actual = store
+            .set(Str(BAR), value.clone(), ops)
+            .await
+            .expect("SET with XX on an existing key should succeed");
+
+        assert_eq!(Some(expected), actual);
+
+        assert_eq!((0, 2), store.dbsize().await);
     }
 }

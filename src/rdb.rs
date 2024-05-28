@@ -1,13 +1,34 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::io::{self, Error, ErrorKind};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
-use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use std::collections::HashSet;
 
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::data::ParseInt;
 use crate::store::Database;
 use crate::stream::Stream;
+
+pub(crate) const MAGIC: &[u8] = b"REDIS";
+pub(crate) const DEFAULT_DB: usize = Database::DEFAULT;
+
+const U32_MAX: usize = u32::MAX as usize;
+
+pub(crate) mod aux {
+    pub const REDIS_VER: &[u8] = b"redis-ver";
+    pub const REDIS_BITS: &[u8] = b"redis-bits";
+    pub const CTIME: &[u8] = b"ctime";
+    pub const USED_MEM: &[u8] = b"used-mem";
+    pub const REPL_STREAM_DB: &[u8] = b"repl-stream-db";
+    pub const REPL_ID: &[u8] = b"repl-id";
+    pub const REPL_OFFSET: &[u8] = b"repl-offset";
+    pub const AOF_BASE: &[u8] = b"aof-base";
+}
 
 pub(crate) mod opcode {
     pub(crate) const EOF: u8 = 0xFF;
@@ -24,6 +45,14 @@ mod encoding {
     pub(super) const BIT_LEN_32: u8 = 0x80;
     pub(super) const BIT_LEN_64: u8 = 0x81;
     pub(super) const ENC_VAL: u8 = 3;
+
+    // NOTE: exclusive patterns (lb..ub) are experimental, hence the -1 in upper bounds
+    pub(super) const LB_INT8: i64 = -(1 << 7);
+    pub(super) const UB_INT8: i64 = (1 << 7) - 1;
+    pub(super) const LB_INT16: i64 = -(1 << 15);
+    pub(super) const UB_INT16: i64 = (1 << 15) - 1;
+    pub(super) const LB_INT32: i64 = -(1 << 31);
+    pub(super) const UB_INT32: i64 = (1 << 31) - 1;
 }
 
 mod valtype {
@@ -73,6 +102,26 @@ impl From<i32> for String {
     #[inline]
     fn from(i: i32) -> Self {
         Self::Int32(i)
+    }
+}
+
+impl From<i64> for String {
+    #[inline]
+    fn from(value: i64) -> Self {
+        use encoding::*;
+        match value {
+            LB_INT8..=UB_INT8 => Self::Int8(value as i8),
+            LB_INT16..=UB_INT16 => Self::Int16(value as i16),
+            LB_INT32..=UB_INT32 => Self::Int32(value as i32),
+            value => value.to_string().into(),
+        }
+    }
+}
+
+impl From<isize> for String {
+    #[inline]
+    fn from(value: isize) -> Self {
+        Self::from(value as i64)
     }
 }
 
@@ -166,6 +215,72 @@ where
     };
 
     Ok((string, bytes_read))
+}
+
+impl String {
+    pub async fn write_into<W>(self, writer: &mut W, buf: &mut BytesMut) -> io::Result<usize>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        match self {
+            String::Str(bytes) if bytes.len() <= 11 => {
+                if let Ok(value) = bytes.as_ref().parse::<i32>() {
+                    let mut buf = [0; 5]; // len is max bytes written by encode_integer
+                    let n = encode_integer(value as i64, &mut buf);
+                    writer.write_all(&buf[..n]).await?;
+                    return Ok(n);
+                }
+
+                // TODO: LZF compression (if enabled)
+
+                Self::write_str(bytes, writer).await
+            }
+            String::Str(bytes) => Self::write_str(bytes, writer).await,
+            String::Int8(i) => Self::write_int(i as i64, writer, buf).await,
+            String::Int16(i) => Self::write_int(i as i64, writer, buf).await,
+            String::Int32(i) => Self::write_int(i as i64, writer, buf).await,
+        }
+    }
+
+    async fn write_int<W>(value: i64, writer: &mut W, buf: &mut BytesMut) -> io::Result<usize>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        // TODO: inline the buffer
+        // buffer with enough capacity for encoding of an i64
+        //let mut buf = [0; 32];
+
+        buf.clear();
+        buf.resize(32, 0);
+
+        let n = encode_integer(value, buf);
+
+        if n > 0 {
+            writer.write_all(&buf[..n]).await?;
+            return Ok(n);
+        }
+
+        // encode as string
+        buf.write_fmt(format_args!("{value}"))
+            .map_err(Error::other)?;
+
+        Self::write_str(buf, writer).await
+    }
+
+    async fn write_str<B, W>(bytes: B, writer: &mut W) -> io::Result<usize>
+    where
+        B: AsRef<[u8]>,
+        W: AsyncWriteExt + Unpin,
+    {
+        let bytes = bytes.as_ref();
+
+        let enclen = Length::Len(bytes.len());
+        let enclen_len = enclen.write_into(writer).await?;
+
+        writer.write_all(bytes).await?;
+
+        Ok(enclen_len + bytes.len())
+    }
 }
 
 // TODO: implement
@@ -265,6 +380,7 @@ impl From<ValueType> for String {
 
 // TODO: other "valtype"s
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum Value {
     String(String),
     Stream(Stream),
@@ -295,6 +411,16 @@ impl Value {
             )),
         }
     }
+
+    pub async fn write_into<W>(self, writer: &mut W, buf: &mut BytesMut) -> io::Result<usize>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        match self {
+            Self::String(s) => s.write_into(writer, buf).await,
+            Self::Stream(_) => unimplemented!("RDB: writing streams is not supported"),
+        }
+    }
 }
 
 impl From<Value> for String {
@@ -319,7 +445,7 @@ impl From<&Value> for ValueType {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Encoding {
     Int8 = 0,
@@ -347,7 +473,7 @@ impl TryFrom<u8> for Encoding {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Length {
     Len(usize),
     Enc(Encoding),
@@ -372,7 +498,7 @@ impl Length {
             BIT_LEN_14 => {
                 let y = reader.read_u8().await?;
                 bytes_read += 1;
-                Self::Len((((x & 0x3F) << u8::BITS) | y) as usize)
+                Self::Len((((x as u16 & 0x3F) << 8) | y as u16) as usize)
             }
             BIT_LEN_32 => {
                 let len = reader.read_u32().await?;
@@ -395,12 +521,75 @@ impl Length {
         Ok((len, bytes_read))
     }
 
+    pub async fn write_into<W>(self, writer: &mut W) -> io::Result<usize>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        use encoding::*;
+
+        let Self::Len(len) = self else {
+            unimplemented!("use encode_integer instead");
+        };
+
+        Ok(match len {
+            len if len < (1 << 6) => {
+                writer.write_u8(len as u8 | (BIT_LEN_6 << 6)).await?;
+                1
+            }
+
+            len if len < (1 << 14) => {
+                // write u16 as BE bytes
+                let buf = [len as u8 | (BIT_LEN_14 << 6), len as u8];
+                writer.write_all(&buf).await?;
+                2
+            }
+
+            ..=U32_MAX => {
+                writer.write_u8(BIT_LEN_32).await?;
+                writer.write_u32(len as u32).await?;
+                1 + 4
+            }
+
+            _ => {
+                writer.write_u8(BIT_LEN_64).await?;
+                writer.write_u64(len as u64).await?;
+                1 + 8
+            }
+        })
+    }
+
     #[inline]
     pub fn into_length(self) -> usize {
         match self {
             Self::Len(len) => len,
             Self::Enc(val) => val as u8 as usize,
         }
+    }
+}
+
+fn encode_integer(value: i64, enc: &mut [u8]) -> usize {
+    use encoding::*;
+    match value {
+        LB_INT8..=UB_INT8 => {
+            enc[0] = (ENC_VAL << 6) | Encoding::Int8 as u8;
+            enc[1] = value as u8; // implicitly & 0xFF
+            2
+        }
+        LB_INT16..=UB_INT16 => {
+            enc[0] = (ENC_VAL << 6) | Encoding::Int16 as u8;
+            enc[1] = (value as u16 & 0xFF) as u8;
+            enc[2] = ((value as u16 >> 8) & 0xFF) as u8;
+            3
+        }
+        LB_INT32..=UB_INT32 => {
+            enc[0] = (ENC_VAL << 6) | Encoding::Int32 as u8;
+            enc[1] = (value as u32 & 0xFF) as u8;
+            enc[2] = ((value as u32 >> 8) & 0xFF) as u8;
+            enc[3] = ((value as u32 >> 16) & 0xFF) as u8;
+            enc[4] = ((value as u32 >> 24) & 0xFF) as u8;
+            5
+        }
+        _ => 0,
     }
 }
 
@@ -448,27 +637,46 @@ where
     Ok((time, 8))
 }
 
-#[derive(Debug, Default)]
+pub(crate) async fn write_time_ms<W>(t: SystemTime, writer: &mut W) -> io::Result<usize>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let ms = t
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_millis();
+
+    writer.write_u64_le(ms as u64).await?;
+    Ok(8)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Aux {
     pub(crate) redis_ver: Option<String>,
     pub(crate) redis_bits: Option<String>,
     pub(crate) ctime: Option<String>,
     pub(crate) used_mem: Option<String>,
+    pub(crate) repl_stream_db: Option<String>,
+    pub(crate) repl_id: Option<String>,
+    pub(crate) repl_offset: Option<String>,
     pub(crate) aof_base: Option<String>,
 }
 
 impl Aux {
     pub fn set(&mut self, key: String, val: String) -> io::Result<()> {
-        use self::String::*;
+        use self::{aux::*, String::*};
         match (key, val) {
             (k @ (Int8(_) | Int16(_) | Int32(_)), _) => {
                 return Err(invalid_data(format!("RDB: expected string key, got {k:?}")))
             }
-            (Str(k), v) if matches!(k.as_ref(), b"redis-ver") => self.redis_ver = Some(v),
-            (Str(k), v) if matches!(k.as_ref(), b"redis-bits") => self.redis_bits = Some(v),
-            (Str(k), v) if matches!(k.as_ref(), b"ctime") => self.ctime = Some(v),
-            (Str(k), v) if matches!(k.as_ref(), b"used-mem") => self.used_mem = Some(v),
-            (Str(k), v) if matches!(k.as_ref(), b"aof-base") => self.aof_base = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), REDIS_VER) => self.redis_ver = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), REDIS_BITS) => self.redis_bits = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), CTIME) => self.ctime = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), USED_MEM) => self.used_mem = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), REPL_STREAM_DB) => self.repl_stream_db = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), REPL_ID) => self.repl_id = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), REPL_OFFSET) => self.repl_offset = Some(v),
+            (Str(k), v) if matches!(k.as_ref(), AOF_BASE) => self.aof_base = Some(v),
             (k, v) => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
@@ -481,7 +689,7 @@ impl Aux {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RDB {
     pub(crate) version: NonZeroU32,
     pub(crate) aux: Aux,
@@ -490,10 +698,65 @@ pub struct RDB {
     pub(crate) checksum: Option<Bytes>,
 }
 
+#[cfg(test)]
+impl RDB {
+    pub(crate) fn remove(mut self, mut expired: HashMap<usize, HashSet<String>>) -> Self {
+        for db in self.dbs.values_mut() {
+            for expired in expired.remove(&db.ix).unwrap_or_default() {
+                db.remove(&expired);
+            }
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+#[repr(transparent)]
+pub struct RDBData(pub(crate) Bytes);
+
+impl std::ops::Deref for RDBData {
+    type Target = Bytes;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[inline]
 fn invalid_data<E>(e: E) -> Error
 where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     Error::new(ErrorKind::InvalidData, e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TODO: this calls for a proptest
+    #[tokio::test]
+    async fn write_read_length() {
+        let cases = [
+            (Length::Len(63), 1),
+            //(Length::Len(16383), 2),
+            (Length::Len(257), 2),
+            //(Length::Len(u32::MAX as usize + 1), 9),
+        ];
+
+        for (input, bytes_expected) in cases {
+            let mut writer = Vec::with_capacity(128);
+
+            let bytes_written = input.write_into(&mut writer).await.expect("write length");
+            assert_eq!(bytes_expected, bytes_written);
+
+            let mut reader = io::Cursor::new(writer);
+
+            let (output, bytes_read) = Length::read_from(&mut reader).await.expect("read length");
+            assert_eq!(bytes_written, bytes_read);
+
+            assert_eq!(input, output);
+        }
+    }
 }

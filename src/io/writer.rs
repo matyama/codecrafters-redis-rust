@@ -1,15 +1,93 @@
+use std::fmt::Write;
 use std::future::Future;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::pin::Pin;
-use std::{fmt::Write, u8};
 
-use anyhow::{Context, Result};
-use bytes::{BufMut, BytesMut};
+use anyhow::{ensure, Context, Result};
+use bytes::{BufMut, Bytes, BytesMut};
+use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
+use crate::data::DataType;
 use crate::io::CRLF;
-use crate::{rdb, DataType, RDBData};
+use crate::rdb::{self, aux, DEFAULT_DB, MAGIC, RDB};
 
 const NULL: &[u8] = b"_\r\n";
+
+const REDIS_VER: Bytes = Bytes::from_static(aux::REDIS_VER);
+const REDIS_BITS: Bytes = Bytes::from_static(aux::REDIS_BITS);
+const CTIME: Bytes = Bytes::from_static(aux::CTIME);
+const USED_MEM: Bytes = Bytes::from_static(aux::USED_MEM);
+const AOF_BASE: Bytes = Bytes::from_static(aux::AOF_BASE);
+
+macro_rules! rdb_write {
+    ([$writer:expr, $written:ident]; SELECTDB $ix:expr) => {
+        rdb_write! { [$writer, $written]; @SELECTDB }
+
+        $written += rdb::Length::Len($ix)
+            .write_into(&mut $writer)
+            .await
+            .with_context(|| format!("SELECTDB {}", $ix))?;
+    };
+
+    ([$writer:expr, $written:ident]; RESIZEDB $($size:ident),+) => {
+        rdb_write! { [$writer, $written]; @RESIZEDB }
+
+        $(
+            $written += rdb::Length::Len($size)
+                .write_into(&mut $writer)
+                .await
+                .with_context(|| format!("RESIZEDB {}", stringify!($size)))?;
+        )+
+    };
+
+    ([$writer:expr, $written:ident]; EXPIRETIMEMS $t:expr) => {
+        rdb_write! { [$writer, $written]; @EXPIRETIMEMS }
+
+        $written += rdb::write_time_ms($t, &mut $writer)
+            .await
+            .with_context(|| format!("EXPIRETIMEMS entry expiration time {:?}", $t))?;
+    };
+
+    ([$writer:expr, $written:ident]; @$op:ident) => {
+        rdb_write! { [$writer, $written, "{:x?} opcode"]; rdb::opcode::$op }
+    };
+
+    ([$writer:expr, $written:ident, $cx:expr]; $byte:expr) => {
+        $writer
+            .write_u8($byte)
+            .await
+            .with_context(|| format!($cx, $byte))?;
+        $written += 1;
+    };
+
+    ([$writer:expr, $buf:expr, $written:ident]; $($key:ident: $val:expr),+) => {
+        $(
+            if let Some(val) = $val {
+                rdb_write! {
+                    [$writer, $buf, $written, "AUX entry {}"];
+                    rdb::String::Str($key) => rdb::String { val } as AUX
+                }
+            }
+        )+
+    };
+
+    (
+        [$writer:expr, $buf:expr, $written:ident, $cx:expr];
+        $key:expr => $vt:ty { $val:expr } as $ty:expr
+    ) => {
+        rdb_write! { [$writer, $written, $cx]; $ty }
+
+        $written += $key.write_into(&mut $writer, &mut $buf)
+            .await
+            .with_context(|| format!($cx, "key"))?;
+
+        $written += <$vt>::write_into($val, &mut $writer, &mut $buf)
+            .await
+            .with_context(|| format!($cx, "value"))?;
+    };
+}
 
 pub struct DataWriter<W> {
     writer: BufWriter<W>,
@@ -28,6 +106,12 @@ where
             buf: String::with_capacity(16),
             aux: String::with_capacity(16),
         }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn into_inner(self) -> W {
+        self.writer.into_inner()
     }
 
     /// Returns the number of bytes written
@@ -181,7 +265,16 @@ where
     ///
     /// Note that the format similar to how [Bulk String](DataType::BulkString)s are encoded, but
     /// without the trailing [CLRF].
-    pub async fn write_rdb(&mut self, RDBData(data): RDBData) -> Result<()> {
+    pub async fn write_rdb(&mut self, rdb: RDB) -> Result<()> {
+        // TODO: read this from a BGSAVEd file (get length from the file writer or FS)
+        //  - implementation detail: write while reading (i.e., pipe the bytes)
+        let data = {
+            let mut mem_writer = DataWriter::new(Vec::with_capacity(1024));
+            let _ = mem_writer.write_rdb_file(rdb).await?;
+            mem_writer.flush().await?;
+            mem_writer.writer.into_inner()
+        };
+
         self.writer.write_u8(b'$').await?;
 
         self.buf.clear();
@@ -199,8 +292,114 @@ where
             .context("RDB file contents")
     }
 
+    /// https://rdb.fnordig.de/file_format.html
+    pub async fn write_rdb_file(&mut self, rdb: RDB) -> Result<usize> {
+        use rdb::opcode::*;
+
+        ensure!(
+            rdb.dbs.contains_key(&DEFAULT_DB),
+            "RDB is missing the default DB: {DEFAULT_DB}"
+        );
+
+        // TODO: ideally reuse `self.buf` (but that one's currently a String)
+        let mut buf = BytesMut::with_capacity(256);
+        let mut bytes_written = 0;
+
+        // header (magic + version)
+        {
+            self.writer.write_all(MAGIC).await.context("magic")?;
+            bytes_written += MAGIC.len();
+
+            // NOTE: must be exactly 4B
+            buf.write_fmt(format_args!("{:04}", rdb.version))?;
+            self.writer.write_all(&buf).await.context("version")?;
+            bytes_written += buf.len();
+
+            buf.clear();
+        }
+
+        // auxiliary fields
+        rdb_write! {
+            [self.writer, buf, bytes_written];
+            REDIS_VER: rdb.aux.redis_ver,
+            REDIS_BITS: rdb.aux.redis_bits,
+            CTIME: rdb.aux.ctime,
+            USED_MEM: rdb.aux.used_mem,
+            AOF_BASE: rdb.aux.aof_base
+        }
+
+        // databases
+        let mut dbs = rdb.dbs.into_values().collect::<Vec<_>>();
+        dbs.sort_unstable_by_key(|db| db.ix);
+
+        for db in dbs {
+            let (ix, db, db_size, expires_size) = db.into_inner();
+
+            rdb_write! {
+                [self.writer, bytes_written];
+                SELECTDB ix
+            }
+
+            rdb_write! {
+                [self.writer, bytes_written];
+                RESIZEDB db_size, expires_size
+            }
+
+            // [EXPIRETIMEMS <exipire-time>] <ty> <key> <val>
+            for (key, val) in db.into_iter() {
+                let (val, expire) = val.into_inner();
+
+                if let Some(expire) = expire {
+                    // NOTE: Redis seems to always save the expire time in milliseconds
+                    rdb_write! {
+                        [self.writer, bytes_written];
+                        EXPIRETIMEMS expire
+                    }
+                }
+
+                let ty = rdb::ValueType::from(&val) as u8;
+
+                rdb_write! {
+                    [self.writer, buf, bytes_written, "entry {}"];
+                    key => rdb::Value { val } as ty
+                }
+            }
+        }
+
+        self.writer.write_u8(EOF).await.context("EOF")?;
+        bytes_written += 1;
+
+        // checksum
+        if let Some(checksum) = rdb.checksum {
+            self.writer.write_all(&checksum).await.context("checksum")?;
+            bytes_written += checksum.len();
+        }
+
+        Ok(bytes_written)
+    }
+
     pub async fn flush(&mut self) -> Result<()> {
         self.writer.flush().await.context("flush data")
+    }
+}
+
+#[allow(dead_code)]
+#[repr(transparent)]
+pub struct RDBFileWriter(DataWriter<File>);
+
+#[allow(dead_code)]
+impl RDBFileWriter {
+    pub async fn new(file: impl AsRef<Path>) -> Result<Option<Self>> {
+        match File::open(file).await {
+            Ok(file) => Ok(Some(Self(DataWriter::new(file)))),
+            // TODO: this should probably create the file (or rather write to a temp and swap)
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound) => Ok(None),
+            Err(e) => Err(e).context("failed to read RDB"),
+        }
+    }
+
+    pub async fn write(&mut self, rdb: RDB) -> Result<usize> {
+        self.0.write_rdb_file(rdb).await
     }
 }
 

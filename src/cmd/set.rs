@@ -341,7 +341,7 @@ impl From<Set> for Command {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StoreOptions {
     pub(crate) exp: Option<Expiry>,
     pub(crate) cond: Option<Condition>,
