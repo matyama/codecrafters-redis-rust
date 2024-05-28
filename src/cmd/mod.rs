@@ -29,6 +29,7 @@ const NULL: DataType = match PROTOCOL {
     Protocol::RESP3 => DataType::Null,
 };
 
+pub(crate) const DBSIZE: Bytes = Bytes::from_static(resp::DBSIZE);
 pub(crate) const PING: Bytes = Bytes::from_static(resp::PING);
 pub(crate) const ECHO: Bytes = Bytes::from_static(resp::ECHO);
 pub(crate) const CONFIG: Bytes = Bytes::from_static(resp::CONFIG);
@@ -52,6 +53,7 @@ pub(crate) const NONE: Bytes = Bytes::from_static(b"none");
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    DBSize,
     Ping(Option<rdb::String>),
     Echo(rdb::String),
     Config(Arc<[Bytes]>),
@@ -74,6 +76,11 @@ impl Command {
     pub async fn exec(self, instance: Arc<Instance>) -> DataType {
         use rdb::String::*;
         match self {
+            Self::DBSize => {
+                let (db_size, expire_size) = instance.store.dbsize().await;
+                DataType::Integer((db_size + expire_size) as i64)
+            }
+
             Self::Ping(msg) => msg.map_or(DataType::str(PONG), DataType::BulkString),
 
             Self::Echo(msg) => DataType::string(msg),
@@ -277,6 +284,8 @@ impl Command {
 impl From<Command> for DataType {
     fn from(cmd: Command) -> Self {
         let items = match cmd {
+            Command::DBSize => vec![Self::string(DBSIZE)],
+
             Command::Ping(None) => vec![Self::string(PING)],
 
             Command::Ping(Some(msg)) => vec![Self::string(PING), Self::string(msg)],

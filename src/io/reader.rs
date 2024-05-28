@@ -307,6 +307,7 @@ where
         self.buf.make_ascii_uppercase();
 
         let resp = match self.buf.as_slice() {
+            DBSIZE => Resp::Cmd(Command::DBSize),
             PING => cmd_try_from!(args => ping::Ping),
             ECHO => cmd_try_from!(args => Command::Echo as "echo"),
             CONFIG => cmd_try_from!(args => config::ConfigGet),

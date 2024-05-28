@@ -31,6 +31,7 @@ pub(crate) mod store;
 pub(crate) mod stream;
 
 pub(crate) mod resp {
+    pub const DBSIZE: &[u8] = b"DBSIZE";
     pub const PING: &[u8] = b"PING";
     pub const ECHO: &[u8] = b"ECHO";
     pub const CONFIG: &[u8] = b"CONFIG";

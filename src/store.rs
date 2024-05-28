@@ -82,7 +82,6 @@ impl Database {
     }
 
     /// Returns a pair of the number of keys with and without expiration
-    #[cfg(test)]
     #[inline]
     pub(crate) fn size(&self) -> (usize, usize) {
         (self.size, self.expire_size)
@@ -328,9 +327,7 @@ impl Store {
         }
     }
 
-    // TODO: expose as command
     // FIXME: keys expire
-    #[cfg(test)]
     pub async fn dbsize(&self) -> (usize, usize) {
         let store = self.0.read().await;
         let guard = store.db().await;
