@@ -154,7 +154,7 @@ mod tests {
                 aof_base: Some(Int8(0)),
             },
             dbs,
-            checksum: Some(Bytes::from_static(b"\xba\x98\x18\x82\xd2\x98\x96\xbc")),
+            checksum: Some(123),
         };
 
         let input = rdb.clone().remove(expired);

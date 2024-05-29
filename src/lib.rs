@@ -287,6 +287,14 @@ impl Instance {
         &self.role
     }
 
+    #[inline]
+    fn prepare_repl(&self, cmd: &Command) -> Option<Command> {
+        match self.role() {
+            Role::Leader(_) if cmd.is_write() => Some(cmd.clone()),
+            _ => None,
+        }
+    }
+
     pub fn state(&self) -> ReplState {
         let state = self.state.load(Acquire);
         // NOTE: if the below is not correct, this could easily use some delayed reclamation scheme
@@ -351,6 +359,20 @@ impl Instance {
         Ok(self.store.snapshot(|| self.state()).await)
     }
 
+    // TODO: handle replicated SELECT (implicitly send an interleaved select)
+    //  - remember last SELECT ix sent to replicas (initial ix=0 not sent)
+    //  - Role::Leader { replicas: ReplicaSet, repl_db: AtomicUsize }
+    //  - inject and forward a SELECT conn.ix command if conn.ix != repl.last_ix
+    //  - and update the last replicated index (if changed)
+    //  - and don't forget to shift the offset by that implicit SELECT ahead of time
+    async fn replicate(&self, cmd: Command, offset: usize) {
+        if let Role::Leader(replicas) = &self.role {
+            let (old_state, new_offset) = self.shift_offset(offset);
+            println!("master offset: {} -> {new_offset}", old_state.repl_offset);
+            replicas.forward(cmd).await;
+        }
+    }
+
     pub async fn handle_connection(&self, mut conn: TcpStream, addr: SocketAddr) -> Result<()> {
         let id = self.next_client_id.fetch_add(1, Relaxed);
         let mut client = Client::new(id, addr, self.cfg.addr);
@@ -385,41 +407,31 @@ impl Instance {
                     // assume that after PSYNC the replica will end up in the current state
                     return replicas.register(conn, self.state()).await;
                 }
-                Resp::Cmd(cmd) if cmd.is_write() => {
-                    let repl_cmd = cmd.clone();
 
-                    println!("executing write command {cmd:?}");
+                Resp::Cmd(cmd) => {
+                    println!("executing command {cmd:?}");
+
+                    let repl_cmd = self.prepare_repl(&cmd);
+
                     let resp = cmd.exec(self, &mut client).await;
 
                     writer.write(&resp).await?;
                     writer.flush().await?;
 
-                    // TODO: handle replicated SELECT (implicitly send an interleaved select)
-                    //  - remember last SELECT ix sent to replicas (initial ix=0 not sent)
-                    //  - inject and forward a SELECT conn.ix command if conn.ix != repl.last_ix
-                    //  - and update the last replicated index (if changed)
-                    if let Role::Leader(replicas) = &self.role {
-                        if resp.is_replicable() {
-                            let (old_state, new_offset) = self.shift_offset(bytes_read);
-                            println!("master offset: {} -> {new_offset}", old_state.repl_offset);
-                            replicas.forward(repl_cmd).await;
-                        }
+                    match repl_cmd {
+                        Some(cmd) if resp.is_ok() => self.replicate(cmd, bytes_read).await,
+                        _ => {}
                     }
 
-                    println!("write command handled: {resp:?}");
+                    println!("command handled: {resp:?}");
                 }
-                Resp::Cmd(cmd) => {
-                    println!("executing non-write command {cmd:?}");
-                    let resp = cmd.exec(self, &mut client).await;
-                    writer.write(&resp).await?;
-                    writer.flush().await?;
-                    println!("non-write command handled: {resp:?}");
-                }
+
                 // XXX: || resp.is_null()
                 Resp::Data(resp) if resp.is_err() => {
                     writer.write(&resp).await?;
                     writer.flush().await?;
                 }
+
                 Resp::Data(resp) => {
                     bail!("protocol violation: expected a command, got {resp:?} instead")
                 }

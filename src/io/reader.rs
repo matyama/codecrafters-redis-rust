@@ -272,9 +272,9 @@ where
 
         // read checksum (8B)
         let checksum = if u32::from(version) >= 5 {
-            buf.resize(8, 0);
-            bytes_read += self.reader.read_exact(&mut buf).await.context("checksum")?;
-            Some(buf.split().freeze())
+            let checksum = self.reader.read_u64_le().await.context("checksum")?;
+            bytes_read += 8;
+            Some(checksum)
         } else {
             None
         };

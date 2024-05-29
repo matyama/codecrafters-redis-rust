@@ -697,7 +697,7 @@ pub struct RDB {
     pub(crate) aux: Aux,
     pub(crate) dbs: Vec<Database>,
     /// Note: checksum is supported for `version >= 5`
-    pub(crate) checksum: Option<Bytes>,
+    pub(crate) checksum: Option<u64>,
 }
 
 #[cfg(test)]

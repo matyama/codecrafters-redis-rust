@@ -363,8 +363,11 @@ where
 
         // checksum
         if let Some(checksum) = rdb.checksum {
-            self.writer.write_all(&checksum).await.context("checksum")?;
-            bytes_written += checksum.len();
+            self.writer
+                .write_u64_le(checksum)
+                .await
+                .context("checksum")?;
+            bytes_written += 8;
         }
 
         Ok(bytes_written)

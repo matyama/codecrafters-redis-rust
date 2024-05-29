@@ -283,7 +283,13 @@ impl Command {
     /// replication.
     #[inline]
     pub(crate) fn is_write(&self) -> bool {
-        // FIXME: What if a replica client issues a SELECT? It probably is just a read!
+        // FIXME: SELECT is not always a write (even in leader: "SELECT 1\nGET foo")
+        //  - so it actually depends on the current replication connection state (last db)
+        //match self {
+        //    Self::Select(_) => server.is_replica() && client.is_leader(), // i.e., from repl conn
+        //    Self::Set(..) | Self::XAdd(..) => true,
+        //    _ => false,
+        //}
         matches!(self, Self::Select(_) | Self::Set(..) | Self::XAdd(_, _, _))
     }
 

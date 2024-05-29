@@ -28,7 +28,7 @@ pub enum DataType {
 
 impl DataType {
     #[inline]
-    pub(crate) fn is_replicable(&self) -> bool {
+    pub(crate) fn is_ok(&self) -> bool {
         !self.is_err() && !self.is_null()
     }
 
