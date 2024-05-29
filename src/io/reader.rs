@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::num::{NonZeroU32, ParseIntError};
@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::cmd::{config, info, ping, replconf, set, sync, wait, xadd, xrange, xread};
+use crate::cmd::{config, info, ping, replconf, select, set, sync, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
 use crate::io::CRLF;
 use crate::rdb::{self, RDBData, MAGIC, RDB};
@@ -140,7 +140,8 @@ where
 
         let mut aux = rdb::Aux::default();
         // TODO: default number of databases from config
-        let mut dbs = HashMap::with_capacity(16);
+        let mut dbs = Vec::with_capacity(crate::config::DBNUM);
+        let mut seen = HashSet::with_capacity(dbs.capacity());
 
         let mut db = None;
         let mut expiry = None;
@@ -167,10 +168,10 @@ where
                     let default = if let Some(db) = db.replace(Database::builder()) {
                         let db = db.build()?;
 
-                        let Entry::Vacant(entry) = dbs.entry(db.ix) else {
-                            bail!("encountered two database with the same index={}", db.ix)
-                        };
-                        entry.insert(db);
+                        ensure!(!seen.contains(&db.id), "DBs with the same index={}", db.id);
+
+                        seen.insert(db.id);
+                        dbs.push(db);
 
                         false
                     } else {
@@ -179,22 +180,18 @@ where
 
                     let db = db.as_mut().expect("DB builder must exist");
 
-                    let (ix, bytes_ix) = rdb::Length::read_from(&mut self.reader)
+                    let (id, bytes_id) = rdb::Length::read_from(&mut self.reader)
                         .await
                         .context("SELECTDB <number>")?;
 
-                    let ix = ix.into_length();
+                    let id = id.into_length();
 
                     if default {
-                        ensure!(
-                            ix == Database::DEFAULT,
-                            "expected db={}, got db={ix}",
-                            Database::DEFAULT
-                        );
+                        ensure!(id == 0, "expected default DB, got db={id}");
                     }
 
-                    db.with_index(ix);
-                    bytes_read += bytes_ix;
+                    db.with_id(id);
+                    bytes_read += bytes_id;
                 }
 
                 RESIZEDB => {
@@ -236,12 +233,15 @@ where
                 }
 
                 EOF => {
-                    let db = db.take().unwrap_or_else(DatabaseBuilder::empty).build()?;
+                    let db = db
+                        .take()
+                        .unwrap_or_else(|| DatabaseBuilder::empty(0))
+                        .build()?;
 
-                    let Entry::Vacant(entry) = dbs.entry(db.ix) else {
-                        bail!("DBs with the same index={}", db.ix)
-                    };
-                    entry.insert(db);
+                    ensure!(!seen.contains(&db.id), "DBs with the same index={}", db.id);
+
+                    seen.insert(db.id);
+                    dbs.push(db);
 
                     break;
                 }
@@ -286,7 +286,6 @@ where
             checksum,
         };
 
-        // println!("{rdb:?}");
         Ok((rdb, bytes_read))
     }
 
@@ -308,6 +307,7 @@ where
 
         let resp = match self.buf.as_slice() {
             DBSIZE => Resp::Cmd(Command::DBSize),
+            SELECT => cmd_try_from!(args => select::Select),
             PING => cmd_try_from!(args => ping::Ping),
             ECHO => cmd_try_from!(args => Command::Echo as "echo"),
             CONFIG => cmd_try_from!(args => config::ConfigGet),

@@ -3,10 +3,13 @@ use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 
 use crate::data::{DataExt as _, DataType};
+
+/// Default max number of stored databases
+pub(crate) const DBNUM: usize = 16;
 
 fn listen_socket_addr(port: &impl std::fmt::Display) -> Result<SocketAddr> {
     format!("0.0.0.0:{port}")
@@ -20,6 +23,7 @@ pub struct Config {
     pub(crate) replica_of: Option<SocketAddr>,
     pub(crate) dir: PathBuf,
     pub(crate) dbfilename: PathBuf,
+    pub(crate) dbnum: usize,
 }
 
 impl Config {
@@ -54,6 +58,7 @@ impl Default for Config {
             replica_of: None,
             dir: PathBuf::from("./"),
             dbfilename: PathBuf::from("dump.rdb"),
+            dbnum: DBNUM,
         }
     }
 }
@@ -111,6 +116,20 @@ impl TryFrom<Args> for Config {
                     };
 
                     cfg.dbfilename = dbfilename;
+                }
+
+                "--databases" => {
+                    let Some(dbnum) = args.next() else {
+                        bail!("missing argument value for --databases");
+                    };
+
+                    let dbnum = dbnum
+                        .parse()
+                        .context("number of databases must be an integer")?;
+
+                    ensure!(dbnum > 0, "number of databases cannot be zero");
+
+                    cfg.dbnum = dbnum;
                 }
 
                 _ => continue,

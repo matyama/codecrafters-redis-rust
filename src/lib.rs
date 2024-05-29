@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicPtr, Ordering::*};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::*};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use tokio::time::Instant;
 
 use rdb::RDB;
 use repl::{ReplConnection, Replication};
@@ -32,6 +33,7 @@ pub(crate) mod stream;
 
 pub(crate) mod resp {
     pub const DBSIZE: &[u8] = b"DBSIZE";
+    pub const SELECT: &[u8] = b"SELECT";
     pub const PING: &[u8] = b"PING";
     pub const ECHO: &[u8] = b"ECHO";
     pub const CONFIG: &[u8] = b"CONFIG";
@@ -157,6 +159,36 @@ impl From<DataType> for Resp {
     }
 }
 
+// TODO: support CLIENT LIST command
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Client {
+    /// unique client ID
+    pub(crate) id: u64,
+    /// address/port of the client
+    pub(crate) addr: SocketAddr,
+    /// address/port of local address client connected to (bind address)
+    pub(crate) laddr: SocketAddr,
+    /// client creation time
+    pub(crate) ctime: Instant,
+    /// current database ID
+    pub(crate) db: usize,
+    // TODO: other fields
+}
+
+impl Client {
+    #[inline]
+    pub fn new(id: u64, addr: SocketAddr, laddr: SocketAddr) -> Self {
+        Self {
+            id,
+            addr,
+            laddr,
+            ctime: Instant::now(),
+            db: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct Leader(SocketAddr);
@@ -177,12 +209,15 @@ impl std::fmt::Display for Role {
     }
 }
 
+// TODO: rename to Server to align more with Redis terminology
 #[derive(Debug)]
 pub struct Instance {
     cfg: Config,
     role: Role,
     state: AtomicPtr<ReplState>,
     store: Arc<Store>,
+    next_client_id: AtomicU64,
+    // TODO: client_list as an atomic linked-list (Redis also has a radix tree clients_index)
 }
 
 impl Instance {
@@ -195,9 +230,9 @@ impl Instance {
                 rdb.version, rdb.aux, rdb.checksum
             );
 
-            Store::from(rdb)
+            Store::init(rdb, cfg.dbnum).context("init store")?
         } else {
-            Store::default()
+            Store::new(cfg.dbnum)
         };
 
         let Some(leader) = cfg.replica_of else {
@@ -214,6 +249,7 @@ impl Instance {
                 role: Role::Leader(ReplicaSet::default()),
                 state,
                 store: Arc::new(store),
+                next_client_id: AtomicU64::default(),
             };
 
             return Ok((instance, ReplConnection::default()));
@@ -224,14 +260,19 @@ impl Instance {
             .with_context(|| format!("handshake with leader at {leader}"))?;
 
         // TODO: persist the initial RDB (i.e., override local dump file)
-        let store = Store::from_rdb(rdb).await.context("apply initial RDB")?;
+        let store = Store::from_rdb(rdb, cfg.dbnum)
+            .await
+            .context("apply initial RDB")?;
 
         let instance = Self {
             cfg,
             role: Role::Replica(Leader(leader)),
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             store: Arc::new(store),
+            next_client_id: AtomicU64::default(),
         };
+
+        // XXX: Should the replication connection be automatically accounted as a Client?
 
         Ok((instance, subscriber))
     }
@@ -310,7 +351,16 @@ impl Instance {
         Ok(self.store.snapshot(|| self.state()).await)
     }
 
-    pub async fn handle_connection(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
+    pub async fn handle_connection(&self, mut conn: TcpStream, addr: SocketAddr) -> Result<()> {
+        let id = self.next_client_id.fetch_add(1, Relaxed);
+        let mut client = Client::new(id, addr, self.cfg.addr);
+        // TODO: register client
+        //  - make it an atomic linked-list
+        //  - return a ClientRef which serves as an exclusive ref and on drop removes itself from
+        //    the list
+        //  - impl Deref and DerefMut with Target=Client
+        //  - issue: drop is might not be called on panic => catch the panic in main?
+
         let (reader, writer) = conn.split();
 
         let mut reader = DataReader::new(reader);
@@ -324,7 +374,7 @@ impl Instance {
                     };
 
                     println!("executing internal command: {cmd:?}");
-                    let resp = cmd.exec(Arc::clone(&self)).await;
+                    let resp = cmd.exec(self, &mut client).await;
 
                     writer.write(&resp).await?;
 
@@ -339,11 +389,15 @@ impl Instance {
                     let repl_cmd = cmd.clone();
 
                     println!("executing write command {cmd:?}");
-                    let resp = cmd.exec(Arc::clone(&self)).await;
+                    let resp = cmd.exec(self, &mut client).await;
 
                     writer.write(&resp).await?;
                     writer.flush().await?;
 
+                    // TODO: handle replicated SELECT (implicitly send an interleaved select)
+                    //  - remember last SELECT ix sent to replicas (initial ix=0 not sent)
+                    //  - inject and forward a SELECT conn.ix command if conn.ix != repl.last_ix
+                    //  - and update the last replicated index (if changed)
                     if let Role::Leader(replicas) = &self.role {
                         if resp.is_replicable() {
                             let (old_state, new_offset) = self.shift_offset(bytes_read);
@@ -356,7 +410,7 @@ impl Instance {
                 }
                 Resp::Cmd(cmd) => {
                     println!("executing non-write command {cmd:?}");
-                    let resp = cmd.exec(Arc::clone(&self)).await;
+                    let resp = cmd.exec(self, &mut client).await;
                     writer.write(&resp).await?;
                     writer.flush().await?;
                     println!("non-write command handled: {resp:?}");
@@ -382,16 +436,19 @@ impl Instance {
                 ReplHandle(dummy)
             }
 
-            Role::Replica(_) => {
+            Role::Replica(Leader(addr)) => {
                 // NOTE: buffer up some writes and unblock new read connections
                 let (tx, mut rx) = mpsc::channel::<ReplCommand>(64);
-                let instance = Arc::clone(&self);
 
                 task::spawn(async move {
+                    let server = self.as_ref();
+                    let id = server.next_client_id.fetch_add(1, Relaxed);
+                    let mut client = Client::new(id, addr, server.cfg.addr);
+
                     while let Some(ReplCommand { cmd, ack }) = rx.recv().await {
                         println!("replica: executing command {cmd:?}");
 
-                        let resp = cmd.exec(Arc::clone(&instance)).await;
+                        let resp = cmd.exec(server, &mut client).await;
 
                         if let Some(ack) = ack {
                             println!("replica: responding with {resp:?}");

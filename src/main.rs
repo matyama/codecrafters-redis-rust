@@ -43,12 +43,12 @@ async fn main() -> Result<()> {
 
             conn = listener.accept() => {
                 match conn {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         // println!("{instance}: accepted new connection at {addr}");
                         stream.set_nodelay(true).context("enable TCP_NODELAY on connection")?;
                         let instance = Arc::clone(&instance);
                         task::spawn(async move {
-                            if let Err(e) = instance.handle_connection(stream).await {
+                            if let Err(e) = instance.handle_connection(stream, addr).await {
                                 eprintln!("task handling connection failed with {e:?}");
                             }
                         });

@@ -1,10 +1,11 @@
 use std::collections::hash_map::{Entry, OccupiedEntry, VacantEntry};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::{mem, usize};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use tokio::sync::{Mutex, MutexGuard, Notify, RwLock};
 use tokio::task::JoinSet;
@@ -62,10 +63,12 @@ impl ValueCell {
     }
 }
 
+// XXX: Redis uses two kvstores: keys & expires (expires probably internally pointing to keys)
 #[derive(Clone, Debug)]
 pub struct Database {
-    pub(crate) ix: usize,
+    pub(crate) id: usize,
     db: HashMap<rdb::String, ValueCell>,
+    // XXX: rename to keys_size and expires_size
     persist_size: usize,
     expire_size: usize,
     // XXX: replace (also in cells) by single watch (issue: no wait_for requires tokio >= 1.37)
@@ -74,11 +77,25 @@ pub struct Database {
 }
 
 impl Database {
-    pub const DEFAULT: usize = 0;
+    #[inline]
+    pub fn new(id: usize) -> Self {
+        Self {
+            id,
+            db: HashMap::default(),
+            persist_size: 0,
+            expire_size: 0,
+            new: Arc::new(Notify::new()),
+        }
+    }
 
     #[inline]
     pub fn builder() -> DatabaseBuilder {
         DatabaseBuilder::default()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        (self.persist_size + self.expire_size) == 0
     }
 
     /// Returns a pair of the number of keys with and without expiration
@@ -95,7 +112,7 @@ impl Database {
 
     #[inline]
     pub(crate) fn into_inner(self) -> (usize, HashMap<rdb::String, ValueCell>, usize, usize) {
-        (self.ix, self.db, self.persist_size, self.expire_size)
+        (self.id, self.db, self.persist_size, self.expire_size)
     }
 
     #[cfg(test)]
@@ -113,7 +130,7 @@ impl Database {
 
 #[derive(Debug, Default)]
 pub struct DatabaseBuilder {
-    ix: Option<usize>,
+    id: Option<usize>,
     db: Option<HashMap<rdb::String, ValueCell>>,
     size: usize,
     expire_size: usize,
@@ -121,9 +138,9 @@ pub struct DatabaseBuilder {
 
 impl DatabaseBuilder {
     #[inline]
-    pub fn empty() -> Self {
+    pub fn empty(id: usize) -> Self {
         Self {
-            ix: Some(Database::DEFAULT),
+            id: Some(id),
             db: Some(HashMap::default()),
             size: 0,
             expire_size: 0,
@@ -131,8 +148,8 @@ impl DatabaseBuilder {
     }
 
     #[inline]
-    pub fn with_index(&mut self, ix: usize) {
-        self.ix = Some(ix);
+    pub fn with_id(&mut self, id: usize) {
+        self.id = Some(id);
     }
 
     #[inline]
@@ -142,7 +159,7 @@ impl DatabaseBuilder {
 
     #[inline]
     pub fn is_resized(&self) -> bool {
-        self.ix.is_some() && self.db.is_some()
+        self.id.is_some() && self.db.is_some()
     }
 
     #[inline]
@@ -166,15 +183,15 @@ impl DatabaseBuilder {
 
     #[inline]
     pub fn build(self) -> Result<Database> {
-        match (self.ix, self.db) {
-            (Some(ix), Some(db)) => Ok(Database {
-                ix,
+        match (self.id, self.db) {
+            (Some(id), Some(db)) => Ok(Database {
+                id,
                 db,
                 persist_size: self.size,
                 expire_size: self.expire_size,
                 new: Arc::new(Notify::new()),
             }),
-            (ix, _) => bail!("incomplete db={ix:?}"),
+            (id, _) => bail!("incomplete db={id:?}"),
         }
     }
 }
@@ -213,75 +230,79 @@ impl StreamHandle {
 //     be more scalable to use some fine-grained locking (e.g., lock per key, sharding or some
 //     tree-like structure instead of a `HashMap`).
 //  3. Lock-free implementations might turn out to perform better as well.
+//
+// XXX: clients could access the store just once at connect and hold an Arc to the selected DB
+//  - issue: current snapshot relies on an exclusive lock to this inner sore (DB list)
+//  - benefit: all Store operations could be moved to Database as clients could reference them
+//    directly (no need to pass the `db` param) and we would no longer have to retake the read lock
 #[derive(Debug)]
-struct StoreInner {
-    // FIXME: This is not how Redis handles namespaces (databases).
-    //
-    // The `SELECT ix` command applies to that particular connection - i.e., the `ix` is a property
-    // of the connection and not the whole server. Also, it's defined to be 0-indexed, so a Vec
-    // might be more appropriate than a HashMap. Note that currently it's not a big deal as we
-    // don't actually support SELECT, so the only database in use is the default one.
-    //
-    // Where SELECT might get tricky is its atomicity. From the point of view of one client, it
-    // should be atomic to swap the selected namespace. So any ongoing operations must see this
-    // change immediately. Currently this should be fine, because no write operation re-takes the
-    // store lock and commands within the same connection are sequential.
-    //
-    // XXX: Implementation of this could be that the instance registers a handle for each conn.
-    // This handle stores an atomic ptr to the currently selected database and all the store
-    // operations go through that handle. The instance than owns the store, which might no longer
-    // need a RwLock. Alternatively, the handle could store just the database index.
-    ix: usize,
-    dbs: HashMap<usize, Mutex<Database>>,
-}
+#[repr(transparent)]
+struct StoreInner(Vec<Mutex<Database>>);
 
 impl StoreInner {
     #[inline]
-    fn new(dbs: HashMap<usize, Database>) -> Self {
-        Self {
-            ix: Database::DEFAULT,
-            dbs: dbs
-                .into_iter()
-                .map(|(ix, db)| (ix, Mutex::new(db)))
-                .collect(),
+    fn new(dbnum: usize) -> Self {
+        Self(Vec::from_iter(
+            (0..dbnum).map(Database::new).map(Mutex::new),
+        ))
+    }
+
+    fn init(dbs: impl IntoIterator<Item = Database>, dbnum: usize) -> Result<Self> {
+        let mut inner = Self::new(dbnum);
+
+        for db in dbs {
+            let cell = inner
+                .get_mut(db.id)
+                .ok_or_else(|| anyhow!("DB id={} exceeds dbnum={dbnum}", db.id))?
+                .get_mut();
+
+            *cell = db;
         }
+
+        Ok(inner)
     }
 
-    async fn db(&self) -> MutexGuard<Database> {
-        self.dbs[&self.ix].lock().await
-    }
-}
-
-impl Default for StoreInner {
-    fn default() -> Self {
-        let ix = Database::DEFAULT;
-
-        let db = Database {
-            ix,
-            db: HashMap::default(),
-            new: Arc::new(Notify::new()),
-            persist_size: 0,
-            expire_size: 0,
-        };
-
-        let mut dbs = HashMap::with_capacity(Store::DEFAULT_SIZE);
-        dbs.insert(ix, Mutex::new(db));
-
-        Self { ix, dbs }
+    async fn get(&self, id: usize) -> MutexGuard<Database> {
+        self[id].lock().await
     }
 }
 
-#[derive(Debug, Default)]
+impl Deref for StoreInner {
+    type Target = [Mutex<Database>];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for StoreInner {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
 pub struct Store(RwLock<StoreInner>);
 
 impl Store {
-    /// Default number of databases this store starts with
-    pub(crate) const DEFAULT_SIZE: usize = 16;
+    #[inline]
+    pub(crate) fn new(dbnum: usize) -> Self {
+        Self(RwLock::new(StoreInner::new(dbnum)))
+    }
 
-    pub(crate) async fn from_rdb(RDBData(data): RDBData) -> Result<Self> {
+    #[inline]
+    pub(crate) fn init(RDB { dbs, .. }: RDB, dbnum: usize) -> Result<Self> {
+        StoreInner::init(dbs, dbnum).map(RwLock::new).map(Self)
+    }
+
+    pub(crate) async fn from_rdb(RDBData(data): RDBData, dbnum: usize) -> Result<Self> {
         let mut reader = DataReader::new(std::io::Cursor::new(data));
         let (rdb, _) = reader.read_rdb_file().await?;
-        Ok(Self(RwLock::new(StoreInner::new(rdb.dbs))))
+        let inner = StoreInner::init(rdb.dbs, dbnum)?;
+        Ok(Self(RwLock::new(inner)))
     }
 
     /// Clones all the contained databases and creates a [`RDB`]
@@ -292,17 +313,21 @@ impl Store {
         use rdb::{Aux, String::*};
 
         // NOTE: intentionally hold an exclusive lock here to create a consistent snapshot
-        let store = self.0.write().await;
+        let mut store = self.0.write().await;
         let state = state();
 
-        let mut dbs = HashMap::with_capacity(store.dbs.len());
-
-        for db in store.dbs.values() {
-            let db = db
-                .try_lock()
-                .expect("hold an exclusive lock to the whole store");
-            dbs.insert(db.ix, db.clone());
-        }
+        // NOTE: skip empty databases
+        let dbs = store
+            .iter_mut()
+            .map(Mutex::get_mut)
+            .filter_map(|db| {
+                if db.id > 0 && db.is_empty() {
+                    None
+                } else {
+                    Some(db.clone())
+                }
+            })
+            .collect();
 
         let checksum = Bytes::from_static(b"\xf0n;\xfe\xc0\xffZ\xa2");
 
@@ -317,7 +342,7 @@ impl Store {
                 redis_bits: Some(Int8(32)),
                 ctime: None,
                 used_mem: None,
-                repl_stream_db: Some(Int8(Database::DEFAULT as i8)),
+                repl_stream_db: Some(Int8(0)),
                 repl_id: state.repl_id.map(rdb::String::from),
                 repl_offset: Some(rdb::String::from(state.repl_offset)),
                 aof_base: Some(Int8(0)),
@@ -328,37 +353,37 @@ impl Store {
     }
 
     // FIXME: keys expire
-    pub async fn dbsize(&self) -> (usize, usize) {
+    pub async fn dbsize(&self, db: usize) -> (usize, usize) {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
         guard.size()
     }
 
     // FIXME: keys expire
     // TODO: support patters other than *
-    pub async fn keys(&self) -> Vec<rdb::String> {
+    pub async fn keys(&self, db: usize) -> Vec<rdb::String> {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
         guard.db.keys().cloned().collect()
     }
 
     // FIXME: keys expire (use get)
-    pub async fn ty(&self, key: rdb::String) -> Option<rdb::ValueType> {
+    pub async fn ty(&self, db: usize, key: rdb::String) -> Option<rdb::ValueType> {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
         guard.db.get(&key).map(rdb::ValueType::from)
     }
 
     // FIXME: keys expire (use get)
-    pub async fn contains(&self, key: &rdb::String) -> bool {
+    pub async fn contains(&self, db: usize, key: &rdb::String) -> bool {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
         guard.db.contains_key(key)
     }
 
-    pub async fn get(&self, key: rdb::String) -> Option<rdb::Value> {
+    pub async fn get(&self, db: usize, key: rdb::String) -> Option<rdb::Value> {
         let store = self.0.read().await;
-        let mut guard = store.db().await;
+        let mut guard = store.get(db).await;
         match guard.db.entry(key) {
             Entry::Occupied(e) => match e.get() {
                 ValueCell {
@@ -379,6 +404,7 @@ impl Store {
 
     pub async fn set(
         &self,
+        db: usize,
         key: rdb::String,
         val: rdb::Value,
         set::StoreOptions { exp, cond }: set::StoreOptions,
@@ -386,7 +412,7 @@ impl Store {
         use set::{Condition::*, Expiry::*};
 
         let store = self.0.read().await;
-        let mut guard = store.db().await;
+        let mut guard = store.get(db).await;
 
         // XXX: not sure at what point Redis takes the timestamp to determine expiration
         let now = SystemTime::now();
@@ -468,6 +494,7 @@ impl Store {
 
     pub async fn xadd(
         &self,
+        db: usize,
         key: rdb::String,
         entry: stream::EntryArg,
         ops: xadd::Options,
@@ -479,7 +506,7 @@ impl Store {
         }
 
         let store = self.0.read().await;
-        let mut guard = store.db().await;
+        let mut guard = store.get(db).await;
 
         match guard.db.entry(key) {
             Entry::Occupied(mut e) => {
@@ -540,12 +567,13 @@ impl Store {
 
     pub async fn xrange(
         &self,
+        db: usize,
         key: rdb::String,
         range: xrange::Range,
         count: Option<usize>,
     ) -> XResult<Vec<stream::Entry>> {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
 
         let Some(ValueCell { data, .. }) = guard.db.get(&key) else {
             return Ok(Some(vec![]));
@@ -580,10 +608,11 @@ impl Store {
 
     async fn get_stream(
         &self,
+        db: usize,
         key: &rdb::String,
     ) -> Result<(Option<(stream::Stream, Arc<Notify>)>, Arc<Notify>), Error> {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
         let new = Arc::clone(&guard.new);
 
         let Some(ValueCell { data, write, .. }) = guard.db.get(key) else {
@@ -602,11 +631,12 @@ impl Store {
 
     async fn lookup_stream(
         &self,
+        db: usize,
         key: &rdb::String,
         blocking: bool,
         unblock: &Notify,
     ) -> XResult<StreamHandle> {
-        let new = match self.get_stream(key).await? {
+        let new = match self.get_stream(db, key).await? {
             (Some((stream, write)), _) => {
                 return Ok(Some(StreamHandle {
                     stream,
@@ -620,7 +650,7 @@ impl Store {
         loop {
             tokio::select! {
                 _ = new.notified(), if blocking => {
-                    if let (Some((stream, write)), _) = self.get_stream(key).await? {
+                    if let (Some((stream, write)), _) = self.get_stream(db, key).await? {
                         return Ok(Some(StreamHandle { stream, write, new: true }));
                     }
                 },
@@ -632,6 +662,7 @@ impl Store {
 
     pub async fn xread(
         self: Arc<Self>,
+        db: usize,
         keys: Keys,
         ids: xread::Ids,
         ops: xread::Options,
@@ -658,7 +689,7 @@ impl Store {
             let unblock = Arc::clone(&unblock);
 
             tasks.spawn(async move {
-                let Some(stream) = store.lookup_stream(&key, blocking, &unblock).await? else {
+                let Some(stream) = store.lookup_stream(db, &key, blocking, &unblock).await? else {
                     // NOTE: non-existent keys (streams) are simply filtered out
                     return Ok((k, None));
                 };
@@ -726,9 +757,9 @@ impl Store {
         })
     }
 
-    pub async fn xlen(&self, key: rdb::String) -> Result<usize, Error> {
+    pub async fn xlen(&self, db: usize, key: rdb::String) -> Result<usize, Error> {
         let store = self.0.read().await;
-        let guard = store.db().await;
+        let guard = store.get(db).await;
         match guard.db.get(&key) {
             Some(ValueCell {
                 data: rdb::Value::Stream(s),
@@ -740,15 +771,11 @@ impl Store {
     }
 }
 
-impl From<rdb::RDB> for Store {
-    fn from(rdb::RDB { dbs, .. }: rdb::RDB) -> Self {
-        Self(RwLock::new(StoreInner {
-            ix: Database::DEFAULT,
-            dbs: dbs
-                .into_iter()
-                .map(|(ix, db)| (ix, Mutex::new(db)))
-                .collect(),
-        }))
+#[cfg(test)]
+impl Default for Store {
+    #[inline]
+    fn default() -> Self {
+        Self::new(crate::config::DBNUM)
     }
 }
 
@@ -798,6 +825,8 @@ mod tests {
 
     use rdb::{String::*, Value};
 
+    const DB: usize = 0;
+
     const FOO: Bytes = Bytes::from_static(b"foo");
     const BAR: Bytes = Bytes::from_static(b"bar");
     const BAZ: Bytes = Bytes::from_static(b"baz");
@@ -806,23 +835,23 @@ mod tests {
     async fn simple_set_get() {
         let store = Store::default();
 
-        let value = store.get(Str(FOO)).await;
+        let value = store.get(DB, Str(FOO)).await;
         assert!(value.is_none(), "cannot get a value from an empty store");
 
         let value = Value::String(Str(BAR));
         let expected = Some(value.clone());
 
         let old = store
-            .set(Str(FOO), value, set::StoreOptions::default())
+            .set(DB, Str(FOO), value, set::StoreOptions::default())
             .await
             .expect("new value was set");
 
         assert!(old.is_none(), "the should be no previous value");
 
-        let acutal = store.get(Str(FOO)).await;
+        let acutal = store.get(DB, Str(FOO)).await;
         assert_eq!(expected, acutal);
 
-        assert_eq!((1, 0), store.dbsize().await);
+        assert_eq!((1, 0), store.dbsize(DB).await);
     }
 
     // TODO: add test for KEEPTTL
@@ -830,7 +859,7 @@ mod tests {
     async fn set_get_with_options() {
         let store = Store::default();
 
-        let value = store.get(Str(FOO)).await;
+        let value = store.get(DB, Str(FOO)).await;
         assert!(value.is_none(), "cannot get a value from an empty store");
 
         let value = Value::String(Str(BAR));
@@ -842,13 +871,13 @@ mod tests {
         };
 
         let old = store
-            .set(Str(FOO), value, ops)
+            .set(DB, Str(FOO), value, ops)
             .await
             .expect("new value was set");
 
         assert!(old.is_none(), "the should be no previous value");
 
-        let acutal = store.get(Str(FOO)).await;
+        let acutal = store.get(DB, Str(FOO)).await;
         assert_eq!(expected, acutal);
 
         let value = Value::String(Str(BAZ));
@@ -860,29 +889,29 @@ mod tests {
         };
 
         let old = store
-            .set(Str(BAR), value, ops)
+            .set(DB, Str(BAR), value, ops)
             .await
             .expect("new value was set");
 
         assert!(old.is_none(), "the should be no previous value");
 
-        let acutal = store.get(Str(BAR)).await;
+        let acutal = store.get(DB, Str(BAR)).await;
         assert_eq!(expected, acutal);
 
-        assert_eq!((0, 2), store.dbsize().await);
+        assert_eq!((0, 2), store.dbsize(DB).await);
 
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        let value = store.get(Str(FOO)).await;
+        let value = store.get(DB, Str(FOO)).await;
         assert!(value.is_some(), "foo has not expired yet");
 
         // FIXME: before GET bar, its key is still accounted for the expire size
         // assert_eq!((0, 1), store.dbsize().await);
 
-        let value = store.get(Str(BAR)).await;
+        let value = store.get(DB, Str(BAR)).await;
         assert!(value.is_none(), "bar has expired");
 
-        assert_eq!((0, 1), store.dbsize().await);
+        assert_eq!((0, 1), store.dbsize(DB).await);
 
         // set bar again on an already expired key - should fail with XX and succeed with NX
         let value = Value::String(Str(BAZ));
@@ -894,7 +923,7 @@ mod tests {
         };
 
         store
-            .set(Str(BAR), value.clone(), ops)
+            .set(DB, Str(BAR), value.clone(), ops)
             .await
             .expect_err("SET with XX should not succeed on an already expired key");
 
@@ -904,20 +933,20 @@ mod tests {
         };
 
         let old = store
-            .set(Str(BAR), value.clone(), ops)
+            .set(DB, Str(BAR), value.clone(), ops)
             .await
             .expect("new value was set");
 
         assert!(old.is_none(), "store should not expose expired values");
 
         let actual = store
-            .get(Str(BAR))
+            .get(DB, Str(BAR))
             .await
             .expect("SET with NX should succeed on an already expired key");
 
         assert_eq!(expected, actual);
 
-        assert_eq!((0, 2), store.dbsize().await);
+        assert_eq!((0, 2), store.dbsize(DB).await);
 
         let ops = set::StoreOptions {
             exp: Some(set::Expiry::KeepTTL),
@@ -925,12 +954,12 @@ mod tests {
         };
 
         let actual = store
-            .set(Str(BAR), value.clone(), ops)
+            .set(DB, Str(BAR), value.clone(), ops)
             .await
             .expect("SET with XX on an existing key should succeed");
 
         assert_eq!(Some(expected), actual);
 
-        assert_eq!((0, 2), store.dbsize().await);
+        assert_eq!((0, 2), store.dbsize(DB).await);
     }
 }

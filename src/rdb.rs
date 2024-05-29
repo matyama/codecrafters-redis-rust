@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +14,6 @@ use crate::stream::Stream;
 use crate::write_fmt;
 
 pub(crate) const MAGIC: &[u8] = b"REDIS";
-pub(crate) const DEFAULT_DB: usize = Database::DEFAULT;
 
 const U32_MAX: usize = u32::MAX as usize;
 
@@ -122,6 +120,15 @@ impl From<isize> for String {
     #[inline]
     fn from(value: isize) -> Self {
         Self::from(value as i64)
+    }
+}
+
+impl From<usize> for String {
+    #[inline]
+    fn from(value: usize) -> Self {
+        isize::try_from(value)
+            .map(Self::from)
+            .unwrap_or_else(|_| value.to_string().into())
     }
 }
 
@@ -688,16 +695,19 @@ impl Aux {
 pub struct RDB {
     pub(crate) version: NonZeroU32,
     pub(crate) aux: Aux,
-    pub(crate) dbs: HashMap<usize, Database>,
+    pub(crate) dbs: Vec<Database>,
     /// Note: checksum is supported for `version >= 5`
     pub(crate) checksum: Option<Bytes>,
 }
 
 #[cfg(test)]
+use std::collections::HashMap;
+
+#[cfg(test)]
 impl RDB {
     pub(crate) fn remove(mut self, mut expired: HashMap<usize, HashSet<String>>) -> Self {
-        for db in self.dbs.values_mut() {
-            for expired in expired.remove(&db.ix).unwrap_or_default() {
+        for db in self.dbs.iter_mut() {
+            for expired in expired.remove(&db.id).unwrap_or_default() {
                 db.remove(&expired);
             }
         }

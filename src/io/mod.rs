@@ -38,8 +38,8 @@ mod tests {
         assert_eq!(expected.aux, actual.aux, "aux");
 
         assert_eq!(expected.dbs.len(), actual.dbs.len(), "store size");
-        for (db1, db2) in expected.dbs.into_values().zip(actual.dbs.into_values()) {
-            assert_eq!(db1.ix, db2.ix, "indices");
+        for (db1, db2) in expected.dbs.into_iter().zip(actual.dbs) {
+            assert_eq!(db1.id, db2.id, "indices");
 
             let mut db1 = db1.iter().collect::<Vec<_>>();
             db1.sort_unstable_by_key(|(k, _)| k.to_string());
@@ -102,7 +102,7 @@ mod tests {
 
         let (db, to_expire) = {
             let mut db = Database::builder();
-            db.with_index(0);
+            db.with_id(0);
             db.with_capacity(8);
 
             // TODO: test efficient storage: write Int32(-10_000) => read Int16(-10_000)
@@ -133,8 +133,13 @@ mod tests {
             (db.build().expect("test db"), to_expire)
         };
 
+        let dbid = db.id;
+
         let mut expired = HashMap::new();
-        expired.insert(db.ix, to_expire);
+        expired.insert(db.id, to_expire);
+
+        let mut dbs = Vec::from_iter((0..16).map(Database::new));
+        dbs[dbid] = db;
 
         let rdb = RDB {
             version: 11.try_into().unwrap(),
@@ -148,7 +153,7 @@ mod tests {
                 repl_offset: None,
                 aof_base: Some(Int8(0)),
             },
-            dbs: HashMap::from_iter(std::iter::once((db.ix, db))),
+            dbs,
             checksum: Some(Bytes::from_static(b"\xba\x98\x18\x82\xd2\x98\x96\xbc")),
         };
 

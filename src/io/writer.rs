@@ -11,7 +11,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::data::DataType;
 use crate::io::CRLF;
-use crate::rdb::{self, aux, DEFAULT_DB, MAGIC, RDB};
+use crate::rdb::{self, aux, MAGIC, RDB};
 use crate::write_fmt;
 
 const NULL: &[u8] = b"_\r\n";
@@ -297,10 +297,7 @@ where
     pub async fn write_rdb_file(&mut self, rdb: RDB) -> Result<usize> {
         use rdb::opcode::*;
 
-        ensure!(
-            rdb.dbs.contains_key(&DEFAULT_DB),
-            "RDB is missing the default DB: {DEFAULT_DB}"
-        );
+        ensure!(!rdb.dbs.is_empty(), "RDB must contain at least one DB");
 
         let mut bytes_written = 0;
 
@@ -327,10 +324,7 @@ where
         }
 
         // databases
-        let mut dbs = rdb.dbs.into_values().collect::<Vec<_>>();
-        dbs.sort_unstable_by_key(|db| db.ix);
-
-        for db in dbs {
+        for db in rdb.dbs {
             let (ix, db, db_size, expires_size) = db.into_inner();
 
             rdb_write! {
