@@ -289,9 +289,10 @@ impl Instance {
 
     #[inline]
     fn prepare_repl(&self, cmd: &Command) -> Option<Command> {
-        match self.role() {
-            Role::Leader(_) if cmd.is_write() => Some(cmd.clone()),
-            _ => None,
+        if matches!(self.role(), Role::Leader(_) if cmd.is_write()) {
+            Some(cmd.clone())
+        } else {
+            None
         }
     }
 
@@ -359,14 +360,16 @@ impl Instance {
         Ok(self.store.snapshot(|| self.state()).await)
     }
 
-    // TODO: handle replicated SELECT (implicitly send an interleaved select)
-    //  - remember last SELECT ix sent to replicas (initial ix=0 not sent)
-    //  - Role::Leader { replicas: ReplicaSet, repl_db: AtomicUsize }
-    //  - inject and forward a SELECT conn.ix command if conn.ix != repl.last_ix
-    //  - and update the last replicated index (if changed)
-    //  - and don't forget to shift the offset by that implicit SELECT ahead of time
-    async fn replicate(&self, cmd: Command, offset: usize) {
+    async fn replicate(&self, db: usize, cmd: Command, offset: usize) {
         if let Role::Leader(replicas) = &self.role {
+            // TODO: check if this SELECT injection is actually sound or there's a data race
+            if replicas.db() != db {
+                let (_, select_offset) = DataType::select(db);
+                let (old_state, new_offset) = self.shift_offset(select_offset);
+                println!("master offset: {} -> {new_offset}", old_state.repl_offset);
+                replicas.select(db).await;
+            }
+
             let (old_state, new_offset) = self.shift_offset(offset);
             println!("master offset: {} -> {new_offset}", old_state.repl_offset);
             replicas.forward(cmd).await;
@@ -395,7 +398,7 @@ impl Instance {
                         bail!("protocol violation: {cmd:?} is only supported by a leader");
                     };
 
-                    println!("executing internal command: {cmd:?}");
+                    println!("executing {cmd:?}");
                     let resp = cmd.exec(self, &mut client).await;
 
                     writer.write(&resp).await?;
@@ -409,7 +412,7 @@ impl Instance {
                 }
 
                 Resp::Cmd(cmd) => {
-                    println!("executing command {cmd:?}");
+                    println!("executing {cmd:?}");
 
                     let repl_cmd = self.prepare_repl(&cmd);
 
@@ -419,11 +422,13 @@ impl Instance {
                     writer.flush().await?;
 
                     match repl_cmd {
-                        Some(cmd) if resp.is_ok() => self.replicate(cmd, bytes_read).await,
+                        Some(cmd) if resp.is_ok() => {
+                            self.replicate(client.db, cmd, bytes_read).await
+                        }
                         _ => {}
                     }
 
-                    println!("command handled: {resp:?}");
+                    println!("done {resp:?}");
                 }
 
                 // XXX: || resp.is_null()

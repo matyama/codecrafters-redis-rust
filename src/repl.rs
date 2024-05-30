@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -62,7 +63,7 @@ impl Default for ReplId {
     }
 }
 
-impl std::fmt::Display for ReplId {
+impl Display for ReplId {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match String::from_utf8_lossy(&self.0) {
@@ -82,7 +83,7 @@ pub struct ReplState {
 
 impl<B> TryFrom<(Bytes, B)> for ReplState
 where
-    B: ParseInt + std::fmt::Debug,
+    B: ParseInt + Debug,
 {
     type Error = Error;
 
@@ -127,7 +128,7 @@ impl Default for ReplState {
     }
 }
 
-impl std::fmt::Display for ReplState {
+impl Display for ReplState {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -234,7 +235,7 @@ impl Connection {
     }
 }
 
-impl std::fmt::Debug for Connection {
+impl Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
             .field("peer", &self.peer)
@@ -285,7 +286,7 @@ impl ReplConnection {
     }
 }
 
-impl std::fmt::Display for ReplConnection {
+impl Display for ReplConnection {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -326,8 +327,10 @@ impl Replica {
 }
 
 #[derive(Debug, Default)]
-#[repr(transparent)]
-pub struct ReplicaSet(RwLock<HashMap<SocketAddr, Arc<Replica>>>);
+pub struct ReplicaSet {
+    refs: RwLock<HashMap<SocketAddr, Arc<Replica>>>,
+    db: AtomicUsize,
+}
 
 impl ReplicaSet {
     pub(crate) async fn register(&self, conn: TcpStream, state: ReplState) -> Result<()> {
@@ -337,12 +340,12 @@ impl ReplicaSet {
         let replica = Arc::new(Replica::new(conn, state));
 
         {
-            let mut replicas = self.0.write().await;
+            let mut replicas = self.refs.write().await;
             replicas.insert(addr, Arc::clone(&replica));
         }
 
         {
-            let replicas = self.0.read().await;
+            let replicas = self.refs.read().await;
             println!(
                 "{addr} added to the current replica set: {:?}",
                 replicas.keys()
@@ -354,17 +357,25 @@ impl ReplicaSet {
         Ok(())
     }
 
-    pub(crate) async fn forward(&self, cmd: Command) {
-        if !cmd.is_repl() {
-            println!("WARN: only some commands can be forwarded to replicas, skipping {cmd:?}");
-            return;
-        };
+    #[inline]
+    pub(crate) fn db(&self) -> usize {
+        self.db.load(Acquire)
+    }
 
+    pub(crate) async fn select(&self, db: usize) {
+        self.forward(Command::Select(db)).await;
+        self.db.store(db, Release);
+    }
+
+    pub(crate) async fn forward(&self, cmd: impl Into<Resp> + Debug) {
         println!("forwarding {cmd:?}");
 
-        let cmd = DataType::from(cmd);
+        let cmd = match cmd.into() {
+            Resp::Cmd(cmd) => DataType::from(cmd),
+            Resp::Data(cmd) => cmd,
+        };
 
-        let replicas = self.0.read().await;
+        let replicas = self.refs.read().await;
 
         // NOTE: spawn should be fine (i.e., without ordering issues), since there's a replica lock
         for (&addr, replica) in replicas.iter() {
@@ -386,7 +397,7 @@ impl ReplicaSet {
         timeout: Duration,
         state: ReplState,
     ) -> Result<(usize, usize)> {
-        let replicas = self.0.read().await;
+        let replicas = self.refs.read().await;
         let num_registered = replicas.len();
 
         // fast path: if all replicas are sufficiently up to date, then skip sending GETACK

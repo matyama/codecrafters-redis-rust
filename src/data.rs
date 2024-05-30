@@ -104,6 +104,14 @@ impl DataType {
         })
     }
 
+    // TODO: Redis pre-computes (or caches) this for common DBs
+    pub(crate) fn select(index: usize) -> (Self, usize) {
+        let data = Self::from(Command::Select(index));
+        let size =
+            DataSerializer::serialized_size(&data).expect("'SELECT index' should be serializable");
+        (data, size)
+    }
+
     pub(crate) fn parse_int(self) -> Result<Self, Error> {
         use rdb::String::*;
         match self {

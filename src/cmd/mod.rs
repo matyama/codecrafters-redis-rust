@@ -272,25 +272,13 @@ impl Command {
         }
     }
 
-    /// Returns `true` iff this command represents either an operation that's subject to
-    /// replication or a command that can be forwarded to a replication connection.
-    #[inline]
-    pub(crate) fn is_repl(&self) -> bool {
-        self.is_write() || matches!(self, Self::Replconf(replconf::Conf::GetAck(_)))
-    }
-
     /// Returns `true` iff this command represents a _write_ operation that's subject to
     /// replication.
     #[inline]
     pub(crate) fn is_write(&self) -> bool {
-        // FIXME: SELECT is not always a write (even in leader: "SELECT 1\nGET foo")
-        //  - so it actually depends on the current replication connection state (last db)
-        //match self {
-        //    Self::Select(_) => server.is_replica() && client.is_leader(), // i.e., from repl conn
-        //    Self::Set(..) | Self::XAdd(..) => true,
-        //    _ => false,
-        //}
-        matches!(self, Self::Select(_) | Self::Set(..) | Self::XAdd(_, _, _))
+        // NOTE: SELECT is not a write although it can be sent over the replication connection.
+        // Whether it is sent to a replica if client's selected DB differs from the repl conn DB.
+        matches!(self, Self::Set(..) | Self::XAdd(..))
     }
 
     /// Returns `true` iff this command represents a replicated operation that should be
