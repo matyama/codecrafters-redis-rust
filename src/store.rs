@@ -359,26 +359,30 @@ impl Store {
         guard.size()
     }
 
-    // FIXME: keys expire
     // TODO: support patters other than *
     pub async fn keys(&self, db: usize) -> Vec<rdb::String> {
+        let now = SystemTime::now();
         let store = self.0.read().await;
         let guard = store.get(db).await;
-        guard.db.keys().cloned().collect()
+        guard
+            .db
+            .iter()
+            .filter_map(|(key, val)| {
+                if val.expired_before(now) {
+                    None
+                } else {
+                    Some(key.clone())
+                }
+            })
+            .collect()
     }
 
-    // FIXME: keys expire (use get)
     pub async fn ty(&self, db: usize, key: rdb::String) -> Option<rdb::ValueType> {
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
-        guard.db.get(&key).map(rdb::ValueType::from)
+        self.get(db, key).await.as_ref().map(rdb::ValueType::from)
     }
 
-    // FIXME: keys expire (use get)
     pub async fn contains(&self, db: usize, key: &rdb::String) -> bool {
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
-        guard.db.contains_key(key)
+        self.get(db, key.clone()).await.is_some()
     }
 
     pub async fn get(&self, db: usize, key: rdb::String) -> Option<rdb::Value> {
