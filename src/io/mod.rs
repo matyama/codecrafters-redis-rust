@@ -1,8 +1,12 @@
 pub(crate) use reader::{DataReader, RDBFileReader};
 pub(crate) use writer::DataWriter;
 
+use crc_table::CRC64_TAB;
+
 pub(crate) mod reader;
 pub(crate) mod writer;
+
+mod crc_table;
 
 pub(crate) const CRLF: &[u8] = b"\r\n"; // [13, 10]
 
@@ -21,8 +25,54 @@ macro_rules! write_fmt {
     }};
 }
 
+fn crc64(crc: u64, data: &[u8]) -> u64 {
+    let (data, last) = data.split_at(data.len() - (data.len() % 8));
+
+    let crc = data.chunks(8).fold(crc, |mut crc, chunk| {
+        crc ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        CRC64_TAB[7][(crc & 0xff) as usize]
+            ^ CRC64_TAB[6][((crc >> 8) & 0xff) as usize]
+            ^ CRC64_TAB[5][((crc >> 16) & 0xff) as usize]
+            ^ CRC64_TAB[4][((crc >> 24) & 0xff) as usize]
+            ^ CRC64_TAB[3][((crc >> 32) & 0xff) as usize]
+            ^ CRC64_TAB[2][((crc >> 40) & 0xff) as usize]
+            ^ CRC64_TAB[1][((crc >> 48) & 0xff) as usize]
+            ^ CRC64_TAB[0][(crc >> 56) as usize]
+    });
+
+    last.iter().fold(crc, |crc, &b| {
+        CRC64_TAB[0][((crc ^ b as u64) & 0xff) as usize] ^ (crc >> 8)
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct Checksum(u64);
+
+impl std::io::Write for Checksum {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = crc64(self.0, buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl From<Checksum> for u64 {
+    #[inline]
+    fn from(Checksum(cksum): Checksum) -> Self {
+        cksum
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::collections::{HashMap, HashSet};
     use std::io::Cursor;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,8 +106,6 @@ mod tests {
                 assert_eq!(e1, e2, "expiry");
             }
         }
-
-        assert_eq!(expected.checksum, actual.checksum, "checksum");
     }
 
     // Rounds millis to `u64` (`u64` is required in the spec and thus written as such)
@@ -154,7 +202,6 @@ mod tests {
                 aof_base: Some(Int8(0)),
             },
             dbs,
-            checksum: Some(123),
         };
 
         let input = rdb.clone().remove(expired);
@@ -175,5 +222,19 @@ mod tests {
 
         assert_eq!(bytes_written, bytes_read, "bytes written/read");
         assert_rdb_eq(input, output);
+    }
+
+    #[test]
+    fn crc64_works() {
+        assert_eq!(0xe9c6d914c4b8d9ca, crc64(0, "123456789".as_bytes()));
+
+        let step1 = "12345".as_bytes();
+        let step2 = "6789".as_bytes();
+
+        let value1 = 17326901458626182669;
+        let value2 = 16845390139448941002;
+
+        assert_eq!(value1, crc64(0, step1));
+        assert_eq!(value2, crc64(value1, step2));
     }
 }

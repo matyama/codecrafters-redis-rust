@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::pin::Pin;
 
@@ -10,7 +10,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::data::DataType;
-use crate::io::CRLF;
+use crate::io::{Checksum, CRLF};
 use crate::rdb::{self, aux, MAGIC, RDB};
 use crate::store::Database;
 use crate::write_fmt;
@@ -24,51 +24,51 @@ const USED_MEM: Bytes = Bytes::from_static(aux::USED_MEM);
 const AOF_BASE: Bytes = Bytes::from_static(aux::AOF_BASE);
 
 macro_rules! rdb_write {
-    ([$writer:expr, $written:ident]; SELECTDB $ix:expr) => {
-        rdb_write! { [$writer, $written]; @SELECTDB }
+    ([$writer:expr, $written:ident, $cksum:ident]; SELECTDB $ix:expr) => {
+        rdb_write! { [$writer, $written, $cksum]; @SELECTDB }
 
         $written += rdb::Length::Len($ix)
-            .write_into(&mut $writer)
+            .write_into(&mut $writer, &mut $cksum)
             .await
             .with_context(|| format!("SELECTDB {}", $ix))?;
     };
 
-    ([$writer:expr, $written:ident]; RESIZEDB $($size:ident),+) => {
-        rdb_write! { [$writer, $written]; @RESIZEDB }
+    ([$writer:expr, $written:ident, $cksum:ident]; RESIZEDB $($size:ident),+) => {
+        rdb_write! { [$writer, $written, $cksum]; @RESIZEDB }
 
         $(
             $written += rdb::Length::Len($size)
-                .write_into(&mut $writer)
+                .write_into(&mut $writer, &mut $cksum)
                 .await
                 .with_context(|| format!("RESIZEDB {}", stringify!($size)))?;
         )+
     };
 
-    ([$writer:expr, $written:ident]; EXPIRETIMEMS $t:expr) => {
-        rdb_write! { [$writer, $written]; @EXPIRETIMEMS }
+    ([$writer:expr, $written:ident, $cksum:ident]; EXPIRETIMEMS $t:expr) => {
+        rdb_write! { [$writer, $written, $cksum]; @EXPIRETIMEMS }
 
-        $written += rdb::write_time_ms($t, &mut $writer)
+        $written += rdb::write_time_ms($t, &mut $writer, &mut $cksum)
             .await
             .with_context(|| format!("EXPIRETIMEMS entry expiration time {:?}", $t))?;
     };
 
-    ([$writer:expr, $written:ident]; @$op:ident) => {
-        rdb_write! { [$writer, $written, "{:x?} opcode"]; rdb::opcode::$op }
+    ([$writer:expr, $written:ident, $cksum:ident]; @$op:ident) => {
+        rdb_write! { [$writer, $written, $cksum, "{:x?} opcode"]; rdb::opcode::$op }
     };
 
-    ([$writer:expr, $written:ident, $cx:expr]; $byte:expr) => {
+    ([$writer:expr, $written:ident, $cksum:ident, $cx:expr]; $byte:expr) => {
         $writer
             .write_u8($byte)
             .await
             .with_context(|| format!($cx, $byte))?;
-        $written += 1;
+        $written += $cksum.write(&[$byte])?;
     };
 
-    ([$writer:expr, $written:ident]; $($key:ident: $val:expr),+) => {
+    ([$writer:expr, $written:ident, $cksum:ident]; $($key:ident: $val:expr),+) => {
         $(
             if let Some(val) = $val {
                 rdb_write! {
-                    [$writer, $written, "AUX entry {}"];
+                    [$writer, $written, $cksum, "AUX entry {}"];
                     rdb::String::Str($key) => rdb::String { val } as AUX
                 }
             }
@@ -76,16 +76,16 @@ macro_rules! rdb_write {
     };
 
     (
-        [$writer:expr, $written:ident, $cx:expr];
+        [$writer:expr, $written:ident, $cksum:ident, $cx:expr];
         $key:expr => $vt:ty { $val:expr } as $ty:expr
     ) => {
-        rdb_write! { [$writer, $written, $cx]; $ty }
+        rdb_write! { [$writer, $written, $cksum, $cx]; $ty }
 
-        $written += $key.write_into(&mut $writer)
+        $written += $key.write_into(&mut $writer, &mut $cksum)
             .await
             .with_context(|| format!($cx, "key"))?;
 
-        $written += <$vt>::write_into($val, &mut $writer)
+        $written += <$vt>::write_into($val, &mut $writer, &mut $cksum)
             .await
             .with_context(|| format!($cx, "value"))?;
     };
@@ -301,22 +301,23 @@ where
         ensure!(!rdb.dbs.is_empty(), "RDB must contain at least one DB");
 
         let mut bytes_written = 0;
+        let mut checksum = Checksum::default();
 
         // header (magic + version)
         {
             self.writer.write_all(MAGIC).await.context("magic")?;
-            bytes_written += MAGIC.len();
+            bytes_written += checksum.write(MAGIC)?;
 
             // NOTE: must be exactly 4B
             let mut buf = [0; 4];
             write_fmt!(buf, "{:04}", rdb.version)?;
             self.writer.write_all(&buf).await.context("version")?;
-            bytes_written += buf.len();
+            bytes_written += checksum.write(&buf)?;
         }
 
         // auxiliary fields
         rdb_write! {
-            [self.writer, bytes_written];
+            [self.writer, bytes_written, checksum];
             REDIS_VER: rdb.aux.redis_ver,
             REDIS_BITS: rdb.aux.redis_bits,
             CTIME: rdb.aux.ctime,
@@ -333,12 +334,12 @@ where
         } in rdb.dbs
         {
             rdb_write! {
-                [self.writer, bytes_written];
+                [self.writer, bytes_written, checksum];
                 SELECTDB ix
             }
 
             rdb_write! {
-                [self.writer, bytes_written];
+                [self.writer, bytes_written, checksum];
                 RESIZEDB db_size, expires_size
             }
 
@@ -349,7 +350,7 @@ where
                 if let Some(expire) = expire {
                     // NOTE: Redis seems to always save the expire time in milliseconds
                     rdb_write! {
-                        [self.writer, bytes_written];
+                        [self.writer, bytes_written, checksum];
                         EXPIRETIMEMS expire
                     }
                 }
@@ -357,19 +358,19 @@ where
                 let ty = rdb::ValueType::from(&val) as u8;
 
                 rdb_write! {
-                    [self.writer, bytes_written, "entry {}"];
+                    [self.writer, bytes_written, checksum, "entry {}"];
                     key => rdb::Value { val } as ty
                 }
             }
         }
 
         self.writer.write_u8(EOF).await.context("EOF")?;
-        bytes_written += 1;
+        bytes_written += checksum.write(&[EOF])?;
 
         // checksum
-        if let Some(checksum) = rdb.checksum {
+        if rdb.version >= rdb::MIN_CKSUM_VERSION {
             self.writer
-                .write_u64_le(checksum)
+                .write_u64_le(checksum.into())
                 .await
                 .context("checksum")?;
             bytes_written += 8;

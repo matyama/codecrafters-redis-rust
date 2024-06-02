@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::num::{NonZeroU32, ParseIntError};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::cmd::{config, info, ping, replconf, select, set, sync, wait, xadd, xrange, xread};
 use crate::data::{DataExt, DataType};
-use crate::io::CRLF;
+use crate::io::{Checksum, CRLF};
 use crate::rdb::{self, RDBData, MAGIC, RDB};
 use crate::store::{Database, DatabaseBuilder};
 use crate::{resp::*, Command, Error, Resp};
@@ -88,13 +88,9 @@ where
             }
         }
 
-        println!("reading RDB file length");
-
         let (Length::Some(len), _) = self.read_num().await.context("RDB file length")? else {
             bail!("cannot read RDB file without content");
         };
-
-        println!("reading RDB file content ({len}B)");
 
         let mut buf = BytesMut::with_capacity(len);
         buf.resize(len, 0);
@@ -103,12 +99,6 @@ where
             .read_exact(&mut buf)
             .await
             .context("read RDB file contents")?;
-
-        println!("RDB file hex: {:x?}", &buf[..len.saturating_sub(8)]);
-
-        // 8-byte checksum
-        let checksum = &buf[len.saturating_sub(8)..];
-        println!("RDB checksum hex: {checksum:x?}");
 
         Ok(RDBData(buf.freeze()))
     }
@@ -120,22 +110,25 @@ where
         // TODO: ideally reuse `self.buf` (but that one's currently Vec to `read_until`)
         let mut buf = BytesMut::with_capacity(4096);
         let mut bytes_read = 0;
+        let mut cksum = Checksum::default();
 
         // read header (magic + version)
         let version = {
             buf.resize(MAGIC.len() + 4, 0);
 
             let n = self.reader.read_exact(&mut buf).await.context("magic")?;
-            bytes_read += n;
 
             let magic = &buf[..MAGIC.len()];
             ensure!(magic == MAGIC, "RDB: expected {MAGIC:?}, got {magic:?}");
 
-            let version = &buf[MAGIC.len()..n];
-            std::str::from_utf8(version)
+            let version = std::str::from_utf8(&buf[MAGIC.len()..n])
                 .context("version is not ASCII")?
                 .parse::<NonZeroU32>()
-                .context("version is not a (valid) number")?
+                .context("version is not a (valid) number")?;
+
+            bytes_read += cksum.write(&buf[..n])?;
+
+            version
         };
 
         let mut aux = rdb::Aux::default();
@@ -148,14 +141,15 @@ where
 
         loop {
             let op = self.reader.read_u8().await.context("opcode")?;
-            bytes_read += 1;
+            bytes_read += cksum.write(&[op])?;
+
             match op {
                 AUX => {
-                    let (key, bytes_key) = rdb::read_string(&mut self.reader, &mut buf)
+                    let (key, bytes_key) = rdb::read_string(&mut self.reader, &mut buf, &mut cksum)
                         .await
                         .context("AUX field key")?;
 
-                    let (val, bytes_val) = rdb::read_string(&mut self.reader, &mut buf)
+                    let (val, bytes_val) = rdb::read_string(&mut self.reader, &mut buf, &mut cksum)
                         .await
                         .context("AUX field value")?;
 
@@ -180,7 +174,7 @@ where
 
                     let db = db.as_mut().expect("DB builder must exist");
 
-                    let (id, bytes_id) = rdb::Length::read_from(&mut self.reader)
+                    let (id, bytes_id) = rdb::Length::read_from(&mut self.reader, &mut cksum)
                         .await
                         .context("SELECTDB <number>")?;
 
@@ -199,13 +193,14 @@ where
                         bail!("RESIZEDB section before any SELECTDB");
                     };
 
-                    let (size, bytes_size) = rdb::Length::read_from(&mut self.reader)
+                    let (size, bytes_size) = rdb::Length::read_from(&mut self.reader, &mut cksum)
                         .await
                         .context("RESIZEDB hash table size")?;
 
-                    let (expire_size, bytes_expire_size) = rdb::Length::read_from(&mut self.reader)
-                        .await
-                        .context("RESIZEDB expire hash table size")?;
+                    let (expire_size, bytes_expire_size) =
+                        rdb::Length::read_from(&mut self.reader, &mut cksum)
+                            .await
+                            .context("RESIZEDB expire hash table size")?;
 
                     // NOTE: sizes are in terms of the number of entries
                     db.with_capacity(size.into_length() + expire_size.into_length());
@@ -217,7 +212,7 @@ where
                 unit @ (EXPIRETIME | EXPIRETIMEMS)
                     if db.as_ref().map_or(false, DatabaseBuilder::is_resized) =>
                 {
-                    let (exp, bytes_expiry) = rdb::read_expiry(unit, &mut self.reader)
+                    let (exp, bytes_expiry) = rdb::read_expiry(unit, &mut self.reader, &mut cksum)
                         .await
                         .context("EXPIRETIME* entry expiration time")?;
 
@@ -252,13 +247,14 @@ where
                         unreachable!("DB must be properly initialized");
                     };
 
-                    let (key, bytes_key) = rdb::read_string(&mut self.reader, &mut buf)
+                    let (key, bytes_key) = rdb::read_string(&mut self.reader, &mut buf, &mut cksum)
                         .await
                         .context("entry key")?;
 
-                    let (val, bytes_val) = rdb::Value::read_from(ty, &mut self.reader, &mut buf)
-                        .await
-                        .context("entry value")?;
+                    let (val, bytes_val) =
+                        rdb::Value::read_from(ty, &mut self.reader, &mut buf, &mut cksum)
+                            .await
+                            .context("entry value")?;
 
                     // NOTE: expiry has potentially been set by EXPIRETIME* in previous iteration
                     db.set(key, val, expiry.take());
@@ -271,22 +267,23 @@ where
         }
 
         // read checksum (8B)
-        let checksum = if u32::from(version) >= 5 {
-            let checksum = self.reader.read_u64_le().await.context("checksum")?;
+        if u32::from(version) >= rdb::MIN_CKSUM_VERSION.into() {
+            let checksum = self
+                .reader
+                .read_u64_le()
+                .await
+                .map(Checksum)
+                .context("checksum")?;
+
+            ensure!(
+                cksum == checksum,
+                "invalid checksum: expected '{checksum:x?}', got '{cksum:x?}'"
+            );
+
             bytes_read += 8;
-            Some(checksum)
-        } else {
-            None
-        };
+        }
 
-        let rdb = RDB {
-            version,
-            aux,
-            dbs,
-            checksum,
-        };
-
-        Ok((rdb, bytes_read))
+        Ok((RDB { version, aux, dbs }, bytes_read))
     }
 
     pub async fn read_next(&mut self) -> Result<Option<(Resp, usize)>> {

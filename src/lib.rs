@@ -226,8 +226,8 @@ impl Instance {
             let (rdb, bytes_read) = reader.read().await?;
 
             println!(
-                "read initial RDB (v{}, {bytes_read}B) {:?} // {:x?}",
-                rdb.version, rdb.aux, rdb.checksum
+                "read initial RDB (v{}, {bytes_read}B) {:?}",
+                rdb.version, rdb.aux
             );
 
             Store::init(rdb, cfg.dbnum).context("init store")?

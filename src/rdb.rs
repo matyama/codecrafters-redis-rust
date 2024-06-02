@@ -14,6 +14,7 @@ use crate::stream::Stream;
 use crate::write_fmt;
 
 pub(crate) const MAGIC: &[u8] = b"REDIS";
+pub(crate) const MIN_CKSUM_VERSION: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(5) };
 
 const U32_MAX: usize = u32::MAX as usize;
 
@@ -185,33 +186,44 @@ impl std::fmt::Display for String {
     }
 }
 
-pub async fn read_string<R>(reader: &mut R, buf: &mut BytesMut) -> io::Result<(String, usize)>
+pub async fn read_string<R, C>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+    cksum: &mut C,
+) -> io::Result<(String, usize)>
 where
     R: AsyncReadExt + Unpin,
+    C: io::Write,
 {
     use Encoding::*;
     use Length::*;
 
-    let (length, mut bytes_read) = Length::read_from(reader).await?;
+    let (length, mut bytes_read) = Length::read_from(reader, cksum).await?;
 
     let string = match length {
         Len(len) => {
             buf.reserve(len);
             buf.resize(len, 0);
-            bytes_read += reader.read_exact(buf).await?;
+            reader.read_exact(buf).await?;
+            bytes_read += cksum.write(&buf[..len])?;
             String::Str(buf.split().freeze())
         }
         Enc(Int8) => {
-            bytes_read += 1;
-            reader.read_i8().await.map(String::Int8)?
+            let i = reader.read_i8().await?;
+            bytes_read += cksum.write(&[i as u8])?;
+            String::Int8(i)
         }
         Enc(Int16) => {
-            bytes_read += 2;
-            reader.read_i16_le().await.map(String::Int16)?
+            let mut buf = [0; 2];
+            reader.read_exact(&mut buf).await?;
+            bytes_read += cksum.write(&buf)?;
+            String::Int16(i16::from_le_bytes(buf))
         }
         Enc(Int32) => {
-            bytes_read += 4;
-            reader.read_i32_le().await.map(String::Int32)?
+            let mut buf = [0; 4];
+            reader.read_exact(&mut buf).await?;
+            bytes_read += cksum.write(&buf)?;
+            String::Int32(i32::from_le_bytes(buf))
         }
         Enc(LZF) => {
             return Err(Error::new(
@@ -225,9 +237,10 @@ where
 }
 
 impl String {
-    pub async fn write_into<W>(self, writer: &mut W) -> io::Result<usize>
+    pub async fn write_into<W, C>(self, writer: &mut W, cksum: &mut C) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
+        C: io::Write,
     {
         match self {
             String::Str(bytes) if bytes.len() <= 11 => {
@@ -235,23 +248,24 @@ impl String {
                     let mut buf = [0; 5]; // len is max bytes written by encode_integer
                     let n = encode_integer(value as i64, &mut buf);
                     writer.write_all(&buf[..n]).await?;
-                    return Ok(n);
+                    return cksum.write(&buf[..n]);
                 }
 
                 // TODO: LZF compression (if enabled)
 
-                Self::write_str(bytes, writer).await
+                Self::write_str(bytes, writer, cksum).await
             }
-            String::Str(bytes) => Self::write_str(bytes, writer).await,
-            String::Int8(i) => Self::write_int(i as i64, writer).await,
-            String::Int16(i) => Self::write_int(i as i64, writer).await,
-            String::Int32(i) => Self::write_int(i as i64, writer).await,
+            String::Str(bytes) => Self::write_str(bytes, writer, cksum).await,
+            String::Int8(i) => Self::write_int(i as i64, writer, cksum).await,
+            String::Int16(i) => Self::write_int(i as i64, writer, cksum).await,
+            String::Int32(i) => Self::write_int(i as i64, writer, cksum).await,
         }
     }
 
-    async fn write_int<W>(value: i64, writer: &mut W) -> io::Result<usize>
+    async fn write_int<W, C>(value: i64, writer: &mut W, cksum: &mut C) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
+        C: io::Write,
     {
         // buffer with enough capacity for encoding of an i64
         let mut buf = [0; 32];
@@ -260,35 +274,40 @@ impl String {
 
         if n > 0 {
             writer.write_all(&buf[..n]).await?;
-            return Ok(n);
+            return cksum.write(&buf[..n]);
         }
 
         // encode as string
         let n = write_fmt!(buf, "{value}")?;
 
-        Self::write_str(&buf[..n], writer).await
+        Self::write_str(&buf[..n], writer, cksum).await
     }
 
-    async fn write_str<B, W>(bytes: B, writer: &mut W) -> io::Result<usize>
+    async fn write_str<B, W, C>(bytes: B, writer: &mut W, cksum: &mut C) -> io::Result<usize>
     where
         B: AsRef<[u8]>,
         W: AsyncWriteExt + Unpin,
+        C: io::Write,
     {
         let bytes = bytes.as_ref();
 
         let enclen = Length::Len(bytes.len());
-        let enclen_len = enclen.write_into(writer).await?;
+        let enclen_len = enclen.write_into(writer, cksum).await?;
 
         writer.write_all(bytes).await?;
-
-        Ok(enclen_len + bytes.len())
+        cksum.write(bytes).map(|len| enclen_len + len)
     }
 }
 
 // TODO: implement
-pub async fn read_stream<R>(_reader: &mut R, _buf: &mut BytesMut) -> io::Result<(Stream, usize)>
+pub async fn read_stream<R, C>(
+    _reader: &mut R,
+    _buf: &mut BytesMut,
+    _cksum: &mut C,
+) -> io::Result<(Stream, usize)>
 where
     R: AsyncReadExt + Unpin,
+    C: io::Write,
 {
     Err(Error::new(
         ErrorKind::Unsupported,
@@ -389,22 +408,24 @@ pub enum Value {
 }
 
 impl Value {
-    pub async fn read_from<T, R>(
+    pub async fn read_from<T, R, C>(
         ty: T,
         reader: &mut R,
         buf: &mut BytesMut,
+        cksum: &mut C,
     ) -> io::Result<(Self, usize)>
     where
         T: TryInto<ValueType, Error = Error>,
         R: AsyncReadExt + Unpin,
+        C: io::Write,
     {
         match ty.try_into()? {
-            ValueType::String => read_string(reader, buf)
+            ValueType::String => read_string(reader, buf, cksum)
                 .await
                 .map(|(s, n)| (Self::String(s), n)),
             ValueType::StreamListPacks
             | ValueType::StreamListPacks2
-            | ValueType::StreamListPacks3 => read_stream(reader, buf)
+            | ValueType::StreamListPacks3 => read_stream(reader, buf, cksum)
                 .await
                 .map(|(s, n)| (Self::Stream(s), n)),
             other => Err(Error::new(
@@ -414,12 +435,13 @@ impl Value {
         }
     }
 
-    pub async fn write_into<W>(self, writer: &mut W) -> io::Result<usize>
+    pub async fn write_into<W, C>(self, writer: &mut W, cksum: &mut C) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
+        C: io::Write,
     {
         match self {
-            Self::String(s) => s.write_into(writer).await,
+            Self::String(s) => s.write_into(writer, cksum).await,
             Self::Stream(_) => unimplemented!("RDB: writing streams is not supported"),
         }
     }
@@ -482,16 +504,17 @@ pub enum Length {
 }
 
 impl Length {
-    pub async fn read_from<R>(reader: &mut R) -> io::Result<(Self, usize)>
+    pub async fn read_from<R, C>(reader: &mut R, cksum: &mut C) -> io::Result<(Self, usize)>
     where
         R: AsyncReadExt + Unpin,
+        C: io::Write,
     {
         use encoding::*;
 
         let mut bytes_read = 0;
 
         let x = reader.read_u8().await?;
-        bytes_read += 1;
+        bytes_read += cksum.write(&[x])?;
 
         // match on the encoding type
         let len = match (x & 0xC0) >> (u8::BITS - 2) {
@@ -499,18 +522,20 @@ impl Length {
             BIT_LEN_6 => Self::Len((x & 0x3F) as usize),
             BIT_LEN_14 => {
                 let y = reader.read_u8().await?;
-                bytes_read += 1;
+                bytes_read += cksum.write(&[y])?;
                 Self::Len((((x as u16 & 0x3F) << 8) | y as u16) as usize)
             }
             BIT_LEN_32 => {
-                let len = reader.read_u32().await?;
-                bytes_read += 4;
-                Self::Len(len as usize)
+                let mut buf = [0; 4];
+                reader.read_exact(&mut buf).await?;
+                bytes_read += cksum.write(&buf)?;
+                Self::Len(u32::from_be_bytes(buf) as usize)
             }
             BIT_LEN_64 => {
-                let len = reader.read_u64().await?;
-                bytes_read += 8;
-                Self::Len(len as usize)
+                let mut buf = [0; 8];
+                reader.read_exact(&mut buf).await?;
+                bytes_read += cksum.write(&buf)?;
+                Self::Len(u64::from_be_bytes(buf) as usize)
             }
             b => {
                 return Err(Error::new(
@@ -523,9 +548,10 @@ impl Length {
         Ok((len, bytes_read))
     }
 
-    pub async fn write_into<W>(self, writer: &mut W) -> io::Result<usize>
+    pub async fn write_into<W, C>(self, writer: &mut W, cksum: &mut C) -> io::Result<usize>
     where
         W: AsyncWriteExt + Unpin,
+        C: io::Write,
     {
         use encoding::*;
 
@@ -533,31 +559,38 @@ impl Length {
             unimplemented!("use encode_integer instead");
         };
 
-        Ok(match len {
+        match len {
             len if len < (1 << 6) => {
-                writer.write_u8(len as u8 | (BIT_LEN_6 << 6)).await?;
-                1
+                let len = len as u8 | (BIT_LEN_6 << 6);
+                writer.write_u8(len).await?;
+                cksum.write(&[len])
             }
 
             len if len < (1 << 14) => {
                 // write u16 as BE bytes
                 let buf = [len as u8 | (BIT_LEN_14 << 6), len as u8];
                 writer.write_all(&buf).await?;
-                2
+                cksum.write(&buf)
             }
 
             ..=U32_MAX => {
-                writer.write_u8(BIT_LEN_32).await?;
-                writer.write_u32(len as u32).await?;
-                1 + 4
+                let mut buf = [0; 5];
+                buf[0] = BIT_LEN_32;
+                buf[1..].copy_from_slice(&(len as u32).to_be_bytes());
+
+                writer.write_all(&buf).await?;
+                cksum.write(&buf)
             }
 
             _ => {
-                writer.write_u8(BIT_LEN_64).await?;
-                writer.write_u64(len as u64).await?;
-                1 + 8
+                let mut buf = [0; 9];
+                buf[0] = BIT_LEN_64;
+                buf[1..].copy_from_slice(&(len as u64).to_be_bytes());
+
+                writer.write_all(&buf).await?;
+                cksum.write(&buf)
             }
-        })
+        }
     }
 
     #[inline]
@@ -615,41 +648,52 @@ impl TryFrom<u8> for ExpiryUnit {
     }
 }
 
-pub async fn read_expiry<U, R>(unit: U, reader: &mut R) -> io::Result<(SystemTime, usize)>
+pub async fn read_expiry<U, R, C>(
+    unit: U,
+    reader: &mut R,
+    cksum: &mut C,
+) -> io::Result<(SystemTime, usize)>
 where
     U: TryInto<ExpiryUnit, Error = Error>,
     R: AsyncReadExt + Unpin,
+    C: io::Write,
 {
-    match unit.try_into()? {
+    Ok(match unit.try_into()? {
         ExpiryUnit::Seconds => {
-            let secs = reader.read_u32_le().await?;
-            let time = UNIX_EPOCH + Duration::from_secs(secs as u64);
-            Ok((time, 4))
+            let mut buf = [0; 4];
+            reader.read_exact(&mut buf).await?;
+            let bytes_read = cksum.write(&buf)?;
+            let secs = u32::from_le_bytes(buf) as u64;
+            (UNIX_EPOCH + Duration::from_secs(secs), bytes_read)
         }
-        ExpiryUnit::Millis => read_time_ms(reader).await,
-    }
+        ExpiryUnit::Millis => {
+            let mut buf = [0; 8];
+            reader.read_exact(&mut buf).await?;
+            let bytes_read = cksum.write(&buf)?;
+            let millis = u64::from_le_bytes(buf);
+            (UNIX_EPOCH + Duration::from_millis(millis), bytes_read)
+        }
+    })
 }
 
-async fn read_time_ms<R>(reader: &mut R) -> io::Result<(SystemTime, usize)>
-where
-    R: AsyncReadExt + Unpin,
-{
-    let millis = reader.read_u64_le().await?;
-    let time = UNIX_EPOCH + Duration::from_millis(millis);
-    Ok((time, 8))
-}
-
-pub(crate) async fn write_time_ms<W>(t: SystemTime, writer: &mut W) -> io::Result<usize>
+pub(crate) async fn write_time_ms<W, C>(
+    t: SystemTime,
+    writer: &mut W,
+    cksum: &mut C,
+) -> io::Result<usize>
 where
     W: AsyncWriteExt + Unpin,
+    C: io::Write,
 {
     let ms = t
         .duration_since(UNIX_EPOCH)
         .expect("time went backwards")
-        .as_millis();
+        .as_millis() as u64;
 
-    writer.write_u64_le(ms as u64).await?;
-    Ok(8)
+    let bytes = ms.to_le_bytes();
+
+    writer.write_all(&bytes).await?;
+    cksum.write(&bytes)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -696,8 +740,6 @@ pub struct RDB {
     pub(crate) version: NonZeroU32,
     pub(crate) aux: Aux,
     pub(crate) dbs: Vec<Database>,
-    /// Note: checksum is supported for `version >= 5`
-    pub(crate) checksum: Option<u64>,
 }
 
 #[cfg(test)]
@@ -752,16 +794,26 @@ mod tests {
 
         for (input, bytes_expected) in cases {
             let mut writer = Vec::with_capacity(128);
+            let mut cksum_write = Vec::new();
 
-            let bytes_written = input.write_into(&mut writer).await.expect("write length");
+            let bytes_written = input
+                .write_into(&mut writer, &mut cksum_write)
+                .await
+                .expect("write length");
+
             assert_eq!(bytes_expected, bytes_written);
 
             let mut reader = io::Cursor::new(writer);
+            let mut cksum_read = Vec::new();
 
-            let (output, bytes_read) = Length::read_from(&mut reader).await.expect("read length");
+            let (output, bytes_read) = Length::read_from(&mut reader, &mut cksum_read)
+                .await
+                .expect("read length");
+
             assert_eq!(bytes_written, bytes_read);
 
             assert_eq!(input, output);
+            assert_eq!(cksum_write, cksum_read);
         }
     }
 }

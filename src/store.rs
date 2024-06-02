@@ -466,10 +466,7 @@ impl Store {
             })
             .collect();
 
-        //let checksum = u64::from_le_bytes(*b"\xf0n;\xfe\xc0\xffZ\xa2");
-        let checksum = u64::from_le_bytes(*b"\xa8\x15\x7f\xb3\xf4\x5f\x5d\x9a");
-
-        // TODO: set ctime, used_mem and aof_base, and compute checksum
+        // TODO: set ctime, used_mem and aof_base
         RDB {
             version: VERSION,
             aux: Aux {
@@ -486,7 +483,6 @@ impl Store {
                 aof_base: Some(Int8(0)),
             },
             dbs,
-            checksum: Some(checksum),
         }
     }
 
