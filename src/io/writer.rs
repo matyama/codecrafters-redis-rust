@@ -12,6 +12,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use crate::data::DataType;
 use crate::io::CRLF;
 use crate::rdb::{self, aux, MAGIC, RDB};
+use crate::store::Database;
 use crate::write_fmt;
 
 const NULL: &[u8] = b"_\r\n";
@@ -324,9 +325,13 @@ where
         }
 
         // databases
-        for db in rdb.dbs {
-            let (ix, db, db_size, expires_size) = db.into_inner();
-
+        for Database {
+            id: ix,
+            kvstore,
+            persist_size: db_size,
+            expires_size,
+        } in rdb.dbs
+        {
             rdb_write! {
                 [self.writer, bytes_written];
                 SELECTDB ix
@@ -338,7 +343,7 @@ where
             }
 
             // [EXPIRETIMEMS <exipire-time>] <ty> <key> <val>
-            for (key, val) in db.into_iter() {
+            for (key, val) in kvstore.into_iter() {
                 let (val, expire) = val.into_inner();
 
                 if let Some(expire) = expire {

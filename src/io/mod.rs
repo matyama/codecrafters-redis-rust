@@ -41,10 +41,10 @@ mod tests {
         for (db1, db2) in expected.dbs.into_iter().zip(actual.dbs) {
             assert_eq!(db1.id, db2.id, "indices");
 
-            let mut db1 = db1.iter().collect::<Vec<_>>();
+            let mut db1 = db1.kvstore.iter().collect::<Vec<_>>();
             db1.sort_unstable_by_key(|(k, _)| k.to_string());
 
-            let mut db2 = db2.iter().collect::<Vec<_>>();
+            let mut db2 = db2.kvstore.iter().collect::<Vec<_>>();
             db2.sort_unstable_by_key(|(k, _)| k.to_string());
 
             for ((k1, v1), (k2, v2)) in db1.into_iter().zip(db2) {
