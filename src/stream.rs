@@ -362,7 +362,7 @@ impl TryFrom<&rdb::String> for StreamId {
 impl From<Id> for Bytes {
     #[inline]
     fn from(id: Id) -> Self {
-        id.into()
+        Self::from(&id)
     }
 }
 
