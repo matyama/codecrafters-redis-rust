@@ -41,6 +41,7 @@ pub(crate) mod resp {
     pub const TYPE: &[u8] = b"TYPE";
     pub const GET: &[u8] = b"GET";
     pub const SET: &[u8] = b"SET";
+    pub const INCR: &[u8] = b"INCR";
     pub const XADD: &[u8] = b"XADD";
     pub const XRANGE: &[u8] = b"XRANGE";
     pub const XREAD: &[u8] = b"XREAD";

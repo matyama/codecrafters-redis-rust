@@ -233,7 +233,6 @@ impl DatabaseBuilder {
         self.id.is_some() && self.db.is_some()
     }
 
-    #[inline]
     pub fn set(&mut self, key: rdb::String, val: rdb::Value, expiry: Option<SystemTime>) {
         if let Some(db) = self.db.as_mut() {
             match expiry {
@@ -660,6 +659,58 @@ impl Store {
 
             // Other cases which don't meet given conditions (NX | XX)
             _ => Err(()),
+        }
+    }
+
+    pub async fn incr(&self, db: usize, key: rdb::String) -> Result<i64, Error> {
+        let store = self.0.read().await;
+        let mut guard = store.get(db).await;
+        match guard.kvstore.entry(key.clone()) {
+            Entry::Occupied(mut e) => match e.get() {
+                // value has expired, so it's effectively vacant
+                ValueCell {
+                    expiry: Some(expiry),
+                    ..
+                } if *expiry < SystemTime::now() => {
+                    e.get_mut()
+                        .write(rdb::Value::String(rdb::String::from(1)), None);
+
+                    guard.persist_size += 1;
+                    guard.expires_size -= 1;
+
+                    guard
+                        .expires
+                        .remove(&key)
+                        .inspect(|Expiry { task, .. }| task.abort());
+
+                    Ok(1)
+                }
+
+                // update existing value if it contains an integer
+                ValueCell {
+                    data: rdb::Value::String(s),
+                    expiry,
+                    ..
+                } => {
+                    let expiry = *expiry;
+                    let n = i64::try_from(s)?;
+
+                    e.get_mut()
+                        .write(rdb::Value::String(rdb::String::from(n + 1)), expiry);
+
+                    Ok(n + 1)
+                }
+
+                _ => Err(Error::WrongType),
+            },
+
+            Entry::Vacant(e) => {
+                let data = rdb::Value::String(rdb::String::from(1));
+                e.insert(ValueCell::new(data, None));
+                guard.persist_size += 1;
+                guard.new.notify_waiters();
+                Ok(1)
+            }
         }
     }
 

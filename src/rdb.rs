@@ -70,6 +70,7 @@ pub enum String {
     Int8(i8),
     Int16(i16),
     Int32(i32),
+    // TODO: add i64 representation for efficient INCR
     // NOTE: LZF could be another variant or just a Str
 }
 
@@ -183,6 +184,28 @@ impl std::fmt::Display for String {
             Self::Int16(i) => write!(f, "{i}"),
             Self::Int32(i) => write!(f, "{i}"),
         }
+    }
+}
+
+impl TryFrom<&String> for i64 {
+    type Error = crate::Error;
+
+    fn try_from(s: &String) -> Result<Self, Self::Error> {
+        match s {
+            String::Str(s) => s.as_ref().parse(),
+            String::Int8(i) => Ok(*i as i64),
+            String::Int16(i) => Ok(*i as i64),
+            String::Int32(i) => Ok(*i as i64),
+        }
+    }
+}
+
+impl TryFrom<String> for i64 {
+    type Error = crate::Error;
+
+    #[inline]
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::try_from(&s)
     }
 }
 

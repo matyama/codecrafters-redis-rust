@@ -39,6 +39,7 @@ pub(crate) const KEYS: Bytes = Bytes::from_static(resp::KEYS);
 pub(crate) const TYPE: Bytes = Bytes::from_static(resp::TYPE);
 pub(crate) const GET: Bytes = Bytes::from_static(resp::GET);
 pub(crate) const SET: Bytes = Bytes::from_static(resp::SET);
+pub(crate) const INCR: Bytes = Bytes::from_static(resp::INCR);
 pub(crate) const XADD: Bytes = Bytes::from_static(resp::XADD);
 pub(crate) const XRANGE: Bytes = Bytes::from_static(resp::XRANGE);
 pub(crate) const XREAD: Bytes = Bytes::from_static(resp::XREAD);
@@ -65,6 +66,7 @@ pub enum Command {
     Keys(rdb::String),
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
+    Incr(rdb::String),
     XAdd(rdb::String, stream::EntryArg, xadd::Options),
     XRange(rdb::String, xrange::Range, xrange::Count),
     XRead(xread::Options, Keys, xread::Ids),
@@ -168,6 +170,12 @@ impl Command {
                     Err(_) => NULL,
                 }
             }
+
+            Self::Incr(key) => server
+                .store
+                .incr(client.db, key)
+                .await
+                .map_or_else(DataType::err, DataType::Integer),
 
             Self::XAdd(key, entry, ops) => server
                 .store
@@ -278,7 +286,7 @@ impl Command {
     pub(crate) fn is_write(&self) -> bool {
         // NOTE: SELECT is not a write although it can be sent over the replication connection.
         // Whether it is sent to a replica if client's selected DB differs from the repl conn DB.
-        matches!(self, Self::Set(..) | Self::XAdd(..))
+        matches!(self, Self::Set(..) | Self::Incr(_) | Self::XAdd(..))
     }
 
     /// Returns `true` iff this command represents a replicated operation that should be
@@ -331,6 +339,8 @@ impl From<Command> for DataType {
                 items.extend(ops.into_bytes().map(DataType::string));
                 items
             }
+
+            Command::Incr(key) => vec![Self::string(INCR), Self::string(key)],
 
             Command::XAdd(key, stream::Entry { id, fields }, ops) => {
                 let mut items = Vec::with_capacity(2 + ops.len() + 1 + 2 * fields.len());

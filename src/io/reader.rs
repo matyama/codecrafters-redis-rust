@@ -313,6 +313,7 @@ where
             KEYS => cmd_try_from!(args => Command::Keys as "keys"),
             GET => cmd_try_from!(args => Command::Get as "get"),
             SET => cmd_try_from!(args => set::Set),
+            INCR => cmd_try_from!(args => Command::Incr as "incr"),
             XADD => cmd_try_from!(args => xadd::XAdd),
             XRANGE => cmd_try_from!(args => xrange::XRange),
             XREAD => cmd_try_from!(args => xread::XRead),
