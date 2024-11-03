@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use rdb::RDB;
 use repl::{ReplConnection, Replication};
 
-pub(crate) use cmd::Command;
+pub(crate) use cmd::{Command, Resp as CommandResp};
 pub(crate) use config::Config;
 pub(crate) use data::{Args, DataType};
 pub(crate) use io::{DataReader, DataWriter, RDBFileReader};
@@ -57,6 +57,7 @@ pub(crate) mod resp {
 
     pub const OK: &[u8] = b"OK";
     pub const PONG: &[u8] = b"PONG";
+    pub const QUEUED: &[u8] = b"QUEUED";
 }
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(5);
@@ -208,13 +209,26 @@ impl Client {
         }
     }
 
+    #[inline]
+    pub(crate) fn is_tx(&self) -> bool {
+        matches!(self.mstate, MultiState::Multi { .. })
+    }
+
     /// Enable queuing subsequent commands for transactional execution
-    pub(crate) fn tx_multi(&mut self) {
+    pub(crate) fn tx_begin(&mut self) {
         if matches!(self.mstate, MultiState::Normal) {
             self.mstate = MultiState::Multi {
                 commands: Vec::new(),
             }
         }
+    }
+
+    pub(crate) fn tx_add(&mut self, cmd: Command) {
+        let MultiState::Multi { ref mut commands } = self.mstate else {
+            eprintln!("WARN: failed to add {cmd:?} to a non-transactional state");
+            return;
+        };
+        commands.push(cmd);
     }
 
     pub(crate) fn tx_exec(&mut self) -> Option<Vec<Command>> {
@@ -435,7 +449,10 @@ impl Instance {
                     };
 
                     println!("executing {cmd:?}");
-                    let resp = cmd.exec(self, &mut client).await;
+                    let CommandResp::Resp(resp) = cmd.exec(self, &mut client).await else {
+                        // TODO: check how this is actually handled
+                        unreachable!("PSYNC execution should not be delayed");
+                    };
 
                     writer.write(&resp).await?;
 
@@ -452,19 +469,32 @@ impl Instance {
 
                     let repl_cmd = self.prepare_repl(&cmd);
 
-                    let resp = cmd.exec(self, &mut client).await;
+                    let result = cmd.exec(self, &mut client).await;
 
-                    writer.write(&resp).await?;
-                    writer.flush().await?;
+                    match result {
+                        CommandResp::Resp(resp) => {
+                            writer.write(&resp).await?;
+                            writer.flush().await?;
 
-                    match repl_cmd {
-                        Some(cmd) if resp.is_ok() => {
-                            self.replicate(client.db, cmd, bytes_read).await
+                            match repl_cmd {
+                                Some(cmd) if resp.is_ok() && !resp.is_queued() => {
+                                    self.replicate(client.db, cmd, bytes_read).await
+                                }
+                                _ => {}
+                            }
+
+                            println!("done {resp:?}");
                         }
-                        _ => {}
-                    }
 
-                    println!("done {resp:?}");
+                        CommandResp::Exec { resp, repl: _ } => {
+                            writer.write(&resp).await?;
+                            writer.flush().await?;
+
+                            // TODO: replicate the whole TX (`repl`, but indicate it's a TX)
+
+                            println!("done {resp:?}");
+                        }
+                    }
                 }
 
                 // XXX: || resp.is_null()
@@ -501,7 +531,9 @@ impl Instance {
                     while let Some(ReplCommand { cmd, ack }) = rx.recv().await {
                         println!("replica: executing command {cmd:?}");
 
-                        let resp = cmd.exec(server, &mut client).await;
+                        let CommandResp::Resp(resp) = cmd.exec(server, &mut client).await else {
+                            unimplemented!("transactional command execution in replicas");
+                        };
 
                         if let Some(ack) = ack {
                             println!("replica: responding with {resp:?}");

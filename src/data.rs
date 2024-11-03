@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 use crate::cmd::{self, Command};
 use crate::io::writer::{DataSerializer, Serializer as _};
-use crate::{rdb, Error};
+use crate::{rdb, resp, Error};
 
 const NEG: &[u8] = b"-";
 
@@ -43,6 +43,14 @@ impl DataType {
             self,
             Self::Null | Self::NullBulkString | Self::NullBulkError
         )
+    }
+
+    #[inline]
+    pub(crate) fn is_queued(&self) -> bool {
+        match self {
+            Self::SimpleString(s) | Self::BulkString(s) => s.matches(resp::QUEUED),
+            _ => false,
+        }
     }
 
     #[inline]

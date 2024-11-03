@@ -54,6 +54,7 @@ pub(crate) const WAIT: Bytes = Bytes::from_static(resp::WAIT);
 
 pub(crate) const OK: Bytes = Bytes::from_static(resp::OK);
 pub(crate) const PONG: Bytes = Bytes::from_static(resp::PONG);
+pub(crate) const QUEUED: Bytes = Bytes::from_static(resp::QUEUED);
 pub(crate) const NONE: Bytes = Bytes::from_static(b"none");
 
 #[derive(Clone, Debug)]
@@ -82,23 +83,29 @@ pub enum Command {
 }
 
 impl Command {
-    pub async fn exec(self, server: &Instance, client: &mut Client) -> DataType {
+    pub async fn exec(self, server: &Instance, client: &mut Client) -> Resp {
         use rdb::String::*;
         match self {
+            // Delay command execution after MULTI (i.e., during transactional execution)
+            cmd @ (Self::Set(..) | Self::Incr(_)) if client.is_tx() => {
+                client.tx_add(cmd);
+                Resp::Resp(DataType::str(QUEUED))
+            }
+
             Self::DBSize => {
                 let (persist_size, expire_size) = server.store.dbsize(client.db).await;
-                DataType::Integer((persist_size + expire_size) as i64)
+                Resp::Resp(DataType::Integer((persist_size + expire_size) as i64))
             }
 
             // TODO: SELECT replication
             Self::Select(db) => {
                 client.db = db;
-                DataType::str(OK)
+                Resp::Resp(DataType::str(OK))
             }
 
-            Self::Ping(msg) => msg.map_or(DataType::str(PONG), DataType::BulkString),
+            Self::Ping(msg) => Resp::Resp(msg.map_or(DataType::str(PONG), DataType::BulkString)),
 
-            Self::Echo(msg) => DataType::string(msg),
+            Self::Echo(msg) => Resp::Resp(DataType::string(msg)),
 
             Self::Config(params) => {
                 let items = params.iter().filter_map(|param| {
@@ -108,34 +115,40 @@ impl Command {
                         .map(|value| (DataType::string(param.clone()), value))
                 });
 
-                match PROTOCOL {
+                let data = match PROTOCOL {
                     Protocol::RESP2 => DataType::array(items.flat_map(|(k, v)| [k, v])),
                     Protocol::RESP3 => DataType::map(items),
-                }
+                };
+
+                Resp::Resp(data)
             }
 
             Self::Info(sections) => {
                 let num_sections = sections.len();
                 let info = info::Info::new(server, &sections);
                 let mut data = BytesMut::with_capacity(1024 * num_sections);
-                match write!(data, "{}", info) {
+                let data = match write!(data, "{}", info) {
                     Ok(_) => DataType::string(data),
                     Err(e) => DataType::error(format!("failed to serialize {info:?}: {e:?}")),
-                }
+                };
+                Resp::Resp(data)
             }
 
-            Self::Type(key) => server
-                .store
-                .ty(client.db, key)
-                .await
-                .map_or(DataType::str(NONE), DataType::str),
+            Self::Type(key) => Resp::Resp(
+                server
+                    .store
+                    .ty(client.db, key)
+                    .await
+                    .map_or(DataType::str(NONE), DataType::str),
+            ),
 
             Self::Keys(pattern @ (Int8(_) | Int16(_) | Int32(_))) => {
-                if server.store.contains(client.db, &pattern).await {
+                let data = if server.store.contains(client.db, &pattern).await {
                     DataType::array([DataType::string(pattern)])
                 } else {
                     DataType::array([])
-                }
+                };
+                Resp::Resp(data)
             }
 
             Self::Keys(Str(pattern)) => match pattern.as_ref() {
@@ -147,127 +160,159 @@ impl Command {
                         .into_iter()
                         .map(DataType::BulkString);
 
-                    DataType::array(keys)
+                    Resp::Resp(DataType::array(keys))
                 }
                 _ => {
                     // TODO: support glob-style patterns
                     let key = Str(pattern);
-                    if server.store.contains(client.db, &key).await {
+                    let data = if server.store.contains(client.db, &key).await {
                         DataType::array([DataType::string(key)])
                     } else {
                         DataType::array([])
-                    }
+                    };
+                    Resp::Resp(data)
                 }
             },
 
-            Self::Get(key) => server
-                .store
-                .get(client.db, key)
-                .await
-                .map_or(NULL, DataType::string),
+            Self::Get(key) => Resp::Resp(
+                server
+                    .store
+                    .get(client.db, key)
+                    .await
+                    .map_or(NULL, DataType::string),
+            ),
 
             Self::Set(key, val, ops) => {
                 let (ops, get) = ops.into();
-                match server.store.set(client.db, key, val, ops).await {
+                let data = match server.store.set(client.db, key, val, ops).await {
                     Ok(Some(val)) if get => DataType::string(val),
                     Ok(_) => DataType::str(OK),
                     Err(_) => NULL,
-                }
+                };
+                Resp::Resp(data)
             }
 
-            Self::Incr(key) => server
-                .store
-                .incr(client.db, key)
-                .await
-                .map_or_else(DataType::err, DataType::Integer),
+            Self::Incr(key) => Resp::Resp(
+                server
+                    .store
+                    .incr(client.db, key)
+                    .await
+                    .map_or_else(DataType::err, DataType::Integer),
+            ),
 
-            // TODO: might need to delay the replication based on this flag
             Self::Multi => {
-                client.tx_multi();
-                DataType::str(OK)
+                client.tx_begin();
+                Resp::Resp(DataType::str(OK))
             }
 
+            // TODO: WAIT interaction
             Self::Exec => {
                 let Some(commands) = client.tx_exec() else {
-                    return DataType::err(Error::err("EXEC without MULTI"));
+                    return Resp::Resp(DataType::err(Error::err("EXEC without MULTI")));
                 };
 
                 if commands.is_empty() {
-                    return DataType::array([]);
+                    return Resp::Resp(DataType::array([]));
                 }
 
-                unimplemented!("EXEC")
+                let resp = Vec::with_capacity(commands.len());
+                let mut repl = Vec::with_capacity(commands.len());
+
+                // TODO: take a write lock
+                // let lock = server.store.tx();
+
+                for cmd in commands {
+                    // TODO: impl From<&Command> for DataType to avoid the clone
+                    repl.push(cmd.clone().into());
+                    // let data = cmd.exec_tx(lock, server, client).await;
+                    // resp.push(data);
+                }
+
+                Resp::Exec {
+                    resp: DataType::array(resp),
+                    repl,
+                }
             }
 
-            Self::XAdd(key, entry, ops) => server
-                .store
-                .xadd(client.db, key, entry, ops)
-                .await
-                .map_or_else(DataType::err, |id| id.map_or(NULL, DataType::string)),
+            Self::XAdd(key, entry, ops) => Resp::Resp(
+                server
+                    .store
+                    .xadd(client.db, key, entry, ops)
+                    .await
+                    .map_or_else(DataType::err, |id| id.map_or(NULL, DataType::string)),
+            ),
 
-            Self::XRange(key, range, xrange::Count(count)) => server
-                .store
-                .xrange(client.db, key, range, count)
-                .await
-                .map_or_else(DataType::err, |entries| {
-                    entries.map_or(NULL, |es| {
-                        DataType::array(es.into_iter().map(DataType::from))
-                    })
-                }),
+            Self::XRange(key, range, xrange::Count(count)) => Resp::Resp(
+                server
+                    .store
+                    .xrange(client.db, key, range, count)
+                    .await
+                    .map_or_else(DataType::err, |entries| {
+                        entries.map_or(NULL, |es| {
+                            DataType::array(es.into_iter().map(DataType::from))
+                        })
+                    }),
+            ),
 
-            Self::XRead(ops, keys, ids) => server
-                .store
-                .clone()
-                .xread(client.db, keys, ids, ops)
-                .await
-                .map_or_else(DataType::err, |items| {
-                    items.map_or(NULL, |items| {
-                        let items = items.into_iter().map(|(key, entries)| {
-                            (
-                                DataType::string(key),
-                                DataType::array(entries.into_iter().map(DataType::from)),
-                            )
-                        });
+            Self::XRead(ops, keys, ids) => Resp::Resp(
+                server
+                    .store
+                    .clone()
+                    .xread(client.db, keys, ids, ops)
+                    .await
+                    .map_or_else(DataType::err, |items| {
+                        items.map_or(NULL, |items| {
+                            let items = items.into_iter().map(|(key, entries)| {
+                                (
+                                    DataType::string(key),
+                                    DataType::array(entries.into_iter().map(DataType::from)),
+                                )
+                            });
 
-                        match PROTOCOL {
-                            Protocol::RESP2 => DataType::array(
-                                items.map(|(key, entries)| DataType::array([key, entries])),
-                            ),
-                            Protocol::RESP3 => DataType::map(items),
-                        }
-                    })
-                }),
+                            match PROTOCOL {
+                                Protocol::RESP2 => DataType::array(
+                                    items.map(|(key, entries)| DataType::array([key, entries])),
+                                ),
+                                Protocol::RESP3 => DataType::map(items),
+                            }
+                        })
+                    }),
+            ),
 
-            Self::XLen(key) => server
-                .store
-                .xlen(client.db, key)
-                .await
-                .map_or_else(DataType::err, |len| DataType::Integer(len as i64)),
+            Self::XLen(key) => Resp::Resp(
+                server
+                    .store
+                    .xlen(client.db, key)
+                    .await
+                    .map_or_else(DataType::err, |len| DataType::Integer(len as i64)),
+            ),
 
             Self::Replconf(replconf::Conf::GetAck(_)) => {
                 let ReplState { repl_offset, .. } = server.state();
                 let repl_offset = repl_offset.to_string().into();
-                DataType::cmd([REPLCONF, ACK, repl_offset])
+                let data = DataType::cmd([REPLCONF, ACK, repl_offset]);
+                Resp::Resp(data)
             }
 
             // TODO: handle ListeningPort | Capabilities
-            Self::Replconf(_) => DataType::str(OK),
+            Self::Replconf(_) => Resp::Resp(DataType::str(OK)),
 
-            Self::PSync(state) if matches!(server.role, Role::Replica(_)) => {
-                DataType::err(format!("unsupported command in a replica: PSYNC {state} "))
-            }
+            Self::PSync(state) if matches!(server.role, Role::Replica(_)) => Resp::Resp(
+                DataType::err(format!("unsupported command in a replica: PSYNC {state} ")),
+            ),
 
             Self::PSync(ReplState {
                 repl_id: None,
                 repl_offset,
             }) if repl_offset.is_negative() => {
                 let mut data = BytesMut::with_capacity(64);
-                match write!(data, "FULLRESYNC {}", server.state()) {
+                let data = match write!(data, "FULLRESYNC {}", server.state()) {
                     Ok(_) => DataType::str(data),
                     Err(e) => {
                         DataType::err(format!("failed to write response to PSYNC ? -1: {e:?}"))
                     }
-                }
+                };
+                Resp::Resp(data)
             }
 
             Self::PSync(state) => unimplemented!("handle PSYNC {state:?}"),
@@ -275,7 +320,9 @@ impl Command {
 
             Self::Wait(num_replicas, timeout) => {
                 let Role::Leader(replicas) = server.role() else {
-                    return DataType::err("protocol violation: WAIT is only supported by a leader");
+                    return Resp::Resp(DataType::err(
+                        "protocol violation: WAIT is only supported by a leader",
+                    ));
                 };
 
                 // Snapshot current replication state/offset. This will include all the writes in
@@ -287,7 +334,7 @@ impl Command {
                     .await
                     .with_context(|| format!("WAIT {num_replicas} {timeout:?}"));
 
-                match result {
+                let data = match result {
                     Ok((n, offset)) if offset > 0 => {
                         let (state, new_offset) = server.shift_offset(offset);
                         println!("master offset: {} -> {new_offset}", state.repl_offset);
@@ -297,7 +344,9 @@ impl Command {
                     Err(e) => {
                         DataType::err(format!("WAIT {num_replicas} {timeout:?} failed with {e:?}"))
                     }
-                }
+                };
+
+                Resp::Resp(data)
             }
         }
     }
@@ -317,6 +366,12 @@ impl Command {
     pub(crate) fn is_ack(&self) -> bool {
         matches!(self, Self::Replconf(replconf::Conf::GetAck(_)))
     }
+}
+
+#[derive(Debug)]
+pub enum Resp {
+    Resp(DataType),
+    Exec { resp: DataType, repl: Vec<DataType> },
 }
 
 impl From<Command> for DataType {
