@@ -43,6 +43,7 @@ pub(crate) mod resp {
     pub const SET: &[u8] = b"SET";
     pub const INCR: &[u8] = b"INCR";
     pub const MULTI: &[u8] = b"MULTI";
+    pub const EXEC: &[u8] = b"EXEC";
     pub const XADD: &[u8] = b"XADD";
     pub const XRANGE: &[u8] = b"XRANGE";
     pub const XREAD: &[u8] = b"XREAD";

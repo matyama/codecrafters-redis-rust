@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::data::{DataType, Keys};
 use crate::repl::ReplState;
-use crate::{rdb, resp, stream, Client};
+use crate::{rdb, resp, stream, Client, Error};
 use crate::{Instance, Protocol, Role, PROTOCOL};
 
 use replconf::{ACK, GETACK};
@@ -41,6 +41,7 @@ pub(crate) const GET: Bytes = Bytes::from_static(resp::GET);
 pub(crate) const SET: Bytes = Bytes::from_static(resp::SET);
 pub(crate) const INCR: Bytes = Bytes::from_static(resp::INCR);
 pub(crate) const MULTI: Bytes = Bytes::from_static(resp::MULTI);
+pub(crate) const EXEC: Bytes = Bytes::from_static(resp::EXEC);
 pub(crate) const XADD: Bytes = Bytes::from_static(resp::XADD);
 pub(crate) const XRANGE: Bytes = Bytes::from_static(resp::XRANGE);
 pub(crate) const XREAD: Bytes = Bytes::from_static(resp::XREAD);
@@ -69,6 +70,7 @@ pub enum Command {
     Set(rdb::String, rdb::Value, set::Options),
     Incr(rdb::String),
     Multi,
+    Exec,
     XAdd(rdb::String, stream::EntryArg, xadd::Options),
     XRange(rdb::String, xrange::Range, xrange::Count),
     XRead(xread::Options, Keys, xread::Ids),
@@ -187,6 +189,14 @@ impl Command {
                 }
 
                 DataType::str(OK)
+            }
+
+            Self::Exec => {
+                let Some(_commands) = client.mstate.take() else {
+                    return DataType::err(Error::err("EXEC without MULTI"));
+                };
+
+                unimplemented!("EXEC")
             }
 
             Self::XAdd(key, entry, ops) => server
@@ -355,6 +365,7 @@ impl From<Command> for DataType {
             Command::Incr(key) => vec![Self::string(INCR), Self::string(key)],
 
             Command::Multi => vec![Self::string(MULTI)],
+            Command::Exec => vec![Self::string(EXEC)],
 
             Command::XAdd(key, stream::Entry { id, fields }, ops) => {
                 let mut items = Vec::with_capacity(2 + ops.len() + 1 + 2 * fields.len());
