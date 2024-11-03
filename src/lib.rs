@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::mem;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::*};
@@ -162,6 +163,19 @@ impl From<DataType> for Resp {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) enum MultiState {
+    /// Normal execution (commands won't be queued up)
+    #[default]
+    Normal,
+
+    /// MULTI has been called
+    Multi {
+        /// [`Command`]s queued up for the transaction
+        commands: Vec<Command>,
+    },
+}
+
 // TODO: support CLIENT LIST command
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -176,9 +190,8 @@ pub struct Client {
     pub(crate) ctime: Instant,
     /// current database ID
     pub(crate) db: usize,
-    // TODO: store a queued up commands (probably `Vec<Command>`)
     /// MULTI/EXEC state
-    pub(crate) mstate: Option<()>,
+    pub(crate) mstate: MultiState,
     // TODO: other fields
 }
 
@@ -191,7 +204,23 @@ impl Client {
             laddr,
             ctime: Instant::now(),
             db: 0,
-            mstate: None,
+            mstate: MultiState::default(),
+        }
+    }
+
+    /// Enable queuing subsequent commands for transactional execution
+    pub(crate) fn tx_multi(&mut self) {
+        if matches!(self.mstate, MultiState::Normal) {
+            self.mstate = MultiState::Multi {
+                commands: Vec::new(),
+            }
+        }
+    }
+
+    pub(crate) fn tx_exec(&mut self) -> Option<Vec<Command>> {
+        match mem::take(&mut self.mstate) {
+            MultiState::Normal => None,
+            MultiState::Multi { commands } => Some(commands),
         }
     }
 }

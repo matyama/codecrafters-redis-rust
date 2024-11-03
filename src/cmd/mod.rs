@@ -183,18 +183,18 @@ impl Command {
 
             // TODO: might need to delay the replication based on this flag
             Self::Multi => {
-                // enable queuing subsequent commands for transactional execution
-                if client.mstate.is_none() {
-                    client.mstate = Some(());
-                }
-
+                client.tx_multi();
                 DataType::str(OK)
             }
 
             Self::Exec => {
-                let Some(_commands) = client.mstate.take() else {
+                let Some(commands) = client.tx_exec() else {
                     return DataType::err(Error::err("EXEC without MULTI"));
                 };
+
+                if commands.is_empty() {
+                    return DataType::array([]);
+                }
 
                 unimplemented!("EXEC")
             }
