@@ -42,6 +42,7 @@ pub(crate) mod resp {
     pub const GET: &[u8] = b"GET";
     pub const SET: &[u8] = b"SET";
     pub const INCR: &[u8] = b"INCR";
+    pub const MULTI: &[u8] = b"MULTI";
     pub const XADD: &[u8] = b"XADD";
     pub const XRANGE: &[u8] = b"XRANGE";
     pub const XREAD: &[u8] = b"XREAD";
@@ -174,6 +175,9 @@ pub struct Client {
     pub(crate) ctime: Instant,
     /// current database ID
     pub(crate) db: usize,
+    // TODO: store a queued up commands (probably `Vec<Command>`)
+    /// MULTI/EXEC state
+    pub(crate) mstate: Option<()>,
     // TODO: other fields
 }
 
@@ -186,6 +190,7 @@ impl Client {
             laddr,
             ctime: Instant::now(),
             db: 0,
+            mstate: None,
         }
     }
 }

@@ -40,6 +40,7 @@ pub(crate) const TYPE: Bytes = Bytes::from_static(resp::TYPE);
 pub(crate) const GET: Bytes = Bytes::from_static(resp::GET);
 pub(crate) const SET: Bytes = Bytes::from_static(resp::SET);
 pub(crate) const INCR: Bytes = Bytes::from_static(resp::INCR);
+pub(crate) const MULTI: Bytes = Bytes::from_static(resp::MULTI);
 pub(crate) const XADD: Bytes = Bytes::from_static(resp::XADD);
 pub(crate) const XRANGE: Bytes = Bytes::from_static(resp::XRANGE);
 pub(crate) const XREAD: Bytes = Bytes::from_static(resp::XREAD);
@@ -67,6 +68,7 @@ pub enum Command {
     Get(rdb::String),
     Set(rdb::String, rdb::Value, set::Options),
     Incr(rdb::String),
+    Multi,
     XAdd(rdb::String, stream::EntryArg, xadd::Options),
     XRange(rdb::String, xrange::Range, xrange::Count),
     XRead(xread::Options, Keys, xread::Ids),
@@ -176,6 +178,16 @@ impl Command {
                 .incr(client.db, key)
                 .await
                 .map_or_else(DataType::err, DataType::Integer),
+
+            // TODO: might need to delay the replication based on this flag
+            Self::Multi => {
+                // enable queuing subsequent commands for transactional execution
+                if client.mstate.is_none() {
+                    client.mstate = Some(());
+                }
+
+                DataType::str(OK)
+            }
 
             Self::XAdd(key, entry, ops) => server
                 .store
@@ -341,6 +353,8 @@ impl From<Command> for DataType {
             }
 
             Command::Incr(key) => vec![Self::string(INCR), Self::string(key)],
+
+            Command::Multi => vec![Self::string(MULTI)],
 
             Command::XAdd(key, stream::Entry { id, fields }, ops) => {
                 let mut items = Vec::with_capacity(2 + ops.len() + 1 + 2 * fields.len());
