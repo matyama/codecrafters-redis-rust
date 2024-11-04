@@ -102,16 +102,10 @@ impl Command {
                 let mut repl = Vec::with_capacity(commands.len());
                 repl.push(DataType::from(Command::Multi));
 
-                // if client's transaction touches multiple DBs, lock the whole store
-                let switches_db = |cmd: &Self| matches!(cmd, Self::Select(db) if *db != client.db);
-
-                let lock_type = if commands.iter().any(switches_db) {
-                    LockType::Store
-                } else {
-                    LockType::Database
-                };
-
-                let store = server.store.lock(lock_type).await;
+                // NOTE: Redis guarantees that a request sent by another client will never be
+                // served in the middle of an ongoing transaction. See:
+                // https://redis.io/docs/latest/develop/interact/transactions
+                let store = server.store.lock(LockType::Store).await;
 
                 for cmd in commands {
                     // TODO: impl From<&Command> for DataType to avoid the clone
@@ -269,29 +263,8 @@ impl Command {
                 Resp::Resp(DataType::str(OK))
             }
 
-            // FIXME: nested EXEC
-            Self::Exec => {
-                let Some(commands) = client.tx_end() else {
-                    return Resp::Resp(DataType::err(Error::err("EXEC without MULTI")));
-                };
-
-                if commands.is_empty() {
-                    return Resp::Resp(DataType::array([]));
-                }
-
-                let resp = Vec::with_capacity(commands.len());
-                let repl = Vec::with_capacity(commands.len());
-
-                Resp::Exec {
-                    resp: DataType::array(resp),
-                    repl,
-                }
-            }
-
-            Self::Discard => Resp::Resp(match client.tx_end() {
-                Some(_) => DataType::str(OK),
-                _ => DataType::err(Error::err("DISCARD without MULTI")),
-            }),
+            Self::Exec => unreachable!("EXEC handled externally"),
+            Self::Discard => unreachable!("DISCARD handled externally"),
 
             Self::XAdd(key, entry, ops) => Resp::Resp(
                 store
