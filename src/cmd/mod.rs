@@ -8,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::data::{DataType, Keys};
 use crate::repl::ReplState;
+use crate::store::{LockType, StoreHandle};
 use crate::{rdb, resp, stream, Client, Error};
 use crate::{Instance, Protocol, Role, PROTOCOL};
 
@@ -84,16 +85,76 @@ pub enum Command {
 
 impl Command {
     pub async fn exec(self, server: &Instance, client: &mut Client) -> Resp {
-        use rdb::String::*;
         match self {
+            // TODO: WAIT interaction
+            Command::Exec => {
+                let Some(commands) = client.tx_exec() else {
+                    return Resp::Resp(DataType::err(Error::err("EXEC without MULTI")));
+                };
+
+                if commands.is_empty() {
+                    return Resp::Resp(DataType::array([]));
+                }
+
+                let mut resp = Vec::with_capacity(commands.len());
+                let mut repl = Vec::with_capacity(commands.len());
+                repl.push(DataType::from(Command::Multi));
+
+                // if client's transaction touches multiple DBs, lock the whole store
+                let switches_db = |cmd: &Self| matches!(cmd, Self::Select(db) if *db != client.db);
+
+                let lock_type = if commands.iter().any(switches_db) {
+                    LockType::Store
+                } else {
+                    LockType::Database
+                };
+
+                let store = server.store.lock(lock_type).await;
+
+                for cmd in commands {
+                    // TODO: impl From<&Command> for DataType to avoid the clone
+                    repl.push(cmd.clone().into());
+                    let data = cmd.exec_locked(server, client, &store).await;
+
+                    // TODO: support nested EXEC
+                    let Resp::Resp(data) = data else {
+                        unimplemented!("nested EXEC");
+                    };
+
+                    resp.push(data);
+                }
+
+                repl.push(DataType::from(Command::Exec));
+
+                Resp::Exec {
+                    resp: DataType::array(resp),
+                    repl,
+                }
+            }
+
             // Delay command execution after MULTI (i.e., during transactional execution)
-            cmd @ (Self::Set(..) | Self::Incr(_)) if client.is_tx() => {
+            cmd if client.is_tx() => {
                 client.tx_add(cmd);
                 Resp::Resp(DataType::str(QUEUED))
             }
 
+            cmd => {
+                let store = server.store.lock(LockType::Database).await;
+                cmd.exec_locked(server, client, &store).await
+            }
+        }
+    }
+
+    async fn exec_locked(
+        self,
+        server: &Instance,
+        client: &mut Client,
+        store: &StoreHandle<'_>,
+    ) -> Resp {
+        use rdb::String::*;
+        match self {
             Self::DBSize => {
-                let (persist_size, expire_size) = server.store.dbsize(client.db).await;
+                let (persist_size, expire_size) = store.dbsize(client.db).await;
                 Resp::Resp(DataType::Integer((persist_size + expire_size) as i64))
             }
 
@@ -135,15 +196,14 @@ impl Command {
             }
 
             Self::Type(key) => Resp::Resp(
-                server
-                    .store
+                store
                     .ty(client.db, key)
                     .await
                     .map_or(DataType::str(NONE), DataType::str),
             ),
 
             Self::Keys(pattern @ (Int8(_) | Int16(_) | Int32(_))) => {
-                let data = if server.store.contains(client.db, &pattern).await {
+                let data = if store.contains(client.db, &pattern).await {
                     DataType::array([DataType::string(pattern)])
                 } else {
                     DataType::array([])
@@ -153,8 +213,7 @@ impl Command {
 
             Self::Keys(Str(pattern)) => match pattern.as_ref() {
                 b"*" => {
-                    let keys = server
-                        .store
+                    let keys = store
                         .keys(client.db)
                         .await
                         .into_iter()
@@ -165,7 +224,7 @@ impl Command {
                 _ => {
                     // TODO: support glob-style patterns
                     let key = Str(pattern);
-                    let data = if server.store.contains(client.db, &key).await {
+                    let data = if store.contains(client.db, &key).await {
                         DataType::array([DataType::string(key)])
                     } else {
                         DataType::array([])
@@ -175,8 +234,7 @@ impl Command {
             },
 
             Self::Get(key) => Resp::Resp(
-                server
-                    .store
+                store
                     .get(client.db, key)
                     .await
                     .map_or(NULL, DataType::string),
@@ -184,7 +242,7 @@ impl Command {
 
             Self::Set(key, val, ops) => {
                 let (ops, get) = ops.into();
-                let data = match server.store.set(client.db, key, val, ops).await {
+                let data = match store.set(client.db, key, val, ops).await {
                     Ok(Some(val)) if get => DataType::string(val),
                     Ok(_) => DataType::str(OK),
                     Err(_) => NULL,
@@ -193,8 +251,7 @@ impl Command {
             }
 
             Self::Incr(key) => Resp::Resp(
-                server
-                    .store
+                store
                     .incr(client.db, key)
                     .await
                     .map_or_else(DataType::err, DataType::Integer),
@@ -205,7 +262,7 @@ impl Command {
                 Resp::Resp(DataType::str(OK))
             }
 
-            // TODO: WAIT interaction
+            // FIXME: nested EXEC
             Self::Exec => {
                 let Some(commands) = client.tx_exec() else {
                     return Resp::Resp(DataType::err(Error::err("EXEC without MULTI")));
@@ -216,17 +273,7 @@ impl Command {
                 }
 
                 let resp = Vec::with_capacity(commands.len());
-                let mut repl = Vec::with_capacity(commands.len());
-
-                // TODO: take a write lock
-                // let lock = server.store.tx();
-
-                for cmd in commands {
-                    // TODO: impl From<&Command> for DataType to avoid the clone
-                    repl.push(cmd.clone().into());
-                    // let data = cmd.exec_tx(lock, server, client).await;
-                    // resp.push(data);
-                }
+                let repl = Vec::with_capacity(commands.len());
 
                 Resp::Exec {
                     resp: DataType::array(resp),
@@ -235,16 +282,14 @@ impl Command {
             }
 
             Self::XAdd(key, entry, ops) => Resp::Resp(
-                server
-                    .store
+                store
                     .xadd(client.db, key, entry, ops)
                     .await
                     .map_or_else(DataType::err, |id| id.map_or(NULL, DataType::string)),
             ),
 
             Self::XRange(key, range, xrange::Count(count)) => Resp::Resp(
-                server
-                    .store
+                store
                     .xrange(client.db, key, range, count)
                     .await
                     .map_or_else(DataType::err, |entries| {
@@ -254,13 +299,10 @@ impl Command {
                     }),
             ),
 
-            Self::XRead(ops, keys, ids) => Resp::Resp(
-                server
-                    .store
-                    .clone()
-                    .xread(client.db, keys, ids, ops)
-                    .await
-                    .map_or_else(DataType::err, |items| {
+            Self::XRead(ops, keys, ids) => {
+                Resp::Resp(store.xread(client.db, keys, ids, ops).await.map_or_else(
+                    DataType::err,
+                    |items| {
                         items.map_or(NULL, |items| {
                             let items = items.into_iter().map(|(key, entries)| {
                                 (
@@ -276,12 +318,12 @@ impl Command {
                                 Protocol::RESP3 => DataType::map(items),
                             }
                         })
-                    }),
-            ),
+                    },
+                ))
+            }
 
             Self::XLen(key) => Resp::Resp(
-                server
-                    .store
+                store
                     .xlen(client.db, key)
                     .await
                     .map_or_else(DataType::err, |len| DataType::Integer(len as i64)),

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use tokio::sync::{Mutex, MutexGuard, Notify, RwLock};
+use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::cmd::{set, xadd, xrange, xread};
@@ -310,6 +310,61 @@ impl DB {
             expires_size: self.expires_size,
         }
     }
+
+    // NOTE: this could get more ergonomic with "smart pointer receivers"
+    async fn get_stream(
+        db: &Mutex<DB>,
+        key: &rdb::String,
+    ) -> Result<(Option<(stream::Stream, Arc<Notify>)>, Arc<Notify>), Error> {
+        let guard = db.lock().await;
+        let new = Arc::clone(&guard.new);
+
+        let Some(ValueCell { data, write, .. }) = guard.kvstore.get(key) else {
+            return Ok((None, new));
+        };
+
+        let rdb::Value::Stream(stream) = data else {
+            return Err(Error::WrongType);
+        };
+
+        let stream = stream.clone();
+        let write = Arc::clone(write);
+
+        Ok((Some((stream, write)), new))
+    }
+
+    // NOTE: this could get more ergonomic with "smart pointer receivers"
+    async fn lookup_stream(
+        db: impl AsRef<Mutex<DB>>,
+        key: &rdb::String,
+        blocking: bool,
+        unblock: &Notify,
+    ) -> XResult<StreamHandle> {
+        let db = db.as_ref();
+
+        let new = match Self::get_stream(db, key).await? {
+            (Some((stream, write)), _) => {
+                return Ok(Some(StreamHandle {
+                    stream,
+                    write,
+                    new: false,
+                }))
+            }
+            (_, new) => new,
+        };
+
+        loop {
+            tokio::select! {
+                _ = new.notified(), if blocking => {
+                    if let (Some((stream, write)), _) = Self::get_stream(db, key).await? {
+                        return Ok(Some(StreamHandle { stream, write, new: true }));
+                    }
+                },
+                _ = unblock.notified(), if blocking => break Ok(None),
+                else => break Ok(None),
+            }
+        }
+    }
 }
 
 pub(crate) type DBHande = Arc<Mutex<DB>>;
@@ -419,6 +474,13 @@ impl DerefMut for StoreInner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub enum LockType {
+    #[default]
+    Database,
+    Store,
+}
+
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct Store(RwLock<StoreInner>);
@@ -485,17 +547,66 @@ impl Store {
         }
     }
 
+    pub(crate) async fn lock(&self, ty: LockType) -> StoreHandle<'_> {
+        match ty {
+            LockType::Store => {
+                let store = self.0.write().await;
+                StoreHandle::Store(StoreLock(store))
+            }
+            LockType::Database => {
+                let store = self.0.read().await;
+                StoreHandle::Database(DbLock(store))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for Store {
+    #[inline]
+    fn default() -> Self {
+        Self::new(crate::config::DBNUM)
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct StoreLock<'tx>(RwLockWriteGuard<'tx, StoreInner>);
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct DbLock<'tx>(RwLockReadGuard<'tx, StoreInner>);
+
+#[derive(Debug)]
+pub(crate) enum StoreHandle<'tx> {
+    Store(StoreLock<'tx>),
+    Database(DbLock<'tx>),
+}
+
+impl StoreHandle<'_> {
+    async fn lock(&self, db: usize) -> MutexGuard<'_, DB> {
+        match self {
+            StoreHandle::Store(StoreLock(store)) => store.get(db).await,
+            StoreHandle::Database(DbLock(store)) => store.get(db).await,
+        }
+    }
+
+    async fn db(&self, db: usize) -> Arc<Mutex<DB>> {
+        match self {
+            StoreHandle::Store(StoreLock(store)) => Arc::clone(&store[db]),
+            StoreHandle::Database(DbLock(store)) => Arc::clone(&store[db]),
+        }
+    }
+
     pub async fn dbsize(&self, db: usize) -> (usize, usize) {
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
+        let guard = self.lock(db).await;
         guard.size()
     }
 
     // TODO: support patters other than *
     pub async fn keys(&self, db: usize) -> Vec<rdb::String> {
         let now = SystemTime::now();
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
+        let guard = self.lock(db).await;
         guard
             .kvstore
             .iter()
@@ -518,8 +629,8 @@ impl Store {
     }
 
     pub async fn get(&self, db: usize, key: rdb::String) -> Option<rdb::Value> {
-        let store = self.0.read().await;
-        let mut guard = store.get(db).await;
+        let mut guard = self.lock(db).await;
+
         match guard.kvstore.entry(key) {
             Entry::Occupied(e) => match e.get() {
                 ValueCell {
@@ -551,8 +662,11 @@ impl Store {
     ) -> Result<Option<rdb::Value>, ()> {
         use set::{Condition::*, Expiry::*};
 
-        let store = self.0.read().await;
-        let handle = &store[db];
+        let handle = match self {
+            StoreHandle::Store(StoreLock(store)) => &store[db],
+            StoreHandle::Database(DbLock(store)) => &store[db],
+        };
+
         let mut guard = handle.lock().await;
 
         // XXX: not sure at what point Redis takes the timestamp to determine expiration
@@ -663,8 +777,7 @@ impl Store {
     }
 
     pub async fn incr(&self, db: usize, key: rdb::String) -> Result<i64, Error> {
-        let store = self.0.read().await;
-        let mut guard = store.get(db).await;
+        let mut guard = self.lock(db).await;
         match guard.kvstore.entry(key.clone()) {
             Entry::Occupied(mut e) => match e.get() {
                 // value has expired, so it's effectively vacant
@@ -727,8 +840,7 @@ impl Store {
             ));
         }
 
-        let store = self.0.read().await;
-        let mut guard = store.get(db).await;
+        let mut guard = self.lock(db).await;
 
         match guard.kvstore.entry(key) {
             Entry::Occupied(mut e) => {
@@ -794,8 +906,7 @@ impl Store {
         range: xrange::Range,
         count: Option<usize>,
     ) -> XResult<Vec<stream::Entry>> {
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
+        let guard = self.lock(db).await;
 
         let Some(ValueCell { data, .. }) = guard.kvstore.get(&key) else {
             return Ok(Some(vec![]));
@@ -828,62 +939,8 @@ impl Store {
         Ok(Some(entries))
     }
 
-    async fn get_stream(
-        &self,
-        db: usize,
-        key: &rdb::String,
-    ) -> Result<(Option<(stream::Stream, Arc<Notify>)>, Arc<Notify>), Error> {
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
-        let new = Arc::clone(&guard.new);
-
-        let Some(ValueCell { data, write, .. }) = guard.kvstore.get(key) else {
-            return Ok((None, new));
-        };
-
-        let rdb::Value::Stream(stream) = data else {
-            return Err(Error::WrongType);
-        };
-
-        let stream = stream.clone();
-        let write = Arc::clone(write);
-
-        Ok((Some((stream, write)), new))
-    }
-
-    async fn lookup_stream(
-        &self,
-        db: usize,
-        key: &rdb::String,
-        blocking: bool,
-        unblock: &Notify,
-    ) -> XResult<StreamHandle> {
-        let new = match self.get_stream(db, key).await? {
-            (Some((stream, write)), _) => {
-                return Ok(Some(StreamHandle {
-                    stream,
-                    write,
-                    new: false,
-                }))
-            }
-            (_, new) => new,
-        };
-
-        loop {
-            tokio::select! {
-                _ = new.notified(), if blocking => {
-                    if let (Some((stream, write)), _) = self.get_stream(db, key).await? {
-                        return Ok(Some(StreamHandle { stream, write, new: true }));
-                    }
-                },
-                _ = unblock.notified(), if blocking => break Ok(None),
-                else => break Ok(None),
-            }
-        }
-    }
-
     pub async fn xread(
-        self: Arc<Self>,
+        &self,
         db: usize,
         keys: Keys,
         ids: xread::Ids,
@@ -906,12 +963,14 @@ impl Store {
         let mut tasks = JoinSet::new();
         let unblock = Arc::new(Notify::new());
 
+        let db = self.db(db).await;
+
         for (k, (key, id)) in keys.iter().cloned().zip(ids.iter().cloned()).enumerate() {
-            let store = Arc::clone(&self);
+            let db = Arc::clone(&db);
             let unblock = Arc::clone(&unblock);
 
             tasks.spawn(async move {
-                let Some(stream) = store.lookup_stream(db, &key, blocking, &unblock).await? else {
+                let Some(stream) = DB::lookup_stream(db, &key, blocking, &unblock).await? else {
                     // NOTE: non-existent keys (streams) are simply filtered out
                     return Ok((k, None));
                 };
@@ -980,8 +1039,7 @@ impl Store {
     }
 
     pub async fn xlen(&self, db: usize, key: rdb::String) -> Result<usize, Error> {
-        let store = self.0.read().await;
-        let guard = store.get(db).await;
+        let guard = self.lock(db).await;
         match guard.kvstore.get(&key) {
             Some(ValueCell {
                 data: rdb::Value::Stream(s),
@@ -990,14 +1048,6 @@ impl Store {
             Some(_) => Err(Error::WrongType),
             None => Ok(0),
         }
-    }
-}
-
-#[cfg(test)]
-impl Default for Store {
-    #[inline]
-    fn default() -> Self {
-        Self::new(crate::config::DBNUM)
     }
 }
 
@@ -1057,6 +1107,8 @@ mod tests {
     async fn simple_set_get() {
         let store = Store::default();
 
+        let store = store.lock(LockType::Database).await;
+
         let value = store.get(DB, Str(FOO)).await;
         assert!(value.is_none(), "cannot get a value from an empty store");
 
@@ -1080,6 +1132,8 @@ mod tests {
     #[tokio::test]
     async fn set_get_with_options() {
         let store = Store::default();
+
+        let store = store.lock(LockType::Database).await;
 
         let value = store.get(DB, Str(FOO)).await;
         assert!(value.is_none(), "cannot get a value from an empty store");
