@@ -316,6 +316,7 @@ where
             INCR => cmd_try_from!(args => Command::Incr as "incr"),
             MULTI => Resp::Cmd(Command::Multi),
             EXEC => Resp::Cmd(Command::Exec),
+            DISCARD => Resp::Cmd(Command::Discard),
             XADD => cmd_try_from!(args => xadd::XAdd),
             XRANGE => cmd_try_from!(args => xrange::XRange),
             XREAD => cmd_try_from!(args => xread::XRead),

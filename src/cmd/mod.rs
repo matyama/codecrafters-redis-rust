@@ -43,6 +43,7 @@ pub(crate) const SET: Bytes = Bytes::from_static(resp::SET);
 pub(crate) const INCR: Bytes = Bytes::from_static(resp::INCR);
 pub(crate) const MULTI: Bytes = Bytes::from_static(resp::MULTI);
 pub(crate) const EXEC: Bytes = Bytes::from_static(resp::EXEC);
+pub(crate) const DISCARD: Bytes = Bytes::from_static(resp::DISCARD);
 pub(crate) const XADD: Bytes = Bytes::from_static(resp::XADD);
 pub(crate) const XRANGE: Bytes = Bytes::from_static(resp::XRANGE);
 pub(crate) const XREAD: Bytes = Bytes::from_static(resp::XREAD);
@@ -73,6 +74,7 @@ pub enum Command {
     Incr(rdb::String),
     Multi,
     Exec,
+    Discard,
     XAdd(rdb::String, stream::EntryArg, xadd::Options),
     XRange(rdb::String, xrange::Range, xrange::Count),
     XRead(xread::Options, Keys, xread::Ids),
@@ -87,8 +89,8 @@ impl Command {
     pub async fn exec(self, server: &Instance, client: &mut Client) -> Resp {
         match self {
             // TODO: WAIT interaction
-            Command::Exec => {
-                let Some(commands) = client.tx_exec() else {
+            Self::Exec => {
+                let Some(commands) = client.tx_end() else {
                     return Resp::Resp(DataType::err(Error::err("EXEC without MULTI")));
                 };
 
@@ -131,6 +133,11 @@ impl Command {
                     repl,
                 }
             }
+
+            Self::Discard => Resp::Resp(match client.tx_end() {
+                Some(_) => DataType::str(OK),
+                _ => DataType::err(Error::err("DISCARD without MULTI")),
+            }),
 
             // Delay command execution after MULTI (i.e., during transactional execution)
             cmd if client.is_tx() => {
@@ -264,7 +271,7 @@ impl Command {
 
             // FIXME: nested EXEC
             Self::Exec => {
-                let Some(commands) = client.tx_exec() else {
+                let Some(commands) = client.tx_end() else {
                     return Resp::Resp(DataType::err(Error::err("EXEC without MULTI")));
                 };
 
@@ -280,6 +287,11 @@ impl Command {
                     repl,
                 }
             }
+
+            Self::Discard => Resp::Resp(match client.tx_end() {
+                Some(_) => DataType::str(OK),
+                _ => DataType::err(Error::err("DISCARD without MULTI")),
+            }),
 
             Self::XAdd(key, entry, ops) => Resp::Resp(
                 store
@@ -463,6 +475,7 @@ impl From<Command> for DataType {
 
             Command::Multi => vec![Self::string(MULTI)],
             Command::Exec => vec![Self::string(EXEC)],
+            Command::Discard => vec![Self::string(DISCARD)],
 
             Command::XAdd(key, stream::Entry { id, fields }, ops) => {
                 let mut items = Vec::with_capacity(2 + ops.len() + 1 + 2 * fields.len());

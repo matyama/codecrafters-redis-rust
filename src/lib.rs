@@ -45,6 +45,7 @@ pub(crate) mod resp {
     pub const INCR: &[u8] = b"INCR";
     pub const MULTI: &[u8] = b"MULTI";
     pub const EXEC: &[u8] = b"EXEC";
+    pub const DISCARD: &[u8] = b"DISCARD";
     pub const XADD: &[u8] = b"XADD";
     pub const XRANGE: &[u8] = b"XRANGE";
     pub const XREAD: &[u8] = b"XREAD";
@@ -231,7 +232,8 @@ impl Client {
         commands.push(cmd);
     }
 
-    pub(crate) fn tx_exec(&mut self) -> Option<Vec<Command>> {
+    /// Conclude an ongoing transaction by returning queued up commands for EXEC or DISCARD
+    pub(crate) fn tx_end(&mut self) -> Option<Vec<Command>> {
         match mem::take(&mut self.mstate) {
             MultiState::Normal => None,
             MultiState::Multi { commands } => Some(commands),
